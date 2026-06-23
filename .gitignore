@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime acquisition data
+gpr_runs/
+gpr_runs_test/
+*.npz
+*.csv
+*.metadata.json
+run_metadata.jsonl
+
+# Generated images / quick probe outputs
+s11_usb_raw.png
+test_s11_usb.csv
+
+# Calibration exports generated during experiments
+calibration/
+osl_s11_*.json
+solt_2port_*.json
+
+# Logs
+*.log
+

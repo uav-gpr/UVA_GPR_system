@@ -17,10 +17,16 @@ Thumbs.db
 # Runtime acquisition data
 gpr_runs/
 gpr_runs_test/
+remote_runs/
 *.npz
 *.csv
 *.metadata.json
 run_metadata.jsonl
+
+# Temporary debug workspaces
+hm30_debug/
+tmp/
+.tmp_hm30_pages/
 
 # Generated images / quick probe outputs
 s11_usb_raw.png
@@ -33,4 +39,3 @@ solt_2port_*.json
 
 # Logs
 *.log
-

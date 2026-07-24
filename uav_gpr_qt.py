@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import json
 import math
+import queue
+import socket
+import struct
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +60,10 @@ class GgaFix:
     fix_quality: int = 0
     satellites: int = 0
     altitude_m: float | None = None
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
 
 
 @dataclass
@@ -622,6 +632,215 @@ def save_trace(
     return csv_path
 
 
+def trace_npz_bytes(
+    index: int,
+    cfg: SweepConfig,
+    frequency_hz: np.ndarray,
+    raw_sparams: dict[str, np.ndarray],
+    display_sparams: dict[str, np.ndarray],
+    time_ns: np.ndarray,
+    trace_by_channel: dict[str, np.ndarray],
+    fix: GgaFix,
+) -> bytes:
+    payload: dict[str, object] = {
+        "index": np.array(index, dtype=np.int64),
+        "config": json.dumps(asdict(cfg), ensure_ascii=False),
+        "frequency_hz": np.asarray(frequency_hz),
+        "time_ns": np.asarray(time_ns),
+        "gnss": json.dumps(asdict(fix), ensure_ascii=False),
+    }
+    for name in S_PARAMETERS:
+        payload[f"raw_{name}_real"] = raw_sparams[name].real
+        payload[f"raw_{name}_imag"] = raw_sparams[name].imag
+        payload[f"display_{name}_real"] = display_sparams[name].real
+        payload[f"display_{name}_imag"] = display_sparams[name].imag
+        payload[f"trace_{name}"] = np.asarray(trace_by_channel[name], dtype=float)
+    buffer = io.BytesIO()
+    np.savez_compressed(buffer, **payload)
+    return buffer.getvalue()
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("socket closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_remote_frame(sock: socket.socket, header: dict[str, object], payload: bytes = b"") -> None:
+    header_bytes = json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    sock.sendall(struct.pack("!I", len(header_bytes)))
+    sock.sendall(header_bytes)
+    sock.sendall(struct.pack("!Q", len(payload)))
+    if payload:
+        sock.sendall(payload)
+
+
+def recv_remote_header(sock: socket.socket) -> dict[str, object]:
+    header_len = struct.unpack("!I", recv_exact(sock, 4))[0]
+    header = json.loads(recv_exact(sock, header_len).decode("utf-8"))
+    payload_len = struct.unpack("!Q", recv_exact(sock, 8))[0]
+    if payload_len:
+        raise ValueError(f"unexpected ack payload: {payload_len} bytes")
+    return header
+
+
+def recv_remote_frame(sock: socket.socket) -> tuple[dict[str, object], bytes]:
+    header_len = struct.unpack("!I", recv_exact(sock, 4))[0]
+    header = json.loads(recv_exact(sock, header_len).decode("utf-8"))
+    payload_len = struct.unpack("!Q", recv_exact(sock, 8))[0]
+    payload = recv_exact(sock, payload_len) if payload_len else b""
+    return header, payload
+
+
+class RemoteSender:
+    def __init__(self, host: str, port: int, run_id: str, status_callback, command_callback=None) -> None:
+        self.host = host
+        self.port = port
+        self.run_id = run_id
+        self.status_callback = status_callback
+        self.command_callback = command_callback
+        self.queue: queue.Queue[tuple[dict[str, object], bytes] | None] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="uav-gpr-remote-sender", daemon=True)
+        self._sock: socket.socket | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.queue.put(None)
+        self._close()
+
+    def enqueue_trace(
+        self,
+        index: int,
+        cfg: SweepConfig,
+        frequency_hz: np.ndarray,
+        raw_sparams: dict[str, np.ndarray],
+        display_sparams: dict[str, np.ndarray],
+        time_ns: np.ndarray,
+        trace_by_channel: dict[str, np.ndarray],
+        fix: GgaFix,
+    ) -> None:
+        payload = trace_npz_bytes(index, cfg, frequency_hz, raw_sparams, display_sparams, time_ns, trace_by_channel, fix)
+        header = {
+            "type": "trace",
+            "protocol": "uav-gpr-telemetry-v1",
+            "run_id": self.run_id,
+            "trace_index": index,
+            "timestamp": utc_timestamp(),
+            "payload_format": "npz",
+            "payload_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "config": asdict(cfg),
+            "gnss": asdict(fix),
+        }
+        self.queue.put((header, payload))
+
+    def _connect(self) -> socket.socket:
+        sock = socket.create_connection((self.host, self.port), timeout=5.0)
+        sock.settimeout(0.5)
+        send_remote_frame(
+            sock,
+            {
+                "type": "hello",
+                "protocol": "uav-gpr-telemetry-v1",
+                "run_id": self.run_id,
+                "timestamp": utc_timestamp(),
+                "supports_commands": True,
+            },
+        )
+        ack, _payload = self._read_frame(sock)
+        if ack.get("type") != "ack":
+            raise ConnectionError(f"unexpected hello ack: {ack}")
+        self.status_callback(f"Remote connected: {self.host}:{self.port}")
+        return sock
+
+    def _close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _read_frame(self, sock: socket.socket) -> tuple[dict[str, object], bytes]:
+        while not self._stop.is_set():
+            try:
+                return recv_remote_frame(sock)
+            except socket.timeout:
+                continue
+        raise ConnectionError("remote sender stopped")
+
+    def _handle_command(self, header: dict[str, object]) -> None:
+        action = str(header.get("action") or "")
+        params = header.get("params") if isinstance(header.get("params"), dict) else {}
+        if self.command_callback is not None:
+            self.command_callback(action, params)
+        if self._sock is not None:
+            send_remote_frame(
+                self._sock,
+                {
+                    "type": "command_ack",
+                    "protocol": "uav-gpr-telemetry-v1",
+                    "run_id": self.run_id,
+                    "action": action,
+                    "timestamp": utc_timestamp(),
+                },
+            )
+
+    def _wait_for_trace_ack(self, sock: socket.socket, trace_index: object) -> None:
+        while not self._stop.is_set():
+            header, _payload = self._read_frame(sock)
+            msg_type = header.get("type")
+            if msg_type == "ack_trace" and header.get("trace_index") == trace_index:
+                return
+            if msg_type == "command":
+                self._handle_command(header)
+                continue
+            raise ConnectionError(f"unexpected trace ack: {header}")
+
+    def _run(self) -> None:
+        pending: tuple[dict[str, object], bytes] | None = None
+        while not self._stop.is_set():
+            try:
+                if self._sock is None:
+                    self._sock = self._connect()
+                try:
+                    item = pending or self.queue.get(timeout=0.2)
+                except queue.Empty:
+                    try:
+                        header, _payload = recv_remote_frame(self._sock)
+                    except socket.timeout:
+                        continue
+                    if header.get("type") == "command":
+                        self._handle_command(header)
+                        continue
+                    raise ConnectionError(f"unexpected remote frame: {header}")
+                pending = None
+                if item is None:
+                    break
+                header, payload = item
+                send_remote_frame(self._sock, header, payload)
+                self._wait_for_trace_ack(self._sock, header.get("trace_index"))
+                self.status_callback(f"Remote sent trace {header['trace_index']}")
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                if pending is None and "item" in locals() and item is not None:
+                    pending = item
+                self._close()
+                self.status_callback(f"Remote send retrying: {exc}")
+                time.sleep(2.0)
+
+
 class AcquisitionWorker(QtCore.QThread):
     trace_ready = QtCore.Signal(int, object, object, object, object, object, object, str)
     status = QtCore.Signal(str)
@@ -716,11 +935,16 @@ class AcquisitionWorker(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    remote_status = QtCore.Signal(str)
+    remote_command = QtCore.Signal(str, object)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("UAV-GPR Control System")
         self.resize(1380, 860)
         self.worker: AcquisitionWorker | None = None
+        self.remote_sender: RemoteSender | None = None
+        self.remote_run_id = ""
         self.background: np.ndarray | None = None
         self.cal_measurements: dict[str, CalibrationMeasurement] = {}
         self.session_calibration: OSLCalibration | None = None
@@ -729,8 +953,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bscan: dict[str, list[np.ndarray]] = {name: [] for name in S_PARAMETERS}
         self.last_display_sparams: dict[str, np.ndarray] | None = None
         self.last_time_ns: np.ndarray | None = None
+        self.remote_status.connect(self.log)
+        self.remote_command.connect(self.handle_remote_command)
         self._build_ui()
         self.refresh_ports()
+        QtCore.QTimer.singleShot(1200, self.connect_remote_sender)
 
     def _build_ui(self) -> None:
         tabs = QtWidgets.QTabWidget()
@@ -885,6 +1112,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.count.setValue(0)
         self.autosave = QtWidgets.QCheckBox("自动保存 CSV/NPZ")
         self.autosave.setChecked(True)
+        self.remote_enable = QtWidgets.QCheckBox("Remote send")
+        self.remote_enable.setChecked(True)
+        self.remote_host = QtWidgets.QLineEdit("192.168.144.111")
+        self.remote_host.setMaximumWidth(140)
+        self.remote_port = QtWidgets.QSpinBox()
+        self.remote_port.setRange(1, 65535)
+        self.remote_port.setValue(8765)
+        self.remote_port.setMaximumWidth(90)
+        self.remote_connect = QtWidgets.QPushButton("Connect")
+        self.remote_connect.clicked.connect(self.connect_remote_sender)
         self.bscan_cmap = QtWidgets.QComboBox()
         self.bscan_cmap.addItems(["gray", "jet"])
         self.bscan_cmap.currentTextChanged.connect(lambda _text: self.refresh_bscan_views())
@@ -912,6 +1149,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ctl.addWidget(self.bscan_cmap, 2, 1)
         ctl.addWidget(clear, 2, 2)
         ctl.addWidget(self.last_info, 2, 3, 1, 5)
+        ctl.addWidget(self.remote_enable, 3, 0)
+        ctl.addWidget(QtWidgets.QLabel("Remote IP"), 3, 1)
+        ctl.addWidget(self.remote_host, 3, 2)
+        ctl.addWidget(QtWidgets.QLabel("Port"), 3, 3)
+        ctl.addWidget(self.remote_port, 3, 4)
+        ctl.addWidget(self.remote_connect, 3, 5)
         ctl.setColumnStretch(1, 1)
         ctl.setColumnStretch(6, 1)
 
@@ -1291,6 +1534,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if cfg.stop_mhz <= cfg.start_mhz:
             self.log("Stop MHz 必须大于 Start MHz")
             return
+        if self.remote_enable.isChecked():
+            self.connect_remote_sender()
         self.worker = AcquisitionWorker(
             cfg=cfg,
             gnss_port=self.selected_port(),
@@ -1311,6 +1556,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.finished_run.connect(self.on_worker_finished)
         self.worker.start()
 
+    def connect_remote_sender(self) -> None:
+        if not hasattr(self, "remote_enable") or not self.remote_enable.isChecked():
+            return
+        if self.remote_sender is not None:
+            self.log("Remote sender already running")
+            return
+        host = self.remote_host.text().strip()
+        if not host:
+            self.log("Remote IP is empty")
+            return
+        self.remote_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.remote_sender = RemoteSender(
+            host,
+            int(self.remote_port.value()),
+            self.remote_run_id,
+            self.remote_status.emit,
+            self.remote_command.emit,
+        )
+        self.remote_sender.start()
+        self.log(f"Remote sender connecting: {host}:{self.remote_port.value()}")
+
+    def handle_remote_command(self, action: str, params: object) -> None:
+        self.log(f"Remote command: {action}")
+        if isinstance(params, dict):
+            if "count" in params:
+                self.count.setValue(max(0, min(int(params["count"]), self.count.maximum())))
+            if "interval_s" in params:
+                self.interval.setValue(float(params["interval_s"]))
+        if action == "start":
+            single = bool(params.get("single", False)) if isinstance(params, dict) else False
+            self.start_acquisition(single=single)
+        elif action == "stop":
+            self.stop_acquisition()
+        elif action == "single":
+            self.start_acquisition(single=True)
+        else:
+            self.log(f"Unknown remote command: {action}")
+
     def stop_acquisition(self) -> None:
         if self.worker:
             self.worker.stop()
@@ -1319,6 +1602,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_worker_finished(self) -> None:
         self.log("采集结束")
         self.worker = None
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.remote_sender is not None:
+            self.remote_sender.stop()
+            self.remote_sender = None
+        super().closeEvent(event)
 
     def clear_bscan(self) -> None:
         self.bscan = {name: [] for name in S_PARAMETERS}
@@ -1350,6 +1639,8 @@ class MainWindow(QtWidgets.QMainWindow):
         fix_text = f"fix={fix.fix_quality}, sats={fix.satellites}, lat={fix.latitude}, lon={fix.longitude}"
         self.last_info.setText(f"#{index} {fix_text}")
         self.gnss_map.update_fix(fix)
+        if self.remote_sender is not None:
+            self.remote_sender.enqueue_trace(index, self.config(), freq, raw, display, time_ns, trace_by_channel, fix)
         self.log(f"Trace {index} complete. {fix_text}" + (f" saved: {Path(path_text).name}" if path_text else ""))
 
 

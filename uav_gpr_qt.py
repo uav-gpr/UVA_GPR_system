@@ -1114,7 +1114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autosave.setChecked(True)
         self.remote_enable = QtWidgets.QCheckBox("Remote send")
         self.remote_enable.setChecked(True)
-        self.remote_host = QtWidgets.QLineEdit("192.168.144.111")
+        self.remote_host = QtWidgets.QLineEdit("127.0.0.1")
         self.remote_host.setMaximumWidth(140)
         self.remote_port = QtWidgets.QSpinBox()
         self.remote_port.setRange(1, 65535)

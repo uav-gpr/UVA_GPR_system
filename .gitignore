@@ -40,3 +40,7 @@ solt_2port_*.json
 
 # Logs
 *.log
+
+# Tool leftovers (not project content)
+dsh-routing-suite-tmp/
+.npm-cache/

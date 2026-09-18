@@ -44,3 +44,9 @@ solt_2port_*.json
 # Tool leftovers (not project content)
 dsh-routing-suite-tmp/
 .npm-cache/
+
+# AgentTeams runtime state
+.agent-teams/
+
+# Deployment build output (regenerate before field use)
+dist/

@@ -825,6 +825,60 @@ class PersistentLibreVnaBackend:
             raise
         self._state = BackendState.STREAMING
 
+    def reconfigure(self, settings: SweepSettings) -> None:
+        """PAUSED → STREAMING：用**新** SweepSettings 重配，不 reopen（第2轮 §3.4）。
+
+        命令序列与 :meth:`configure` 相同（SET_IDLE → 清 stream/pending →
+        SWEEP_SETTINGS；任一失败 -> FAULTED）。与 configure 的区别：
+
+        - 仅接受 PAUSED（CLOSED/OPEN_IDLE/STREAMING/FAULTED 一律拒绝，
+          configure 的既有拒绝语义不受影响）；
+        - 重建 assembler（点数可能变化），但旧 assembler 的累计诊断统计**折叠
+          保留**（completed/dropped/... 只增不减，pause/resume 的统计保留语义
+          跨 reconfigure 同样成立）；
+        - ``configure_count += 1``、``open_count`` / ``connection_generation`` /
+          ``trace_index`` 连续（不重置、不重开连接）。
+        """
+        if self._state is not BackendState.PAUSED:
+            raise _state_error("reconfigure", self._state)
+        if not isinstance(settings, SweepSettings):
+            raise TypeError("settings 必须是 SweepSettings")
+        info = self._device_info
+        if info is None:
+            raise LibreVnaError("设备信息缺失（open 未成功获取 DeviceInfo）")
+        self._validate_capability(settings, info)
+        self._pending_max = self._resolve_pending_max(settings)
+        self._sweep_timeout_s = self._compute_sweep_timeout(settings)
+        # 先保存旧 assembler 累计统计快照——命令阶段的 _discard_stale_sweep_data
+        # 与随后的 assembler 重建都会触碰它，顺序错误会把折叠基线清零。
+        self._snapshot_assembler_stats()
+        saved = self._saved_assembler_stats
+        try:
+            self._send_command(SET_IDLE, timeout_s=self._settings.command_timeout_s)
+            self._discard_stale_sweep_data()
+            self._send_command(
+                SWEEP_SETTINGS,
+                payload=settings.encode(),
+                timeout_s=self._settings.command_timeout_s,
+            )
+        except Exception:
+            self._enter_faulted()
+            raise
+        self._assembler = ContinuousSweepAssembler(settings.points)
+        if saved is not None:
+            # 折叠旧会话累计统计（只增不减）。
+            self._assembler.completed_sweeps = saved["completed_sweeps"]
+            self._assembler.dropped_sweeps = saved["dropped_sweeps"]
+            self._assembler.incomplete_sweeps = saved["incomplete_sweeps"]
+            self._assembler.duplicate_points = saved["duplicate_points"]
+            self._assembler.jump_points = saved["jump_points"]
+            self._assembler.out_of_range_points = saved["out_of_range_points"]
+            self._assembler.invalid_points = saved["invalid_points"]
+            self._saved_assembler_stats = None
+        self._frozen_settings = settings
+        self._stats.configure_count += 1
+        self._state = BackendState.STREAMING
+
     def close(self) -> None:
         """尽力 SET_IDLE，始终尝试释放 USB；幂等。fail-closed 状态判定。
 

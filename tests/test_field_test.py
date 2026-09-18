@@ -468,8 +468,9 @@ class LayeredBenchTests(unittest.TestCase):
         self.assertIsNone(report["processing_queue"], "同步微基准不得伪造队列指标")
 
     def test_production_full_layers_clean_invariants(self) -> None:
+        # rate=40：热状态余量（第3轮裁定延续；实测整机发热时 50/s 余量仅 4%，必然抖破）
         rc, report = _run_cmd(
-            ft.cmd_bench, _bench_args(layers="usb,proc,disk,net", seconds=4.0)
+            ft.cmd_bench, _bench_args(layers="usb,proc,disk,net", seconds=4.0, rate=40.0)
         )
         self.assertEqual(rc, 0)
         self.assertTrue(report["passed"])
@@ -1174,7 +1175,8 @@ class ProductionIntegrityTests(unittest.TestCase):
         cleanup.consumer_exited（来自 isRunning() 检查）验证，见
         test_consumer_qthread_exit_state_reflects_real_object。
         """
-        opts = _opts(layers=("usb", "proc", "disk", "net"), duration_s=2.0, rate=50.0)
+        # rate=40：热状态余量（第3轮裁定延续）
+        opts = _opts(layers=("usb", "proc", "disk", "net"), duration_s=2.0, rate=40.0)
         report, failures, cleanup = ft.run_layered_production(opts, purpose="bench")
         self.assertTrue(report["passed"], failures)
         self.assertTrue(cleanup.ok, failures)

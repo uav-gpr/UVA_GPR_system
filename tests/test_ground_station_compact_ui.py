@@ -196,10 +196,13 @@ class GroundStationCompactUiTests(unittest.TestCase):
         self.assertEqual(task.actions()[3], self.window.action_exit)
 
     def test_only_start_and_stop_buttons_on_main_window(self) -> None:
+        # 第3轮控制迁移：地面端补齐暂停/继续快捷按钮（任务控制完整迁移地面端，共开始/停止/暂停/继续）
         buttons = self.central.findChildren(QtWidgets.QPushButton)
-        self.assertEqual({button.text() for button in buttons}, {"开始", "停止"})
+        self.assertEqual({button.text() for button in buttons}, {"开始", "停止", "暂停", "继续"})
         self.assertEqual(self.window.start_button.text(), "开始")
         self.assertEqual(self.window.stop_button.text(), "停止")
+        self.assertEqual(self.window.pause_button.text(), "暂停")
+        self.assertEqual(self.window.resume_button.text(), "继续")
 
     def test_start_and_stop_buttons_send_original_actions(self) -> None:
         self.window.start_button.click()
@@ -211,6 +214,11 @@ class GroundStationCompactUiTests(unittest.TestCase):
         self.window.stop_button.click()
         self.assertEqual(self.window.receiver.calls[-1][0], "stop")
         self.assertIsNone(self.window.receiver.calls[-1][1])
+        # 第3轮控制迁移：暂停与继续按钮发送对应远程命令
+        self.window.pause_button.click()
+        self.assertEqual(self.window.receiver.calls[-1][0], "pause")
+        self.window.resume_button.click()
+        self.assertEqual(self.window.receiver.calls[-1][0], "resume")
 
     def test_single_acquisition_in_menu_sends_single(self) -> None:
         self.window.action_single_acquisition.trigger()
@@ -542,7 +550,7 @@ class GroundStationCompactUiTests(unittest.TestCase):
         central = self.window.centralWidget()
         self.assertIsNotNone(central)
         buttons = central.findChildren(QtWidgets.QPushButton)
-        self.assertEqual({button.text() for button in buttons}, {"开始", "停止"})
+        self.assertEqual({button.text() for button in buttons}, {"开始", "停止", "暂停", "继续"})
         # GNSS 仍在 Splitter 右侧。
         self.assertIsInstance(self.window.gnss_map.parentWidget(), QtWidgets.QSplitter)
         splitter = self.window.findChild(QtWidgets.QSplitter, "main_splitter")

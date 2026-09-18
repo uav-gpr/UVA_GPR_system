@@ -372,6 +372,12 @@ class SaveTraceMetadataTests(unittest.TestCase):
                 self.assertIn(expected, keys, f"缺少旧 NPZ key: {expected}")
             self.assertIn("acquisition", keys)
             self.assertIn("flight", keys)
+            self.assertIn("trace_S11_complex", keys)
+            self.assertIn("trace_S22_complex", keys)
+            self.assertEqual(data["trace_S11_complex"].dtype, np.complex128)
+            self.assertEqual(data["trace_S22_complex"].dtype, np.complex128)
+            np.testing.assert_allclose(data["trace_S11"], data["trace_S11_complex"].real)
+            np.testing.assert_allclose(data["trace_S22"], data["trace_S22_complex"].real)
             acquisition = json.loads(str(data["acquisition"].item()))
             self.assertEqual(
                 {k: acquisition[k] for k in self.acquisition},

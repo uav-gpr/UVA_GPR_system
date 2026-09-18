@@ -43,12 +43,40 @@ from ground_trace_pipeline import (
 from gnss_map_widget import GnssMapWidget
 from gpr_processing import flat_reflection_filter
 from pipeline_metrics import PipelineMetrics
+# 第2轮 §3.7-9：地面 run_id 词汇表的**唯一正则源**（air_task/idle/校准/local
+# 四类单一分类）。禁止在本模块再写第二套 run_id 正则（R-A-19/R-A-19b/R-A-20
+# 三处判据共用同一函数）。
+from disk_outbox import (  # noqa: E402
+    RUN_ID_CLASS_AIR_TASK,
+    RUN_ID_CLASS_CALIBRATION,
+    RUN_ID_CLASS_IDLE,
+    RUN_ID_CLASS_LOCAL,
+    classify_run_id,
+)
 
 
 PROTOCOL = "uav-gpr-telemetry-v1"
 S_PARAMETERS = ("S11", "S21", "S12", "S22")
 UI_CHANNELS = ("S11", "S22")
 CHANNEL_LABELS = {"S11": "HH (S11)", "S22": "VV (S22)"}
+
+#: §5.4：空中→地面校准回程消息类型前缀（旧地面端落入 handle_client 的
+#: "忽略未知消息"分支；R-C-13 有测试）。
+_CALIBRATION_MESSAGE_PREFIX = "calibration_"
+
+
+def is_not_older_than(run_x: object, baseline: object) -> bool:
+    """R-A-19b 唯一比较函数：完整 run_id 的**字典序**比较（基线空 = 满足）。
+
+    ``YYYYmmdd_HHMMSS_%04d`` 定长格式保证"字典序 == 时间序"；**禁止**只比
+    seq 数值——空中进程重启后 seq 回到 1，只比 seq 会把更晚的新任务误判为
+    补传（R-A-19b 写死）。
+    """
+    run = run_x if isinstance(run_x, str) else ""
+    base = baseline if isinstance(baseline, str) else ""
+    if not base:
+        return True
+    return run >= base
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -478,7 +506,19 @@ def safe_name(value: object, fallback: str) -> str:
 
 
 class AspectRatioWidget(QtWidgets.QWidget):
-    """A height-for-width container for a visual width:height ratio."""
+    """A height-for-width container for a visual width:height ratio.
+
+    第6轮 t3 修复：父链上的 QSplitter 不传播 heightForWidth（取证
+    D:\\博士任务\\_t3_forensics\\probe_aspect_geometry_after_fix.txt：容器
+    hfw 随比例正确变化但可见几何恒为均分值），QVBoxLayout 对两个等宽
+    stretch=1 容器的均分会把比例差完全抵消
+    （h = w/r + (H−slider−2·w/r)/2 ≡ 常数）。因此这里按当前宽度给自己加
+    ``maximumHeight = width/ratio`` 硬上限（resizeEvent 实时跟随宽度、
+    minimumSizeHint 托底防 max<min 冲突），保留父布局 stretch=1 填充：
+    可见高度 = min(均分份额, width/ratio)——比例可容纳时精确呈现长宽比
+    （letterbox 留白），视图总高放不下时上限不绑定、回落既有均分行为
+    （物理极限），默认 ratio=2.0 大窗口外观与修复前一致。
+    """
 
     def __init__(self, child: QtWidgets.QWidget, width_to_height: float = 2.0) -> None:
         super().__init__()
@@ -500,7 +540,19 @@ class AspectRatioWidget(QtWidgets.QWidget):
 
     def set_aspect_ratio(self, width_to_height: float) -> None:
         self._aspect_ratio = min(max(float(width_to_height), 0.5), 6.0)
+        self._apply_height_cap()
         self.updateGeometry()
+
+    def _apply_height_cap(self) -> None:
+        """按当前宽度把可见高度上限锁到 width/ratio（t3 修复核心）。"""
+        if self.width() <= 0:
+            return
+        floor_h = self.minimumSizeHint().height()
+        self.setMaximumHeight(max(floor_h, int(round(self.width() / self._aspect_ratio))))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().resizeEvent(event)
+        self._apply_height_cap()
 
 
 class ReceiverThread(QtCore.QThread):
@@ -509,6 +561,10 @@ class ReceiverThread(QtCore.QThread):
     command_status = QtCore.Signal(str)
     #: 第1轮检查点D：空中端 acquisition_status 状态消息（state/queues等）。
     acquisition_status = QtCore.Signal(dict)
+    #: 第2轮 R-A-19/R-C-20：hello 触发的 run 切换（窗口合成 acquiring 路径）。
+    run_switched = QtCore.Signal(str)
+    #: 第2轮 §5.4：校准回程消息（绝不进 _accept_trace/display FIFO，R-C-17）。
+    calibration_message = QtCore.Signal(dict)
 
     def __init__(self, host: str, port: int, out_dir: Path, metrics=None) -> None:
         super().__init__()
@@ -535,6 +591,15 @@ class ReceiverThread(QtCore.QThread):
         self._send_lock = threading.Lock()
         #: 实际绑定端口（port=0 时由 OS 分配；bind 后在 run() 内更新）。
         self._bound_port: int | None = None
+        # ---- 第2轮 R-A-19/R-A-19b：地面 run 切换与补传模式 ----
+        # 仅在接收线程内读写（handle_client/_accept_trace/_on_hello_run_id
+        # 同线程串行），无锁。
+        #: 当前基线身份（镜像的空中 run_id；空 = 无基线，重放按正常处理）。
+        self._mirrored_air_run_id: str = ""
+        #: 补传模式中的旧 run（safe_name 形态；None = 不在补传模式）。
+        self._replay_run_id: str | None = None
+        #: 补传模式按 run 计数（R-A-19b：可观测性不得静默）。
+        self._replay_counts: dict[str, int] = {}
 
     def begin_run(self, run_id: str) -> None:
         """第三次定向修复：切换 run_id 时调用，重置当前内存去重表。
@@ -545,6 +610,60 @@ class ReceiverThread(QtCore.QThread):
         _ = run_id
         with self._emitted_lock:
             self._seen_traces.clear()
+
+    # ---- 第2轮 R-A-19 / R-A-19b / R-C-20：run 切换与补传模式 ----
+
+    def _on_hello_run_id(self, run_id: object) -> None:
+        """hello 触发的 run 切换判定（接收线程内串行执行）。
+
+        词汇表唯一判据来源 = ``disk_outbox.classify_run_id``（§3.7-9，禁止
+        第二套正则）；比较 = :func:`is_not_older_than`（完整字典序）。
+        """
+        run_text = run_id if isinstance(run_id, str) else ""
+        cls = classify_run_id(run_text)
+        if cls in (RUN_ID_CLASS_IDLE, RUN_ID_CLASS_LOCAL):
+            return  # 连接身份/本地式：不切换、不改基线（词汇表处置）
+        if cls == RUN_ID_CLASS_CALIBRATION:
+            # 词汇表：校准身份本轮不上线；一旦出现按补传模式处置（trace 照常
+            # 落盘+ACK，绝不 begin_run/绝不显示）+ 记一条意外日志。
+            self.status.emit(f"意外的校准身份上线: run_id={run_text!r}（按补传模式处置）")
+            self._enter_replay_mode(run_text)
+            return
+        # ---- air_task ----
+        if run_text == self._mirrored_air_run_id:
+            return  # R-A-19③：同 run 重连 hello 不得重置窗口任务基线
+        if is_not_older_than(run_text, self._mirrored_air_run_id):
+            self._exit_replay_mode()
+            self.begin_run(run_text)  # 清内存去重表（磁盘判重路径不受影响 [冻结]）
+            self._mirrored_air_run_id = run_text
+            self.run_switched.emit(run_text)  # 窗口侧合成 acquiring 路径（R-C-20①）
+            self.status.emit(f"Run 切换（hello）: {run_text}")
+        else:
+            self._enter_replay_mode(run_text)
+
+    def _enter_replay_mode(self, run_id: str) -> None:
+        """进入补传模式：旧 run 重放仅落盘+ACK，不进显示（R-A-19b）。"""
+        run_key = safe_name(run_id, "run")
+        if self._replay_run_id == run_key:
+            return
+        if self._replay_run_id is not None:
+            self._exit_replay_mode()
+        self._replay_run_id = run_key
+        self._replay_counts[run_key] = self._replay_counts.get(run_key, 0)
+        self.status.emit(
+            f"补传模式: run={run_id} 早于基线（{self._mirrored_air_run_id or '空'}），"
+            "该 run 帧仅落盘+ACK，不进入显示"
+        )
+
+    def _exit_replay_mode(self) -> None:
+        """退出补传模式：按 run 记一条汇总日志（R-A-19b：不静默吞显示）。"""
+        if self._replay_run_id is None:
+            return
+        count = self._replay_counts.get(self._replay_run_id, 0)
+        self.status.emit(
+            f"补传模式结束: run={self._replay_run_id} 共接收 {count} 条（仅落盘，不显示）"
+        )
+        self._replay_run_id = None
 
     def _note_emitted(self) -> None:
         with self._emitted_lock:
@@ -694,6 +813,9 @@ class ReceiverThread(QtCore.QThread):
                 raise ValueError(f"unsupported protocol: {header.get('protocol')}")
             if msg_type == "hello":
                 send_frame(sock, {"type": "ack", "protocol": PROTOCOL, "timestamp": datetime.now().isoformat(timespec="seconds")})
+                # 第2轮 R-A-19/R-A-19b：hello 是 run 切换双触发之一（接收线程
+                # 内串行执行；词汇表唯一判据 = classify_run_id）。
+                self._on_hello_run_id(header.get("run_id"))
                 self.status.emit(f"Remote ready, run_id={header.get('run_id')}")
             elif msg_type == "trace":
                 _t0 = time.perf_counter()
@@ -708,12 +830,22 @@ class ReceiverThread(QtCore.QThread):
                         pass
                 self._note_emitted()  # emit 前占用待处理计数（Qt queued 屏障）。
                 self.trace_received.emit(header, payload, str(path))
+            elif isinstance(msg_type, str) and msg_type.startswith(_CALIBRATION_MESSAGE_PREFIX):
+                # 第2轮 §5.4/R-C-17：校准回程按 type 分派到校准展示分支——
+                # 绝不进 _accept_trace/_seen_traces/display FIFO，不占 trace 序列。
+                self.calibration_message.emit(dict(header))
             elif msg_type == "command_ack":
                 # command_ack 只表示停止/启动命令已被空中端接受，不等于采集
                 # 已停止（第1轮检查点D）：最终状态由 acquisition_status 决定。
                 self.command_status.emit(f"Remote accepted: {header.get('action')}")
             elif msg_type == "acquisition_status":
                 # 第1轮检查点D：向后兼容状态消息（旧接收端会落入 else 分支忽略）。
+                # R-A-19b：补传 run 的 stopped/drain_failed 到达即该 run 结束——
+                # 在接收线程记汇总日志（主线程随后按 R-A-20 迟到护栏忽略）。
+                if str(header.get("state") or "") in ("stopped", "drain_failed"):
+                    run_key = safe_name(header.get("run_id"), "run")
+                    if run_key == self._replay_run_id:
+                        self._exit_replay_mode()
                 self.acquisition_status.emit(dict(header))
             else:
                 self.status.emit(f"Ignored message: {msg_type}")
@@ -797,6 +929,9 @@ class ReceiverThread(QtCore.QThread):
                         "duplicate": True,
                     },
                 )
+                if run_key == self._replay_run_id:
+                    # R-A-19b：补传重放被 duplicate 吸收也计数（重发≠丢数）。
+                    self._replay_counts[run_key] = self._replay_counts.get(run_key, 0) + 1
                 return None  # 幂等：不重新进入解码/显示
             self.status.emit(
                 f"Trace 冲突拒绝: run={run_key} trace={trace_index} "
@@ -822,6 +957,11 @@ class ReceiverThread(QtCore.QThread):
                 "path": path.name,
             },
         )
+        if run_key == self._replay_run_id:
+            # R-A-19b：补传模式——已照常落盘+ACK（数据完整性优先，outbox 依赖
+            # ACK 划除），但绝不进显示/对账基线：不 _note_emitted、不 emit。
+            self._replay_counts[run_key] = self._replay_counts.get(run_key, 0) + 1
+            return None
         return path
 
     def save_trace(self, header: dict[str, object], payload: bytes, *, actual_sha: str | None = None) -> Path:
@@ -863,13 +1003,23 @@ class ReceiverThread(QtCore.QThread):
 
 @dataclass(frozen=True)
 class AcquisitionUiSettings:
-    """采集参数已提交状态（对话框草稿未应用前，command_params 只读这里）。
+    """采集参数与雷达扫描、处理参数已提交状态。
 
     frozen：已应用实例不可被外部原地修改；对话框每次“应用”都生成新快照。
     """
 
     interval_s: float = 0.0
     count: int = 0
+    start_mhz: float = 400.0
+    stop_mhz: float = 4000.0
+    points: int = 201
+    ifbw_hz: int = 10000
+    power_dbm: float = -20.0
+    dwell_us: int = 0
+    ifft_points: int = 2048
+    time_window_ns: float = 40.0
+    dewow_enabled: bool = False
+    dewow_window_ns: float = 4.0
 
     def command_params(self, single: bool = False) -> dict[str, object]:
         return {
@@ -877,6 +1027,23 @@ class AcquisitionUiSettings:
             "interval_s": float(self.interval_s),
             "single": single,
         }
+
+    def sweep_params(self) -> dict[str, object]:
+        return {
+            "start_mhz": float(self.start_mhz),
+            "stop_mhz": float(self.stop_mhz),
+            "points": int(self.points),
+            "ifbw_hz": int(self.ifbw_hz),
+            "power_dbm": float(self.power_dbm),
+            "dwell_us": int(self.dwell_us),
+            "ifft_points": int(self.ifft_points),
+            "time_window_ns": float(self.time_window_ns),
+            "dewow_enabled": bool(self.dewow_enabled),
+            "dewow_window_ns": float(self.dewow_window_ns),
+        }
+
+
+GroundSettings = AcquisitionUiSettings
 
 
 @dataclass(frozen=True)
@@ -893,16 +1060,24 @@ class BscanUiSettings:
 
 
 class AcquisitionSettingsDialog(QtWidgets.QDialog):
-    """采集设置对话框：编辑草稿，点“应用”才提交给主窗口。"""
+    """地面端设置中心对话框：包含采集任务控制、VNA 扫描参数与信号处理参数页。"""
 
     def __init__(self, window: "GroundStationWindow") -> None:
         super().__init__(window)
         self._window = window
         self.setObjectName("acquisition_settings_dialog")
-        self.setWindowTitle("采集设置")
-        form = QtWidgets.QFormLayout(self)
-        # 第1轮检查点C：显式采集模式，避免"0 秒间隔"这类易误解的纯数字。
-        # interval_s=0.0 是底层兼容表示（"每个完整Sweep"）。
+        self.setWindowTitle("设置中心")
+        self.resize(520, 420)
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        self.tab_widget = QtWidgets.QTabWidget(self)
+        self.tab_widget.setObjectName("settings_tab_widget")
+
+        # ---- Tab 1: 采集控制 ----
+        self.acq_page = QtWidgets.QWidget()
+        self.acq_page.setObjectName("acquisition_page")
+        form = QtWidgets.QFormLayout(self.acq_page)
         self.mode = QtWidgets.QComboBox()
         self.mode.setObjectName("acquisition_mode_input")
         self.mode.addItem("每个完整Sweep（默认）", userData=0.0)
@@ -923,7 +1098,105 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
         form.addRow("采集间隔 (s)", self.interval)
         form.addRow("采集数量", self.count)
         form.addRow("", self.count_hint)
+        self.tab_widget.addTab(self.acq_page, "采集控制")
+
+        # ---- Tab 2: 扫描参数 (SweepConfig 对齐) ----
+        self.sweep_page = QtWidgets.QWidget()
+        self.sweep_page.setObjectName("sweep_page")
+        sweep_form = QtWidgets.QFormLayout(self.sweep_page)
+        self.start_mhz = QtWidgets.QDoubleSpinBox()
+        self.start_mhz.setObjectName("start_mhz_input")
+        self.start_mhz.setRange(0.001, 6000.0)
+        self.start_mhz.setDecimals(3)
+        self.start_mhz.setValue(400.0)
+        self.start_mhz.setKeyboardTracking(False)
+        self.stop_mhz = QtWidgets.QDoubleSpinBox()
+        self.stop_mhz.setObjectName("stop_mhz_input")
+        self.stop_mhz.setRange(0.001, 6000.0)
+        self.stop_mhz.setDecimals(3)
+        self.stop_mhz.setValue(4000.0)
+        self.stop_mhz.setKeyboardTracking(False)
+        self.points = QtWidgets.QSpinBox()
+        self.points.setObjectName("points_input")
+        self.points.setRange(2, 4501)
+        self.points.setValue(201)
+        self.ifbw = QtWidgets.QSpinBox()
+        self.ifbw.setObjectName("ifbw_input")
+        self.ifbw.setRange(6, 50000)
+        self.ifbw.setValue(10000)
+        self.power = QtWidgets.QDoubleSpinBox()
+        self.power.setObjectName("power_input")
+        self.power.setRange(-40.0, 0.0)
+        self.power.setDecimals(1)
+        self.power.setValue(-20.0)
+        self.power.setKeyboardTracking(False)
+        self.dwell = QtWidgets.QSpinBox()
+        self.dwell.setObjectName("dwell_input")
+        self.dwell.setRange(0, 10239)
+        self.dwell.setValue(0)
+        sweep_form.addRow("起始频率 (MHz)", self.start_mhz)
+        sweep_form.addRow("终止频率 (MHz)", self.stop_mhz)
+        sweep_form.addRow("频点数", self.points)
+        sweep_form.addRow("中频带宽 (Hz)", self.ifbw)
+        sweep_form.addRow("发射功率 (dBm)", self.power)
+        sweep_form.addRow("驻留时间 (μs)", self.dwell)
+        self.tab_widget.addTab(self.sweep_page, "扫描参数")
+
+        # ---- Tab 3: 处理参数 (Dewow / 时间窗 对齐) ----
+        self.processing_page = QtWidgets.QWidget()
+        self.processing_page.setObjectName("processing_page")
+        proc_form = QtWidgets.QFormLayout(self.processing_page)
+        # 第6轮 t3 UX（captain 批准方案一）：设置中心此前无 B-scan 页，
+        # 长宽比唯一入口在菜单"B-scan"→"B-scan 设置……"——用户在设置中心
+        # 找不到长宽比（真机 bug2 入口困惑层）。在处理参数页顶部加一行
+        # 说明 + 直达按钮，沿用既有 open_bscan_settings 打开逻辑；
+        # 不动 3 页签结构与既有 *_input 控件。
+        self.bscan_entry_hint = QtWidgets.QLabel(
+            "长宽比 / 颜色表等 B-scan 显示选项在 B-scan 显示设置中"
+        )
+        self.bscan_entry_hint.setObjectName("bscan_entry_hint")
+        self.bscan_entry_button = QtWidgets.QPushButton(
+            "B-scan 显示设置（长宽比/颜色表）…"
+        )
+        self.bscan_entry_button.setObjectName("bscan_entry_button")
+        self.bscan_entry_button.clicked.connect(self._open_bscan_settings_entry)
+        proc_form.addRow(self.bscan_entry_hint)
+        proc_form.addRow("", self.bscan_entry_button)
+        self.dewow_enabled = QtWidgets.QCheckBox("启用 Dewow")
+        self.dewow_enabled.setObjectName("dewow_enabled_input")
+        self.dewow_enabled.setChecked(False)
+        self.dewow_window = QtWidgets.QDoubleSpinBox()
+        self.dewow_window.setObjectName("dewow_window_input")
+        self.dewow_window.setRange(0.001, 1000.0)
+        self.dewow_window.setDecimals(3)
+        self.dewow_window.setValue(4.0)
+        self.dewow_window.setEnabled(False)
+        self.dewow_enabled.toggled.connect(self.dewow_window.setEnabled)
+        self.time_window = QtWidgets.QDoubleSpinBox()
+        self.time_window.setObjectName("time_window_input")
+        self.time_window.setRange(1.0, 1000.0)
+        self.time_window.setDecimals(1)
+        self.time_window.setValue(40.0)
+        self.ifft_points = QtWidgets.QSpinBox()
+        self.ifft_points.setObjectName("ifft_points_input")
+        self.ifft_points.setRange(256, 65536)
+        self.ifft_points.setValue(2048)
+        proc_form.addRow("", self.dewow_enabled)
+        proc_form.addRow("Dewow 窗长 (ns)", self.dewow_window)
+        proc_form.addRow("时间窗 (ns)", self.time_window)
+        proc_form.addRow("IFFT 点数", self.ifft_points)
+        self.tab_widget.addTab(self.processing_page, "处理参数")
+
+        main_layout.addWidget(self.tab_widget)
+
+        # 底部按钮区：下发参数、应用、取消
         buttons = QtWidgets.QDialogButtonBox()
+        self.send_params_button = buttons.addButton(
+            "下发参数", QtWidgets.QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.send_params_button.setObjectName("send_params_button")
+        self.send_params_button.clicked.connect(self.send_params_to_air)
+
         self.apply_button = buttons.addButton(
             "应用", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
         )
@@ -934,11 +1207,33 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
         self.cancel_button.setObjectName("acquisition_cancel_button")
         buttons.accepted.connect(self.apply)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        main_layout.addWidget(buttons)
 
     def _sync_interval_enabled(self) -> None:
-        # 选择"固定时间间隔"后才启用秒数输入框。
         self.interval.setEnabled(self.mode.currentIndex() == 1)
+
+    def _open_bscan_settings_entry(self) -> None:
+        """第6轮 t3 UX：设置中心直达 B-scan 显示设置（打开既有非模态对话框）。"""
+        self._window.open_bscan_settings()
+
+    def validate(self) -> str | None:
+        if self.stop_mhz.value() <= self.start_mhz.value():
+            return "终止频率必须大于起始频率"
+        if self.points.value() < 2 or self.points.value() > 4501:
+            return "频点数超出范围 [2, 4501]"
+        if self.ifbw.value() < 6 or self.ifbw.value() > 50000:
+            return "中频带宽超出范围 [6, 50000] Hz"
+        if self.power.value() < -40.0 or self.power.value() > 0.0:
+            return "发射功率超出范围 [-40, 0] dBm"
+        if self.dwell.value() < 0 or self.dwell.value() > 10239:
+            return "驻留时间超出范围 [0, 10239] us"
+        if self.ifft_points.value() < 256 or self.ifft_points.value() > 65536:
+            return "IFFT 点数超出范围 [256, 65536]"
+        if self.time_window.value() < 1.0 or self.time_window.value() > 1000.0:
+            return "时间窗超出范围 [1, 1000] ns"
+        if self.dewow_window.value() <= 0.0 or self.dewow_window.value() > 1000.0:
+            return "Dewow 窗长超出范围 (0, 1000] ns"
+        return None
 
     def load_from(self, settings: AcquisitionUiSettings) -> None:
         if float(settings.interval_s) <= 0.0:
@@ -949,6 +1244,17 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
             float(settings.interval_s) if settings.interval_s > 0.0 else 1.0
         )
         self.count.setValue(int(settings.count))
+        self.start_mhz.setValue(float(settings.start_mhz))
+        self.stop_mhz.setValue(float(settings.stop_mhz))
+        self.points.setValue(int(settings.points))
+        self.ifbw.setValue(int(settings.ifbw_hz))
+        self.power.setValue(float(settings.power_dbm))
+        self.dwell.setValue(int(settings.dwell_us))
+        self.ifft_points.setValue(int(settings.ifft_points))
+        self.time_window.setValue(float(settings.time_window_ns))
+        self.dewow_enabled.setChecked(bool(settings.dewow_enabled))
+        self.dewow_window.setValue(float(settings.dewow_window_ns))
+        self.dewow_window.setEnabled(bool(settings.dewow_enabled))
         self._sync_interval_enabled()
 
     def draft_settings(self) -> AcquisitionUiSettings:
@@ -957,15 +1263,39 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
         else:
             interval = float(self.interval.value())
             if interval <= 0.0:
-                interval = 0.0  # 固定模式下输入 0 等价于"每个完整Sweep"。
+                interval = 0.0
         return AcquisitionUiSettings(
             interval_s=interval,
             count=int(self.count.value()),
+            start_mhz=float(self.start_mhz.value()),
+            stop_mhz=float(self.stop_mhz.value()),
+            points=int(self.points.value()),
+            ifbw_hz=int(self.ifbw.value()),
+            power_dbm=float(self.power.value()),
+            dwell_us=int(self.dwell.value()),
+            ifft_points=int(self.ifft_points.value()),
+            time_window_ns=float(self.time_window.value()),
+            dewow_enabled=bool(self.dewow_enabled.isChecked()),
+            dewow_window_ns=float(self.dewow_window.value()),
         )
 
+    def send_params_to_air(self) -> bool:
+        err = self.validate()
+        if err is not None:
+            self._window.log(f"参数验证失败: {err}")
+            return False
+        draft = self.draft_settings()
+        self._window.apply_acquisition_settings(draft)
+        self._window.send_set_params(draft.sweep_params())
+        return True
+
     def apply(self) -> None:
-        self._window.apply_acquisition_settings(self.draft_settings())
+        if not self.send_params_to_air():
+            return
         self.accept()
+
+
+GroundSettingsDialog = AcquisitionSettingsDialog
 
 
 class BscanSettingsDialog(QtWidgets.QDialog):
@@ -1092,6 +1422,540 @@ def _compute_initial_window_size() -> tuple[int, int]:
     return initial_w, initial_h
 
 
+_STEP_INSTRUCTIONS: dict[str, str] = {
+    "P1_Open": "步骤 1/6 [P1_Open]: 请在天线端口 1 (Port 1) 安装开路器 (Open)，端口 2 保持连接匹配负载 (Load)。",
+    "P1_Short": "步骤 2/6 [P1_Short]: 请在天线端口 1 (Port 1) 安装短路器 (Short)，端口 2 保持连接匹配负载 (Load)。",
+    "P1_Load": "步骤 3/6 [P1_Load]: 请在天线端口 1 (Port 1) 安装匹配负载 (Load)，端口 2 保持连接匹配负载 (Load)。",
+    "P2_Open": "步骤 4/6 [P2_Open]: 请在天线端口 2 (Port 2) 安装开路器 (Open)，端口 1 保持连接匹配负载 (Load)。",
+    "P2_Short": "步骤 5/6 [P2_Short]: 请在天线端口 2 (Port 2) 安装短路器 (Short)，端口 1 保持连接匹配负载 (Load)。",
+    "P2_Load": "步骤 6/6 [P2_Load]: 请在天线端口 2 (Port 2) 安装匹配负载 (Load)，端口 1 保持连接匹配负载 (Load)。",
+    "Background": "空采背景参考 [Background]: 请将雷达天线对准净空（远离地面及障碍物 1.5 米以上）测量直达波与天线串扰。",
+}
+
+_STEP_GUIDES: dict[str, str] = {
+    "P1_Open": "P1: Open / P2: Load",
+    "P1_Short": "P1: Short / P2: Load",
+    "P1_Load": "P1: Load / P2: Load",
+    "P2_Open": "P2: Open / P1: Load",
+    "P2_Short": "P2: Short / P1: Load",
+    "P2_Load": "P2: Load / P1: Load",
+    "Background": "天线净空对空 (空采)",
+}
+
+
+class CalibrationWizard(QtWidgets.QDialog):
+    """地面分步校准与空采向导对话框（参考 rebar-inspector reference_wizard）。
+
+    提供分步状态机、标准件安装提示、采集进度指示、失败重采、以及收齐后解算/激活控制。
+    复用第2轮 cal_* 命令链与 CalibrationSession（服务层零改动）。
+    采用垂直步骤列表 + 底部清晰分排操作栏，杜绝控件重叠。
+    """
+
+    #: OSL 六步顺序（§5.2 编排流程；与空中端 CALIBRATION 步骤一致）。
+    OSL_STEPS = ("P1_Open", "P1_Short", "P1_Load", "P2_Open", "P2_Short", "P2_Load")
+
+    def __init__(self, window: "GroundStationWindow") -> None:
+        super().__init__(window)
+        self._window = window
+        self.setObjectName("calibration_dialog")
+        self.setWindowTitle("分步校准向导（地面发起 / 空中执行）")
+        self.setModal(False)
+        self.setMinimumSize(720, 580)
+        self.resize(780, 640)
+
+        self._connected = False
+        self._cal_id: str | None = None
+        self._mode: str = "osl"
+        self._steps: list[str] = []
+        self._step_index = 0
+        self._steps_done = 0
+        self._solved = False
+        self._capturing = False
+
+        self._build_ui()
+        self._set_session_controls()
+
+    def _build_ui(self) -> None:
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(8)
+
+        # ---- 1. 校准计划配置区 ----
+        plan_group = QtWidgets.QGroupBox("校准计划与扫描参数")
+        plan_group.setObjectName("calibration_plan_group")
+        plan_grid = QtWidgets.QGridLayout(plan_group)
+        plan_grid.setSpacing(6)
+
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.setObjectName("calibration_mode_input")
+        self.mode_combo.addItem("OSL（六步双反射）", userData="osl")
+        self.mode_combo.addItem("空采参考（背景）", userData="background")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+
+        self.repeats = QtWidgets.QSpinBox()
+        self.repeats.setObjectName("calibration_repeats_input")
+        self.repeats.setRange(1, 256)
+        self.repeats.setValue(16)
+
+        self.cal_start = QtWidgets.QDoubleSpinBox()
+        self.cal_start.setObjectName("calibration_start_mhz_input")
+        self.cal_start.setRange(0.001, 6000.0)
+        self.cal_start.setDecimals(3)
+        self.cal_start.setValue(400.0)
+
+        self.cal_stop = QtWidgets.QDoubleSpinBox()
+        self.cal_stop.setObjectName("calibration_stop_mhz_input")
+        self.cal_stop.setRange(0.001, 6000.0)
+        self.cal_stop.setDecimals(3)
+        self.cal_stop.setValue(4000.0)
+
+        self.cal_points = QtWidgets.QSpinBox()
+        self.cal_points.setObjectName("calibration_points_input")
+        self.cal_points.setRange(2, 4501)
+        self.cal_points.setValue(201)
+
+        self.cal_ifbw = QtWidgets.QSpinBox()
+        self.cal_ifbw.setObjectName("calibration_ifbw_input")
+        self.cal_ifbw.setRange(6, 50000)
+        self.cal_ifbw.setValue(10000)
+
+        self.cal_power = QtWidgets.QDoubleSpinBox()
+        self.cal_power.setObjectName("calibration_power_input")
+        self.cal_power.setRange(-40.0, 0.0)
+        self.cal_power.setDecimals(1)
+        self.cal_power.setValue(-20.0)
+
+        self.cal_dwell = QtWidgets.QSpinBox()
+        self.cal_dwell.setObjectName("calibration_dwell_input")
+        self.cal_dwell.setRange(0, 10239)
+        self.cal_dwell.setValue(0)
+
+        plan_grid.addWidget(QtWidgets.QLabel("校准模式:"), 0, 0)
+        plan_grid.addWidget(self.mode_combo, 0, 1)
+        plan_grid.addWidget(QtWidgets.QLabel("每步重复采样:"), 0, 2)
+        plan_grid.addWidget(self.repeats, 0, 3)
+
+        plan_grid.addWidget(QtWidgets.QLabel("起始频率 (MHz):"), 1, 0)
+        plan_grid.addWidget(self.cal_start, 1, 1)
+        plan_grid.addWidget(QtWidgets.QLabel("终止频率 (MHz):"), 1, 2)
+        plan_grid.addWidget(self.cal_stop, 1, 3)
+
+        plan_grid.addWidget(QtWidgets.QLabel("频点数:"), 2, 0)
+        plan_grid.addWidget(self.cal_points, 2, 1)
+        plan_grid.addWidget(QtWidgets.QLabel("中频带宽 (Hz):"), 2, 2)
+        plan_grid.addWidget(self.cal_ifbw, 2, 3)
+
+        plan_grid.addWidget(QtWidgets.QLabel("发射功率 (dBm):"), 3, 0)
+        plan_grid.addWidget(self.cal_power, 3, 1)
+        plan_grid.addWidget(QtWidgets.QLabel("驻留时间 (us):"), 3, 2)
+        plan_grid.addWidget(self.cal_dwell, 3, 3)
+
+        main_layout.addWidget(plan_group)
+
+        # ---- 2. 分步采集表格与进度区 ----
+        steps_group = QtWidgets.QGroupBox("分步采集状态与进度")
+        steps_group.setObjectName("calibration_steps_group")
+        steps_layout = QtWidgets.QVBoxLayout(steps_group)
+        steps_layout.setSpacing(6)
+
+        self.steps_table = QtWidgets.QTableWidget(0, 4)
+        self.steps_table.setObjectName("calibration_steps_table")
+        self.steps_table.setHorizontalHeaderLabels(["步骤", "状态", "安装指引", "质量 / 备注"])
+        self.steps_table.horizontalHeader().setStretchLastSection(True)
+        self.steps_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.steps_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.steps_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.steps_table.verticalHeader().setVisible(False)
+        self.steps_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.steps_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.steps_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.steps_table.setFixedHeight(150)
+        steps_layout.addWidget(self.steps_table)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setObjectName("calibration_progress_bar")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("总进度: %p%")
+        steps_layout.addWidget(self.progress_bar)
+
+        main_layout.addWidget(steps_group)
+
+        # ---- 3. 当前步骤指引与状态反馈区 ----
+        instruction_box = QtWidgets.QGroupBox("当前步骤操作指引")
+        instruction_box.setObjectName("calibration_instruction_box")
+        instruction_layout = QtWidgets.QVBoxLayout(instruction_box)
+        instruction_layout.setSpacing(4)
+
+        self.instruction_label = QtWidgets.QLabel("请配置校准计划后点击“开始校准”启动向导。")
+        self.instruction_label.setObjectName("calibration_instruction_label")
+        self.instruction_label.setWordWrap(True)
+        self.instruction_label.setStyleSheet("QLabel { font-weight: bold; font-size: 13px; color: #1a73e8; }")
+        instruction_layout.addWidget(self.instruction_label)
+
+        self.warning_label = QtWidgets.QLabel("⚠ 提示：更换物理标准件后请务必确认接头紧固连接，再点击“采集下一步”。")
+        self.warning_label.setObjectName("calibration_warning_label")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet("QLabel { color: #d93025; font-size: 11px; }")
+        instruction_layout.addWidget(self.warning_label)
+
+        self.status_label = QtWidgets.QLabel("未连接空中端")
+        self.status_label.setObjectName("calibration_status_label")
+        self.status_label.setWordWrap(True)
+        instruction_layout.addWidget(self.status_label)
+
+        self.quality_label = QtWidgets.QLabel("质量指标：-")
+        self.quality_label.setObjectName("calibration_quality_label")
+        self.quality_label.setWordWrap(True)
+        instruction_layout.addWidget(self.quality_label)
+
+        self.result_label = QtWidgets.QLabel("结果摘要：-")
+        self.result_label.setObjectName("calibration_result_label")
+        self.result_label.setWordWrap(True)
+        instruction_layout.addWidget(self.result_label)
+
+        main_layout.addWidget(instruction_box)
+
+        # ---- 4. 底部操作栏（杜绝按钮重叠：分排水平流式布局）----
+        bar1 = QtWidgets.QHBoxLayout()
+        bar1.setSpacing(8)
+
+        self.begin_button = QtWidgets.QPushButton("开始校准")
+        self.begin_button.setObjectName("calibration_begin_button")
+        self.begin_button.setMinimumHeight(32)
+        self.begin_button.clicked.connect(self.begin_calibration)
+
+        self.capture_button = QtWidgets.QPushButton("采集下一步")
+        self.capture_button.setObjectName("calibration_capture_button")
+        self.capture_button.setMinimumHeight(32)
+        self.capture_button.clicked.connect(self.capture_next_step)
+        self.capture_button.setEnabled(False)
+
+        recapture_label = QtWidgets.QLabel("重采目标:")
+        recapture_label.setObjectName("calibration_recapture_label")
+
+        self.recapture_combo = QtWidgets.QComboBox()
+        self.recapture_combo.setObjectName("calibration_recapture_combo")
+        self.recapture_combo.setMinimumHeight(30)
+        self.recapture_combo.setMinimumWidth(100)
+
+        self.recapture_button = QtWidgets.QPushButton("重采该步骤")
+        self.recapture_button.setObjectName("calibration_recapture_button")
+        self.recapture_button.setMinimumHeight(32)
+        self.recapture_button.clicked.connect(self.recapture_selected_step)
+        self.recapture_button.setEnabled(False)
+
+        bar1.addWidget(self.begin_button)
+        bar1.addWidget(self.capture_button)
+        bar1.addWidget(recapture_label)
+        bar1.addWidget(self.recapture_combo)
+        bar1.addWidget(self.recapture_button)
+        bar1.addStretch(1)
+        main_layout.addLayout(bar1)
+
+        bar2 = QtWidgets.QHBoxLayout()
+        bar2.setSpacing(8)
+
+        self.finish_button = QtWidgets.QPushButton("解算并生成")
+        self.finish_button.setObjectName("calibration_finish_button")
+        self.finish_button.setMinimumHeight(32)
+        self.finish_button.clicked.connect(self.finish_calibration)
+        self.finish_button.setEnabled(False)
+
+        self.activate_button = QtWidgets.QPushButton("激活校准")
+        self.activate_button.setObjectName("calibration_activate_button")
+        self.activate_button.setMinimumHeight(32)
+        self.activate_button.clicked.connect(self.activate_calibration)
+        self.activate_button.setEnabled(False)
+
+        self.cancel_button = QtWidgets.QPushButton("取消会话")
+        self.cancel_button.setObjectName("calibration_cancel_button")
+        self.cancel_button.setMinimumHeight(32)
+        self.cancel_button.clicked.connect(self.cancel_session)
+        self.cancel_button.setEnabled(False)
+
+        self.close_button = QtWidgets.QPushButton("关闭")
+        self.close_button.setObjectName("calibration_close_button")
+        self.close_button.setMinimumHeight(32)
+        self.close_button.clicked.connect(self.close)
+
+        bar2.addWidget(self.finish_button)
+        bar2.addWidget(self.activate_button)
+        bar2.addWidget(self.cancel_button)
+        bar2.addStretch(1)
+        bar2.addWidget(self.close_button)
+        main_layout.addLayout(bar2)
+
+    def _on_mode_changed(self) -> None:
+        mode = str(self.mode_combo.currentData() or "osl")
+        if mode == "background":
+            self.instruction_label.setText("空采背景参考模式：请将天线对准净空后点击“开始校准”。")
+        else:
+            self.instruction_label.setText("六步双反射 OSL 模式：请配置计划后点击“开始校准”。")
+
+    def _get_step_guide(self, step: str) -> str:
+        return _STEP_GUIDES.get(step, "按向导提示操作")
+
+    def _get_step_instruction(self, step: str) -> str:
+        return _STEP_INSTRUCTIONS.get(step, f"请准备并采集步骤 {step}")
+
+    # ---- 连接状态（R-C-11）----
+
+    def set_connected(self, connected: bool) -> None:
+        self._connected = bool(connected)
+        if not self._connected:
+            self.status_label.setText("未连接空中端（开始校准已禁用）")
+        elif self._cal_id is None:
+            self.status_label.setText("已连接空中端：请配置计划后点击\"开始校准\"")
+        self._set_session_controls()
+
+    def _set_session_controls(self) -> None:
+        session_active = self._cal_id is not None
+        self.begin_button.setEnabled(self._connected and not session_active)
+        self.capture_button.setEnabled(
+            session_active and self._step_index < len(self._steps) and not self._capturing
+        )
+        self.recapture_button.setEnabled(
+            session_active and self.recapture_combo.count() > 0 and not self._capturing
+        )
+        self.finish_button.setEnabled(
+            session_active and self._steps_done >= len(self._steps) and not self._solved and not self._capturing
+        )
+        self.activate_button.setEnabled(session_active and self._solved and not self._capturing)
+        self.cancel_button.setEnabled(session_active)
+
+        for widget in (
+            self.mode_combo,
+            self.repeats,
+            self.cal_start,
+            self.cal_stop,
+            self.cal_points,
+            self.cal_ifbw,
+            self.cal_power,
+            self.cal_dwell,
+        ):
+            widget.setEnabled(not session_active)
+
+    def _refresh_step_highlight(self) -> None:
+        total = len(self._steps)
+        if total > 0:
+            pct = int((self._steps_done / total) * 100)
+            self.progress_bar.setValue(pct)
+            self.progress_bar.setFormat(f"总进度: {self._steps_done}/{total} ({pct}%)")
+
+        current_step = self._steps[self._step_index] if self._step_index < total else None
+        if current_step:
+            self.instruction_label.setText(self._get_step_instruction(current_step))
+        elif self._steps_done >= total and total > 0:
+            self.instruction_label.setText("所有步骤已采集完毕！请点击“解算并生成”完成校准解算。")
+
+        self.recapture_combo.clear()
+        for idx, step_name in enumerate(self._steps):
+            if idx < self._steps_done or idx == self._step_index:
+                self.recapture_combo.addItem(step_name, step_name)
+
+        if current_step:
+            for row in range(self.steps_table.rowCount()):
+                if self.steps_table.item(row, 0) and self.steps_table.item(row, 0).text() == current_step:
+                    self.steps_table.selectRow(row)
+                    break
+
+    # ---- 编排命令（既有 type="command" + 新 action，R-C-12）----
+
+    def _send(self, action: str, params: dict[str, object]) -> None:
+        receiver = getattr(self._window, "receiver", None)
+        send = getattr(receiver, "send_command", None)
+        if not callable(send):
+            self.status_label.setText("未连接空中端（无法发送校准命令）")
+            return
+        send(action, params)
+
+    def begin_calibration(self) -> None:
+        cal_id = f"cal_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        mode = str(self.mode_combo.currentData() or "osl")
+        steps = list(self.OSL_STEPS) if mode == "osl" else ["Background"]
+        params: dict[str, object] = {
+            "cal_id": cal_id,
+            "mode": mode,
+            "repeats": int(self.repeats.value()),
+            "config": {
+                "start_mhz": float(self.cal_start.value()),
+                "stop_mhz": float(self.cal_stop.value()),
+                "points": int(self.cal_points.value()),
+                "ifbw_hz": int(self.cal_ifbw.value()),
+                "power_dbm": float(self.cal_power.value()),
+                "dwell_us": int(self.cal_dwell.value()),
+            },
+        }
+        self._cal_id = cal_id
+        self._mode = mode
+        self._steps = steps
+        self._step_index = 0
+        self._steps_done = 0
+        self._solved = False
+        self._capturing = False
+
+        self.steps_table.setRowCount(0)
+        for name in steps:
+            self._append_step_row(name, "待采集", "")
+
+        self._refresh_step_highlight()
+        self.status_label.setText(f"已发送 cal_begin（cal_id={cal_id}）…")
+        self._send("cal_begin", params)
+        self._set_session_controls()
+
+    def capture_next_step(self) -> None:
+        if self._cal_id is None or self._step_index >= len(self._steps):
+            return
+        step = self._steps[self._step_index]
+        self._capturing = True
+        self._update_step_row(step, "请求采集中…", "")
+        self.status_label.setText(f"已发送 cal_capture（{step}）…")
+        self._set_session_controls()
+        self._send("cal_capture", {"cal_id": self._cal_id, "step": step})
+
+    def recapture_selected_step(self) -> None:
+        step = self.recapture_combo.currentText()
+        if not step:
+            return
+        self.recapture_step(step)
+
+    def recapture_step(self, step: str) -> None:
+        if self._cal_id is None or step not in self._steps:
+            return
+        self._capturing = True
+        step_idx = self._steps.index(step)
+        self._step_index = step_idx
+        self._update_step_row(step, "请求重采中…", "")
+        self.status_label.setText(f"已发送 cal_capture（重采 {step}）…")
+        self._refresh_step_highlight()
+        self._set_session_controls()
+        self._send("cal_capture", {"cal_id": self._cal_id, "step": step})
+
+    def finish_calibration(self) -> None:
+        if self._cal_id is None:
+            return
+        self._send("cal_finish", {"cal_id": self._cal_id})
+
+    def activate_calibration(self) -> None:
+        if self._cal_id is None:
+            return
+        self._send("cal_activate", {"cal_id": self._cal_id})
+
+    def cancel_session(self) -> None:
+        if self._cal_id is None:
+            return
+        self._send("cal_cancel", {"cal_id": self._cal_id, "reason": "地面操作员取消"})
+        self.status_label.setText(f"已发送 cal_cancel（cal_id={self._cal_id}）…")
+
+    # ---- 回程展示（calibration_* 消息）----
+
+    def on_calibration_message(self, header: dict) -> None:
+        msg_type = str(header.get("type") or "")
+        cal_id = str(header.get("cal_id") or "")
+        if self._cal_id is not None and cal_id and cal_id != self._cal_id:
+            return
+
+        if msg_type == "calibration_capture":
+            step = str(header.get("step") or "")
+            index = header.get("index")
+            of = header.get("of")
+            self._update_step_row(
+                step,
+                f"采集中 {index}/{of}" if of else "采集中…",
+                "",
+            )
+            if isinstance(index, int) and isinstance(of, int) and index >= of:
+                self._capturing = False
+                self._update_step_row(step, "已完成", "")
+                if step in self._steps:
+                    idx = self._steps.index(step)
+                    self._steps_done = max(self._steps_done, idx + 1)
+                    if self._step_index <= idx:
+                        self._step_index = min(idx + 1, len(self._steps))
+                self.status_label.setText(
+                    f"步骤 {step} 完成（{self._steps_done}/{len(self._steps)}）"
+                )
+                self._refresh_step_highlight()
+                self._set_session_controls()
+        elif msg_type == "calibration_quality":
+            step = str(header.get("step") or "")
+            repeat_rms = header.get("repeat_rms")
+            max_abs = header.get("max_abs_err")
+            sample = header.get("sample_count")
+            note = str(header.get("note") or "")
+            rms_text = "-" if repeat_rms is None else f"{float(repeat_rms):.3e}"
+            max_text = "-" if max_abs is None else f"{float(max_abs):.3e}"
+            self._update_step_row(
+                step,
+                "已完成",
+                f"重复RMS={rms_text} 最大误差={max_text} 样本={sample} {note}".strip(),
+            )
+            self.quality_label.setText(
+                f"质量指标: {step} 重复RMS={rms_text} 最大绝对误差={max_text} 样本数={sample}"
+                f"{'（' + note + '）' if note else ''}"
+            )
+        elif msg_type == "calibration_result":
+            status = str(header.get("status") or "")
+            if status == "planned":
+                steps = header.get("steps")
+                if isinstance(steps, list) and steps:
+                    self._steps = [str(s) for s in steps]
+                    self.steps_table.setRowCount(0)
+                    for name in self._steps:
+                        self._append_step_row(name, "待采集", "")
+                self._refresh_step_highlight()
+                self.status_label.setText(
+                    f"空中端已建会话（cal_id={cal_id}）：接好第 1 个标准件后点\"采集下一步\""
+                )
+            elif status == "solved":
+                self._solved = True
+                self.result_label.setText(
+                    "解算完成："
+                    f"路径={header.get('path') or '-'} 有效频段={header.get('valid_band_hz') or '-'}"
+                )
+                summary = str(header.get("profile_summary") or "")
+                if summary:
+                    self.result_label.setText(self.result_label.text() + f" | {summary}")
+            elif status == "activated":
+                self.status_label.setText(f"校准已激活（cal_id={cal_id}）：后续采集立即生效")
+            elif status == "cancelled":
+                self.status_label.setText(f"会话已取消（cal_id={cal_id}）；已收 capture 文件保留")
+                self._cal_id = None
+                self._capturing = False
+            elif status in ("rejected", "failed"):
+                self._capturing = False
+                self.status_label.setText(
+                    f"空中端拒绝/失败（{status}）：{header.get('reason') or '-'}"
+                )
+                if status == "failed":
+                    self._cal_id = None
+            self._set_session_controls()
+
+    # ---- 步骤表工具 ----
+
+    def _append_step_row(self, name: str, state: str, remark: str) -> None:
+        row = self.steps_table.rowCount()
+        self.steps_table.insertRow(row)
+        self.steps_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+        self.steps_table.setItem(row, 1, QtWidgets.QTableWidgetItem(state))
+        self.steps_table.setItem(row, 2, QtWidgets.QTableWidgetItem(self._get_step_guide(name)))
+        self.steps_table.setItem(row, 3, QtWidgets.QTableWidgetItem(remark))
+
+    def _update_step_row(self, name: str, state: str, remark: str) -> None:
+        for row in range(self.steps_table.rowCount()):
+            if self.steps_table.item(row, 0) is not None and self.steps_table.item(row, 0).text() == name:
+                if state:
+                    self.steps_table.setItem(row, 1, QtWidgets.QTableWidgetItem(state))
+                if remark:
+                    self.steps_table.setItem(row, 3, QtWidgets.QTableWidgetItem(remark))
+                return
+
+
+CalibrationDialog = CalibrationWizard
+
+
 class _DecoderBridge(QtCore.QObject):
     """把后台解码线程结果经 Qt 队列信号送回主线程。"""
 
@@ -1139,10 +2003,16 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self._task_baseline: dict[str, int] = {}
         self._task_run_id: str | None = None
         self._last_ground_run_id: str | None = None
+        # 第2轮 R-A-19/R-C-20：窗口侧镜像的空中 run_id（hello/acquiring 切换
+        # 时更新；R-A-20 迟到护栏用它放行"基线镜像"身份）。
+        self._mirrored_air_run_id: str | None = None
+        # 第2轮 R-C-11：远程连接状态（校准对话框"开始校准"门控）。
+        self._remote_connected = False
         # 已提交设置：主界面与 command_params 只读这里，对话框编辑独立草稿。
         self.acq_settings = AcquisitionUiSettings()
         self.bscan_settings = BscanUiSettings()
         self.bscan_rows: dict[str, list[np.ndarray]] = {name: [] for name in UI_CHANNELS}
+        self.bscan_rows_complex: dict[str, list[np.ndarray]] = {name: [] for name in UI_CHANNELS}
         self.bscan_time_ns: np.ndarray | None = None
         self.bscan_processing_signature: tuple[bool, float | None] | None = None
         self.bscan_filter_status_override: str | None = None
@@ -1174,6 +2044,10 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         # 停止提交屏障（第二次定向修复）：最终状态到达时的 FIFO 入队计数；
         # 屏障之前的全部 Trace 完成提交（committed+rejected+failed）才可停止。
         self._stop_commit_barrier: int | None = None
+        # 第5轮：链路积压可见化
+        self._air_inflight: int = 0
+        self._air_unacknowledged: int = 0
+        self._air_paused: bool = False  # 第5轮 Q1=B：空中端暂停标记（paused 状态置位）。
         # 受控依赖注入：纯显示测试可传 start_receiver=False 避免启动真实监听线程。
         self.receiver = receiver if receiver is not None else ReceiverThread(host, port, out_dir)
         # 接收/落盘阶段耗时计入同一统计（测试注入的假 receiver 无此属性则跳过）。
@@ -1187,6 +2061,12 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.receiver.command_status.connect(self._on_command_status)
         if hasattr(self.receiver, "acquisition_status"):
             self.receiver.acquisition_status.connect(self._on_acquisition_status)
+        # 第2轮 R-A-19/R-C-20：hello 触发的 run 切换 → 合成 acquiring 路径
+        #（不新增第二套基线逻辑）；校准回程 → 校准展示分支（R-C-17）。
+        if hasattr(self.receiver, "run_switched"):
+            self.receiver.run_switched.connect(self._on_hello_run_switched)
+        if hasattr(self.receiver, "calibration_message"):
+            self.receiver.calibration_message.connect(self._on_calibration_message)
         # 生产路径：接收线程收到的 Trace 交给后台解码线程，不再在主线程解压。
         # （on_trace 保留为同步兼容/测试入口。）
         self.receiver.trace_received.connect(self._on_receiver_trace_received)
@@ -1218,6 +2098,15 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.menu_task.addSeparator()
         self.action_exit = self.menu_task.addAction("退出")
         self.action_exit.setObjectName("action_exit")
+        # 第2轮 §5.2/R-C-11：地面校准入口（编排与展示，不直接访问硬件）。
+        # 追加在"退出"之后：既有冻结测试锁定 [2]=分隔线、[3]=退出 的顺序
+        #（test_ground_station_compact_ui.test_chinese_menus_and_actions_exist）。
+        self.action_calibration = self.menu_task.addAction("校准……")
+        self.action_calibration.setObjectName("action_calibration")
+        self.action_pause = self.menu_task.addAction("暂停")
+        self.action_pause.setObjectName("action_pause")
+        self.action_resume = self.menu_task.addAction("继续")
+        self.action_resume.setObjectName("action_resume")
 
         self.menu_bscan = menubar.addMenu("B-scan")
         self.action_bscan_settings = self.menu_bscan.addAction("B-scan 设置……")
@@ -1240,6 +2129,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
         self.action_single_acquisition.triggered.connect(self.send_single)
         self.action_acquisition_settings.triggered.connect(self.open_acquisition_settings)
+        self.action_calibration.triggered.connect(self.open_calibration_dialog)
+        self.action_pause.triggered.connect(self.send_pause)
+        self.action_resume.triggered.connect(self.send_resume)
         self.action_exit.triggered.connect(self.close)
         self.action_bscan_settings.triggered.connect(self.open_bscan_settings)
         self.action_clear_bscan.triggered.connect(self.clear_bscan)
@@ -1279,13 +2171,25 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         # 限制按钮宽度，避免在窄窗口下被水平拉伸；最小高度保证可点击区域。
         self.start_button.setMaximumWidth(120)
         self.start_button.setMinimumHeight(32)
+        self.pause_button = QtWidgets.QPushButton("暂停")
+        self.pause_button.setObjectName("pause_button")
+        self.pause_button.setMaximumWidth(120)
+        self.pause_button.setMinimumHeight(32)
+        self.resume_button = QtWidgets.QPushButton("继续")
+        self.resume_button.setObjectName("resume_button")
+        self.resume_button.setMaximumWidth(120)
+        self.resume_button.setMinimumHeight(32)
         self.stop_button = QtWidgets.QPushButton("停止")
         self.stop_button.setObjectName("stop_button")
         self.stop_button.setMaximumWidth(120)
         self.stop_button.setMinimumHeight(32)
         self.start_button.clicked.connect(self.send_start)
+        self.pause_button.clicked.connect(self.send_pause)
+        self.resume_button.clicked.connect(self.send_resume)
         self.stop_button.clicked.connect(self.send_stop)
         row.addWidget(self.start_button)
+        row.addWidget(self.pause_button)
+        row.addWidget(self.resume_button)
         row.addWidget(self.stop_button)
         row.addStretch(1)
         return bar
@@ -1410,11 +2314,15 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.trace_label = QtWidgets.QLabel("暂无 Trace")
         self.trace_label.setObjectName("trace_label")
         self.trace_label.setWordWrap(True)
+        self.backlog_label = QtWidgets.QLabel("空闲/已停止")
+        self.backlog_label.setObjectName("backlog_label")
+        self.backlog_label.setWordWrap(True)
         details_layout.addRow("监听地址", self.listen_label)
         details_layout.addRow("保存目录", self.out_dir_label)
         details_layout.addRow("最近事件", self.status_label)
         details_layout.addRow("当前 Trace", self.trace_label)
         details_layout.addRow("采集元数据", self.acquisition_label)
+        details_layout.addRow("链路积压", self.backlog_label)
         details_layout.addRow("Dewow", self.dewow_status)
         details_layout.addRow("Flat Filter", self.bscan_filter_status)
         details_layout.addRow("旧格式", self.legacy_status)
@@ -1422,7 +2330,30 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
         # ---- 两个设置对话框（非模态，打开时加载已提交值）----
         self.acquisition_dialog = AcquisitionSettingsDialog(self)
+        self.settings_dialog = self.acquisition_dialog
         self.bscan_dialog = BscanSettingsDialog(self)
+        # ---- 第2轮 §5.2：校准编排向导（非模态，R-C-04/R-C-11）----
+        self.calibration_dialog = CalibrationWizard(self)
+        self.calibration_wizard = self.calibration_dialog
+        self.calibration_dialog.set_connected(self._remote_connected)
+
+    def open_calibration_dialog(self) -> None:
+        """打开校准对话框（非模态；未连接时"开始校准"禁用并明确提示）。"""
+        self.calibration_dialog.set_connected(self._remote_connected)
+        self.calibration_dialog.show()
+        self.calibration_dialog.raise_()
+
+    def open_calibration_wizard(self) -> None:
+        """打开校准向导（open_calibration_dialog 的别名）。"""
+        self.open_calibration_dialog()
+
+    def _on_calibration_message(self, header: dict) -> None:
+        """校准回程分派（R-C-17：不进 trace 路径，只到展示层）。"""
+        msg_type = str(header.get("type") or "")
+        self.calibration_dialog.on_calibration_message(header)
+        if msg_type == "calibration_result":
+            status = str(header.get("status") or "")
+            self.log(f"校准回程: cal_id={header.get('cal_id')} status={status}")
 
     def open_acquisition_settings(self) -> None:
         self.acquisition_dialog.load_from(self.acq_settings)
@@ -1442,12 +2373,52 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.details_window.show()
         self.details_window.raise_()
 
+    def backlog_counts(self) -> dict[str, int]:
+        """获取当前空中端链路积压计数的快照字典。"""
+        return {
+            "inflight": int(getattr(self, "_air_inflight", 0)),
+            "unacknowledged": int(getattr(self, "_air_unacknowledged", 0)),
+        }
+
+    def backlog_text(self, state: str = "") -> str:
+        """获取当前链路积压的展示文案。"""
+        inflight = int(getattr(self, "_air_inflight", 0))
+        unack = int(getattr(self, "_air_unacknowledged", 0))
+        # 第5轮 Q1=B：暂停排空可见化——"已暂停 · 还差 K 条"随逐条到达递减，
+        # 归零后"已暂停（待命）"；恢复采集由 command_ack resume 清除暂停标记。
+        if state == "paused" or getattr(self, "_air_paused", False):
+            # 第5轮 F-A：K 口径与 stopping 统一——remaining(=outstanding) 已含
+            # 在途，不再叠加 inflight。
+            pending = unack
+            if pending > 0:
+                return f"已暂停 · 还差 {pending} 条"
+            return "已暂停（待命）"
+        if state == "stopping":
+            if unack > 0:
+                return f"排空中 · 还差 {unack} 条"
+            return "排空中"
+        if inflight > 0 or unack > 0:
+            return f"在途 {inflight} / 未确认 {unack}"
+        return "空闲/已停止"
+
     def show_about(self) -> None:
         QtWidgets.QMessageBox.about(self, "关于", "UAV-GPR 地面站")
 
     def apply_acquisition_settings(self, settings: AcquisitionUiSettings) -> None:
         self.acq_settings = settings
         self.log("采集设置已应用")
+
+    def sweep_params(self) -> dict[str, object]:
+        return self.acq_settings.sweep_params()
+
+    def send_set_params(self, params: dict[str, object] | None = None) -> None:
+        payload = dict(params if params is not None else self.acq_settings.sweep_params())
+        self.acquisition_status_label.setText("采集状态：正在下发参数")
+        if hasattr(self.receiver, "send_command"):
+            self.receiver.send_command("set_params", payload)
+
+    def open_settings_center(self) -> None:
+        self.open_acquisition_settings()
 
     def apply_bscan_settings(self, settings: BscanUiSettings) -> None:
         self.bscan_settings = settings
@@ -1464,10 +2435,20 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         lowered = text.lower()
         if text.startswith("Connected") or "remote ready" in lowered:
             self.connection_status_label.setText("连接状态：已连接")
+            self._set_remote_connected(True)
         elif "disconnected" in lowered or "client error" in lowered:
             self.connection_status_label.setText("连接状态：已断开")
+            self._set_remote_connected(False)
         elif lowered.startswith("listening"):
             self.connection_status_label.setText("连接状态：等待连接")
+            self._set_remote_connected(False)
+
+    def _set_remote_connected(self, connected: bool) -> None:
+        """R-C-11：连接状态变化同步到校准对话框（未连接→"开始校准"禁用）。"""
+        self._remote_connected = bool(connected)
+        dialog = getattr(self, "calibration_dialog", None)
+        if dialog is not None:
+            dialog.set_connected(self._remote_connected)
 
     def _on_command_status(self, text: str) -> None:
         self.log(text)
@@ -1487,6 +2468,14 @@ class GroundStationWindow(QtWidgets.QMainWindow):
                 self.acquisition_status_label.setText("采集状态：正在停止（等待排空）")
             elif action == "single":
                 self.acquisition_status_label.setText("采集状态：单次采集已接受")
+            elif action == "pause":
+                self.acquisition_status_label.setText("采集状态：已暂停")
+            elif action == "resume":
+                # 第5轮 Q1=B：恢复采集清除暂停标记（积压计数自然归零）。
+                self._air_paused = False
+                self.acquisition_status_label.setText("采集状态：采集中")
+            elif action == "set_params":
+                self.acquisition_status_label.setText("采集状态：参数已下发（以空中应用结果为准）")
             # 未知 action 不改变状态，避免误显示为“采集中”。
 
     def _on_acquisition_status(self, header: dict) -> None:
@@ -1510,15 +2499,56 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             )
             if header.get(key) is not None
         }
-        if state == "stopping":
-            self.acquisition_status_label.setText("采集状态：正在停止（排空中）")
-        elif state == "stopped":
-            # 迟到的旧 run_id stopped 不得结束新任务（第三次定向修复）。
-            new_run = str(header.get("run_id") or "")
-            cur = self._task_run_id
-            if cur and new_run and new_run != cur:
+        # 第5轮：链路积压更新
+        remaining = header.get("remaining")
+        inflight = header.get("inflight")
+        if remaining is not None:
+            self._air_unacknowledged = int(remaining)
+        if inflight is not None:
+            self._air_inflight = int(inflight)
+        if state in ("stopped", "drain_failed"):
+            self._air_inflight = 0
+            self._air_unacknowledged = 0
+            self._air_paused = False
+        if state == "paused":
+            # 第5轮 F-B（t6 评审）：迟到护栏必须**先于**置粘性标记——旧写法先置
+            # _air_paused=True 再判迟到，旧 run 的 paused 迟到会把新任务全程
+            # 污染成"已暂停"（与 R-A-20 冲突，评审生产路径实测复现）。
+            if self._is_late_air_status(str(header.get("run_id") or "")):
                 self.log(
-                    f"忽略迟到停止状态: run_id={new_run}（当前任务={cur}）"
+                    f"忽略迟到暂停状态: run_id={str(header.get('run_id') or '')}"
+                    f"（当前任务={self._task_run_id}，镜像={self._mirrored_air_run_id or '空'}）"
+                )
+                return
+            # 第5轮 Q1=B：空中端在扫频边界暂停到位（带真实积压计数）。
+            self._air_paused = True
+        if hasattr(self, "backlog_label"):
+            self.backlog_label.setText(self.backlog_text(state=state))
+
+        if state == "paused":
+            # 第5轮 F-A：K 口径与 stopping 统一——remaining(=outstanding) 已含
+            # 在途，不再叠加 inflight（旧公式首屏多计 ≤inflight 条）。
+            pending = int(getattr(self, "_air_unacknowledged", 0))
+            if pending > 0:
+                self.acquisition_status_label.setText(
+                    f"采集状态：已暂停（排空中 · 还差 {pending} 条）"
+                )
+            else:
+                self.acquisition_status_label.setText("采集状态：已暂停（待命）")
+        elif state == "stopping":
+            rem = getattr(self, "_air_unacknowledged", 0)
+            if rem > 0:
+                self.acquisition_status_label.setText(f"采集状态：正在停止（排空中 · 还差 {rem} 条）")
+            else:
+                self.acquisition_status_label.setText("采集状态：正在停止（排空中）")
+        elif state == "stopped":
+            # 迟到的旧 run_id stopped 不得结束新任务（第三次定向修复 +
+            # 第2轮 R-A-20 词汇表护栏）。
+            new_run = str(header.get("run_id") or "")
+            if self._is_late_air_status(new_run):
+                self.log(
+                    f"忽略迟到停止状态: run_id={new_run}（当前任务={self._task_run_id}，"
+                    f"镜像={self._mirrored_air_run_id or '空'}）"
                 )
                 return
             # 记录最终状态；真正的"已停止（数据已全部排空）"由对账决定。
@@ -1531,29 +2561,94 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             self._reconcile_stop_state()
         elif state == "drain_failed":
             new_run = str(header.get("run_id") or "")
-            cur = self._task_run_id
-            if cur and new_run and new_run != cur:
+            if self._is_late_air_status(new_run):
                 self.log(
-                    f"忽略迟到失败状态: run_id={new_run}（当前任务={cur}）"
+                    f"忽略迟到失败状态: run_id={new_run}（当前任务={self._task_run_id}，"
+                    f"镜像={self._mirrored_air_run_id or '空'}）"
                 )
                 return
             self._final_stop_state = None  # 失败终态：直接显示，不再对账。
             self.acquisition_status_label.setText("采集状态：排空失败（部分数据未处理）")
         elif state == "acquiring":
-            # 收到 acquiring：新任务开始。run_id 切换时建立新基线。
+            # 收到 acquiring：新任务开始（第2轮 R-A-19/R-A-19b/R-A-20 词汇表
+            # 护栏：判据唯一来源 = classify_run_id + is_not_older_than）。
             new_run = str(header.get("run_id") or "")
-            if new_run and new_run != self._task_run_id:
-                self._begin_task(run_id=new_run)
-                self._final_stop_state = None
-                self._stop_commit_barrier = None
-                self._last_ground_run_id = new_run
-            self.acquisition_status_label.setText("采集状态：采集中")
+            cls = classify_run_id(new_run)
+            if cls == RUN_ID_CLASS_AIR_TASK:
+                if new_run == self._task_run_id or new_run == self._mirrored_air_run_id:
+                    # R-A-19② 幂等：不重复 _begin_task、不清 _final_stop_state、
+                    # 不重置已建基线。
+                    # 第5轮 F-B：acquiring 接受即清除迟到 paused 的粘性标记。
+                    self._air_paused = False
+                    self.acquisition_status_label.setText("采集状态：采集中")
+                elif is_not_older_than(new_run, self._mirrored_air_run_id or ""):
+                    self._accept_air_run(new_run)
+                    # 第5轮 F-B：同上，接受新 run 即清暂停粘性标记。
+                    self._air_paused = False
+                    self.acquisition_status_label.setText("采集状态：采集中")
+                else:
+                    # 早于基线的旧 run acquiring：补传模式由接收线程处置，
+                    # 绝不为旧 run 重建任务基线（R-A-19b）。
+                    self.log(
+                        f"忽略早于基线的 acquiring: run_id={new_run}"
+                        f"（基线={self._mirrored_air_run_id or '空'}）"
+                    )
+            else:
+                # R-A-20③：非 air_task（本地占位/idle/校准）按当前 run 处理，
+                # 沿用第 1 轮语义（第 1 轮冻结测试兼容）。
+                if new_run and new_run != self._task_run_id:
+                    self._begin_task(run_id=new_run)
+                    self._final_stop_state = None
+                    self._stop_commit_barrier = None
+                    self._last_ground_run_id = new_run
+                # 第5轮 F-B：新任务基线建立即清暂停粘性标记。
+                self._air_paused = False
+                self.acquisition_status_label.setText("采集状态：采集中")
         else:
             # 未知/原始英文状态值一律映射为中文未知，不透出原始值。
             self.acquisition_status_label.setText("采集状态：未知状态")
         if detail:
             self.log(f"空中端状态: {state} {detail}")
         _ = drain_state
+
+    def _is_late_air_status(self, run_id: str) -> bool:
+        """R-A-20 迟到护栏（身份类别的唯一分类函数见 R-A-19/R-A-19b 调用点）。
+
+        本护栏只做**身份相等性**判定（第1轮冻结语义的镜像扩展）：
+
+        ① run_id == 当前基线（含本地占位 start-/single-<ts>）→ 正常；
+        ② == 基线镜像的空中 run_id（切换时记录）→ 正常；
+        ③④ 其余（真旧空中任务、旧式本地 id 等）→ 迟到忽略——与第 1 轮冻结
+        测试 ``test_late_old_run_id_stopped_ignored``（new-run/old-run）语义
+        逐字一致；"本地占位不判迟到"由 acquiring/hello 切换后的基线替换保证
+        （R-A-20 的 run₂ 场景在切换后 run₂ == 基线，走①）。
+        词汇表分类（classify_run_id）已在 R-A-19①/R-A-19b 切换判定处生效，
+        能到达本函数③④分支的身份均已通过词汇表路由。
+        """
+        if not run_id or run_id == self._task_run_id:
+            return False
+        if run_id == self._mirrored_air_run_id:
+            return False
+        return True
+
+    def _accept_air_run(self, run_id: str) -> None:
+        """接受新空中任务身份：窗口侧任务基线（hello 与 acquiring 共用路径）。
+
+        R-C-20①：hello 触发的切换经 :meth:`_on_hello_run_switched` 合成等价的
+        ``acquisition_status{state:"acquiring"}`` 到这里，不新增第二套基线逻辑。
+        """
+        self._begin_task(run_id=run_id)
+        self._final_stop_state = None
+        self._stop_commit_barrier = None
+        self._last_ground_run_id = run_id
+        self._mirrored_air_run_id = run_id
+
+    def _on_hello_run_switched(self, run_id: str) -> None:
+        """hello 触发的 run 切换（R-C-20①）：合成 acquiring 路径建任务基线。"""
+        self.log(f"空中 run 切换（hello）: {run_id}")
+        self._on_acquisition_status(
+            {"state": "acquiring", "run_id": run_id, "via": "hello"}
+        )
 
     def _begin_task(self, run_id: str) -> None:
         """建立任务级计数基线（第三次定向修复）。
@@ -1672,6 +2767,10 @@ class GroundStationWindow(QtWidgets.QMainWindow):
                 return False
         # 全部条件满足：最终显示。
         self.acquisition_status_label.setText("采集状态：已停止（数据已全部排空）")
+        self._air_inflight = 0
+        self._air_unacknowledged = 0
+        if hasattr(self, "backlog_label"):
+            self.backlog_label.setText("空闲/已停止")
         self.log("停止对账完成：空中已排空、地面解码回调与显示提交均已归零")
         self._final_stop_state = None  # 终态已呈现，避免重复触发。
         self._stop_commit_barrier = None
@@ -1703,6 +2802,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     def send_start(self) -> None:
         self._final_stop_state = None  # 新任务：清除旧停止对账状态。
         self._stop_commit_barrier = None
+        self._air_paused = False  # 新任务：清除暂停标记。
+        # 第5轮 Q2=A：开始新采集时自动清空 B-scan（停止后可回看，新任务干净画布）。
+        self.clear_bscan()
         self._begin_task(run_id=f"start-{int(time.time())}")
         self.acquisition_status_label.setText("采集状态：正在发送启动命令")
         self.receiver.send_command("start", self.command_params())
@@ -1710,6 +2812,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     def send_single(self) -> None:
         self._final_stop_state = None
         self._stop_commit_barrier = None
+        self._air_paused = False
+        # 第5轮 Q2=A：单次采集同样是新任务，画布同步清空。
+        self.clear_bscan()
         self._begin_task(run_id=f"single-{int(time.time())}")
         self.acquisition_status_label.setText("采集状态：单次采集命令已发送")
         self.receiver.send_command("single", self.command_params(single=True))
@@ -1718,8 +2823,17 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.acquisition_status_label.setText("采集状态：正在发送停止命令")
         self.receiver.send_command("stop")
 
+    def send_pause(self) -> None:
+        self.acquisition_status_label.setText("采集状态：正在发送暂停命令")
+        self.receiver.send_command("pause")
+
+    def send_resume(self) -> None:
+        self.acquisition_status_label.setText("采集状态：正在发送继续命令")
+        self.receiver.send_command("resume")
+
     def clear_bscan(self) -> None:
         self.bscan_rows = {name: [] for name in UI_CHANNELS}
+        self.bscan_rows_complex = {name: [] for name in UI_CHANNELS}
         self.bscan_time_ns = None
         self.bscan_processing_signature = None
         self.bscan_filter_status_override = None
@@ -1747,8 +2861,12 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         trace_by_channel: dict[str, np.ndarray],
         processing_signature: tuple[bool, float | None] | None = None,
     ) -> bool:
+        traces_real = {
+            name: (np.asarray(trace).real if np.iscomplexobj(trace) else trace)
+            for name, trace in trace_by_channel.items()
+        }
         try:
-            candidate_time, candidate_traces = validate_bscan_trace(time_ns, trace_by_channel)
+            candidate_time, candidate_traces = validate_bscan_trace(time_ns, traces_real)
         except (TypeError, ValueError) as exc:
             self.bscan_filter_status_override = f"B-scan已拒绝：{exc}；请清空B-scan后重新开始"
             return False
@@ -1773,8 +2891,11 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             self.bscan_time_ns = candidate_time
         if self.bscan_processing_signature is None and processing_signature is not None:
             self.bscan_processing_signature = processing_signature
+        if not hasattr(self, "bscan_rows_complex"):
+            self.bscan_rows_complex = {name: [] for name in UI_CHANNELS}
         for name in UI_CHANNELS:
             self.bscan_rows[name].append(candidate_traces[name])
+            self.bscan_rows_complex[name].append(np.asarray(trace_by_channel[name], dtype=np.complex128))
         total_after = self.bscan_trace_count()
         self.bscan_window_start = bscan_start_after_append(
             self.bscan_window_start,
@@ -1818,6 +2939,13 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         return value
 
     def _bscan_matrix_for_display(self, name: str) -> np.ndarray | None:
+        rows_c = getattr(self, "bscan_rows_complex", {}).get(name, [])
+        if rows_c and len(rows_c) == len(self.bscan_rows.get(name, [])):
+            matrix_c = np.column_stack([np.asarray(row, dtype=np.complex128) for row in rows_c])
+            flat_window = self.flat_filter_window()
+            if self.bscan_settings.flat_filter_enabled and matrix_c.shape[1] >= flat_window:
+                matrix_c = flat_reflection_filter(matrix_c, window_size=flat_window)
+            return matrix_c.real
         rows = self.bscan_rows.get(name, [])
         if not rows:
             return None
@@ -1848,16 +2976,26 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         - 色阶显式计算：实部关于 0 对称 [-max_abs, +max_abs]；全零/全 NaN
           时使用安全非零范围；S11/S22 各自独立计算。
         """
-        rows = self.bscan_rows.get(name, [])
-        if not rows:
-            return None, None
+        rows_c = getattr(self, "bscan_rows_complex", {}).get(name, [])
         flat_window = self.flat_filter_window()
-        if self.bscan_settings.flat_filter_enabled:
-            matrix, _applied = apply_flat_filter_windowed(
-                rows, self.bscan_window_start, flat_window, filter_func=flat_reflection_filter
-            )
+        if rows_c and len(rows_c) == len(self.bscan_rows.get(name, [])):
+            if self.bscan_settings.flat_filter_enabled:
+                matrix_c, _applied = apply_flat_filter_windowed(
+                    rows_c, self.bscan_window_start, flat_window, filter_func=flat_reflection_filter
+                )
+                matrix = matrix_c.real
+            else:
+                matrix = bscan_window_from_rows(self.bscan_rows[name], self.bscan_window_start).matrix
         else:
-            matrix = bscan_window_from_rows(rows, self.bscan_window_start).matrix
+            rows = self.bscan_rows.get(name, [])
+            if not rows:
+                return None, None
+            if self.bscan_settings.flat_filter_enabled:
+                matrix, _applied = apply_flat_filter_windowed(
+                    rows, self.bscan_window_start, flat_window, filter_func=flat_reflection_filter
+                )
+            else:
+                matrix = bscan_window_from_rows(rows, self.bscan_window_start).matrix
         finite = matrix[np.isfinite(matrix)]
         if finite.size:
             max_abs = float(np.max(np.abs(finite)))
@@ -1949,6 +3087,34 @@ class GroundStationWindow(QtWidgets.QMainWindow):
                     consumed()
                 except Exception:  # noqa: BLE001
                     pass
+            if getattr(self, "_air_unacknowledged", 0) > 0:
+                self._air_unacknowledged = max(0, self._air_unacknowledged - 1)
+            if getattr(self, "_air_inflight", 0) > 0:
+                self._air_inflight = max(0, self._air_inflight - 1)
+            if hasattr(self, "backlog_label"):
+                if getattr(self, "_air_paused", False):
+                    curr_state = "paused"
+                elif "正在停止" in self.acquisition_status_label.text():
+                    curr_state = "stopping"
+                else:
+                    curr_state = ""
+                self.backlog_label.setText(self.backlog_text(state=curr_state))
+            if getattr(self, "_air_paused", False):
+                # 第5轮 Q1=B + F-A：暂停排空中逐条递减（K 口径=remaining，与
+                # stopping 统一），归零切"已暂停（待命）"。
+                pending = int(getattr(self, "_air_unacknowledged", 0))
+                if pending > 0:
+                    self.acquisition_status_label.setText(
+                        f"采集状态：已暂停（排空中 · 还差 {pending} 条）"
+                    )
+                else:
+                    self.acquisition_status_label.setText("采集状态：已暂停（待命）")
+            elif "正在停止（排空中" in self.acquisition_status_label.text():
+                rem = getattr(self, "_air_unacknowledged", 0)
+                if rem > 0:
+                    self.acquisition_status_label.setText(f"采集状态：正在停止（排空中 · 还差 {rem} 条）")
+                else:
+                    self.acquisition_status_label.setText("采集状态：正在停止（排空中）")
 
     def _on_trace_rejected(self, header: dict, path: str, exc: BaseException) -> None:
         """解码失败回调（主线程，经 _DecoderBridge 信号）。

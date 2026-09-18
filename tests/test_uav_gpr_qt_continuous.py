@@ -9,7 +9,8 @@ stop、重复启停、pause/resume 无残留线程、慢消费者不阻塞 USB�
   与行为测试验证）；
 - 慢消费者不阻止 USB 持续排流；
 - start 后立即 stop、重复启停、pause/resume 均无残留线程；
-- feature flag 默认回退 legacy。
+- feature flag **默认 continuous**（第4轮采集速度修复：真机 legacy ≈2.75 s/帧），
+  legacy 需显式选择（env=legacy 或界面“采集引擎”下拉）。
 """
 
 from __future__ import annotations
@@ -733,19 +734,60 @@ class GnssReaderThreadTests(unittest.TestCase):
 
 @unittest.skipIf(air is None, f"uav_gpr_qt dependencies unavailable: {IMPORT_ERROR}")
 class FeatureFlagTests(unittest.TestCase):
-    def test_default_mode_is_legacy(self) -> None:
-        self.assertEqual(air.acquisition_mode(), "legacy")
-        self.assertFalse(air.is_continuous_enabled())
+    """采集引擎 feature flag 契约（第4轮：**默认改为高速连续**）。
+
+    第4轮透明更新（真机 2.75 s/帧 修复，团队任务卡 t1）：
+    - 旧契约：缺省 / 非法值 → legacy；显式 env 才 continuous。
+      （原 test 名为 test_default_mode_is_legacy / test_invalid_env_value_falls_back_to_legacy）
+    - 新契约：缺省 → **continuous**（高速常驻引擎，USB 只开一次）；非法值同样
+      回退 continuous；legacy 只能**显式**选（env=legacy 或界面下拉）。
+      断言意图（默认值是谁 / env 能否覆盖 / 非法值回退到默认）逐条保留，
+      只是默认值本身变了——不是删除断言。
+    """
+
+    def test_default_mode_is_continuous(self) -> None:
+        """缺省引擎 = 高速连续采集（原 test_default_mode_is_legacy 的契约反转）。"""
+        self.assertEqual(air.DEFAULT_ACQUISITION_MODE, "continuous")
+        self.assertEqual(air.acquisition_mode(), "continuous")
+        self.assertTrue(air.is_continuous_enabled())
+
+    def test_env_var_selects_legacy(self) -> None:
+        """legacy 退路仍可用：显式 env=legacy 明确切回慢引擎（调试用）。"""
+        with unittest.mock.patch.dict(os.environ, {"UAV_GPR_ACQUISITION_MODE": "legacy"}):
+            self.assertEqual(air.acquisition_mode(), "legacy")
+            self.assertFalse(air.is_continuous_enabled())
 
     def test_env_var_selects_continuous(self) -> None:
         with unittest.mock.patch.dict(os.environ, {"UAV_GPR_ACQUISITION_MODE": "continuous"}):
             self.assertTrue(air.is_continuous_enabled())
             self.assertEqual(air.acquisition_mode(), "continuous")
 
-    def test_invalid_env_value_falls_back_to_legacy(self) -> None:
+    def test_invalid_env_value_falls_back_to_continuous(self) -> None:
+        """非法值回退到**当前默认**（continuous）——绝不静默掉进慢引擎。"""
         with unittest.mock.patch.dict(os.environ, {"UAV_GPR_ACQUISITION_MODE": "bogus"}):
-            self.assertEqual(air.acquisition_mode(), "legacy")
-            self.assertFalse(air.is_continuous_enabled())
+            self.assertEqual(air.acquisition_mode(), "continuous")
+            self.assertTrue(air.is_continuous_enabled())
+
+    def test_default_window_starts_with_continuous_engine(self) -> None:
+        """未设 env 时真实 MainWindow 默认走连续引擎（端到端默认值证明）。"""
+        from PySide6 import QtWidgets
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(air.ACQUISITION_MODE_ENV, None)
+            window = air.MainWindow()
+            try:
+                window.remote_enable.setChecked(False)
+                self.assertTrue(
+                    window.continuous_enabled.isChecked(),
+                    "默认窗口必须已勾选连续采集（否则真机又走 2.75s/帧 的 legacy）",
+                )
+                self.assertEqual(window.engine_mode_combo.currentData(), "continuous")
+            finally:
+                window.close()
+                window.deleteLater()
+                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+                app.processEvents()
 
 
 class UsbWorkerStructuralTests(unittest.TestCase):
@@ -1293,7 +1335,19 @@ class RealConsumerTests(unittest.TestCase):
         worker.failed.connect(failed_messages.append, DIRECT)
         with unittest.mock.patch.object(air, "save_trace", side_effect=RuntimeError("disk full")):
             worker.start()
-            self.assertTrue(finished.wait(5.0), "autosave 失败应触发 fatal 并停止 producer")
+            # 最坏路径是设计内且有界的：消费者 fatal 退出后，若生产者在
+            # _stop 被观察到之前已填满队列，LosslessProcessingQueue.put 会
+            # "先触发受控停止再有界阻塞等待消费者腾位"（默认 max_wait_s=30，
+            # 第 1 轮 fail-closed 语义：绝不静默丢 Trace）。因此等待上限必须
+            # 覆盖该设计边界，不能只给 5s（否则调度时机决定是否偶发）。
+            self.assertTrue(
+                finished.wait(40.0), "autosave 失败应触发 fatal 并停止 producer"
+            )
+        # finished_run 以 DIRECT 连接在 run() 的 finally **内部**发出：emit 时
+        # QThread 尚未标记退出。直接断言 isRunning()==False 会与"emit 返回 →
+        # run() 返回 → 线程退出"赛跑（间歇性假失败）。语义不变：仍要求线程
+        # 真正退出，只是先做有界等待（与本文件 :578/:1199 既有写法一致）。
+        self.assertTrue(worker.wait(5000), "worker 线程应在 5s 内退出")
         self.assertFalse(worker.isRunning())
         self.assertTrue(any("处理线程异常" in m or "disk full" in m for m in failed_messages))
         self.assertFalse(backend.is_open)

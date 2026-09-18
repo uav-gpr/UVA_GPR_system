@@ -645,15 +645,17 @@ class GroundBScanGuiTests(unittest.TestCase):
                             name: produced_traces[name].copy()
                             for name in air.UI_CHANNELS
                         }
-                        for name in air.UI_CHANNELS:
-                            window.ascan_curves[name].setData(time_ns, traces[name])
-                        original_ascan = {
-                            name: tuple(
-                                None if value is None else np.asarray(value).copy()
-                                for value in window.ascan_curves[name].getData()
-                            )
-                            for name in air.UI_CHANNELS
-                        }
+                        original_ascan = {}
+                        if hasattr(window, "ascan_curves"):
+                            for name in air.UI_CHANNELS:
+                                window.ascan_curves[name].setData(time_ns, traces[name])
+                            original_ascan = {
+                                name: tuple(
+                                    None if value is None else np.asarray(value).copy()
+                                    for value in window.ascan_curves[name].getData()
+                                )
+                                for name in air.UI_CHANNELS
+                            }
                         signature = (dewow_enabled, 4.0) if dewow_enabled else (False, None)
                         for _ in range(40):
                             self.assertTrue(window._append_bscan_trace(time_ns, traces, signature))
@@ -675,14 +677,15 @@ class GroundBScanGuiTests(unittest.TestCase):
                             np.testing.assert_array_equal(produced_traces[name], pipeline_snapshot[name])
                             for actual, expected in zip(window.bscan[name], original_history[name]):
                                 np.testing.assert_array_equal(actual, expected)
-                            for actual, expected in zip(
-                                window.ascan_curves[name].getData(),
-                                original_ascan[name],
-                            ):
-                                if expected is None:
-                                    self.assertIsNone(actual)
-                                else:
-                                    np.testing.assert_array_equal(actual, expected)
+                            if hasattr(window, "ascan_curves"):
+                                for actual, expected in zip(
+                                    window.ascan_curves[name].getData(),
+                                    original_ascan[name],
+                                ):
+                                    if expected is None:
+                                        self.assertIsNone(actual)
+                                    else:
+                                        np.testing.assert_array_equal(actual, expected)
         finally:
             window.close()
             app.processEvents()

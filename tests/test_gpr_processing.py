@@ -212,6 +212,51 @@ class FlatReflectionFilterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             flat_reflection_filter(data, 7)
 
+    def test_complex_flat_reflection_filter_preserves_complex(self) -> None:
+        rng = np.random.default_rng(101)
+        r = rng.standard_normal((10, 5))
+        im = rng.standard_normal((10, 5))
+        c = r + 1j * im
+        filtered = flat_reflection_filter(c, window_size=3)
+        self.assertTrue(np.iscomplexobj(filtered))
+        np.testing.assert_allclose(filtered.real, flat_reflection_filter(r, window_size=3))
+        np.testing.assert_allclose(filtered.imag, flat_reflection_filter(im, window_size=3))
+
+
+class Round5AlignedIfftTests(unittest.TestCase):
+    def test_aligned_mode_dc_padding_and_oversampling(self) -> None:
+        freq = np.linspace(400e6, 4000e6, 201)
+        spec = np.ones(201, dtype=np.complex128)
+        t_ns, trace = frequency_to_time_trace(
+            freq, spec, time_window_ns=40.0, apply_dewow=False, aligned=True,
+            oversampling=16,
+        )
+        self.assertTrue(np.iscomplexobj(trace))
+        # 40 ns window with 16x oversampling gives 2949 samples（机制验证：显式 16 与钢筋仪同参数）
+        self.assertEqual(trace.size, 2949)
+        self.assertEqual(t_ns.size, 2949)
+
+    def test_aligned_mode_return_complex_false(self) -> None:
+        freq = np.linspace(400e6, 4000e6, 201)
+        spec = np.ones(201, dtype=np.complex128)
+        t_ns, trace = frequency_to_time_trace(
+            freq, spec, time_window_ns=40.0, apply_dewow=False, aligned=True,
+            return_complex=False, oversampling=16,
+        )
+        self.assertFalse(np.iscomplexobj(trace))
+        self.assertEqual(trace.dtype, np.float64)
+        self.assertEqual(trace.size, 2949)
+
+    def test_complex_dewow(self) -> None:
+        rng = np.random.default_rng(202)
+        r = rng.standard_normal(50)
+        im = rng.standard_normal(50)
+        c = r + 1j * im
+        filtered = dewow(c, dt_s=0.1e-9, window_ns=1.0)
+        self.assertTrue(np.iscomplexobj(filtered))
+        np.testing.assert_allclose(filtered.real, dewow(r, dt_s=0.1e-9, window_ns=1.0))
+        np.testing.assert_allclose(filtered.imag, dewow(im, dt_s=0.1e-9, window_ns=1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ import math
 import numpy as np
 
 
-BSCAN_WINDOW_TRACES = 64
+BSCAN_WINDOW_TRACES = 256
 BSCAN_TIME_RTOL = 1e-9
 BSCAN_TIME_ATOL = 1e-9
 
@@ -55,7 +55,7 @@ def _validated_trace_count(total_traces: int) -> int:
 
 
 def bscan_window_max_start(total_traces: int) -> int:
-    """Return the one-based first-trace position of the final 64-trace window."""
+    """Return the one-based first-trace position of the final 256-trace window."""
     total = _validated_trace_count(total_traces)
     return max(1, total - BSCAN_WINDOW_TRACES + 1)
 
@@ -158,13 +158,13 @@ def bscan_window_from_rows(
     start_trace: int = 1,
     n_samples: int | None = None,
 ) -> BScanWindow:
-    """直接从历史行列表构造当前 64 道显示窗口（不构造全部历史矩阵）。
+    """直接从历史行列表构造当前 256 道显示窗口（不构造全部历史矩阵）。
 
     ``rows`` 为按时间顺序追加的 1-D trace 列表（每条长度相同）。本函数只
-    切片 ``[start-1, start-1+64)`` 的行并拷贝进 NaN 填充的
-    ``[n_samples, 64]`` 矩阵，成本受窗口大小约束，与历史总道数无关。
+    切片 ``[start-1, start-1+256)`` 的行并拷贝进 NaN 填充的
+    ``[n_samples, 256]`` 矩阵，成本受窗口大小约束，与历史总道数无关。
 
-    ``n_samples`` 缺省时取第一行的长度；不足 64 道时用 NaN 右侧填充；
+    ``n_samples`` 缺省时取第一行的长度；不足 256 道时用 NaN 右侧填充；
     空历史返回全 NaN 窗口（``start_trace`` 收敛为 1、``end_trace`` 为 0）。
     返回的 ``matrix`` 总是 ``float64``、形状 ``[n_samples, BSCAN_WINDOW_TRACES]``。
     """
@@ -218,7 +218,7 @@ def flat_filter_window_bounds(
     start_trace: int,
     flat_window_size: int,
 ) -> tuple[int, int]:
-    """返回可见 64 道窗口加上 Flat Filter 半窗邻域后的 1-based 切片边界。
+    """返回可见 256 道窗口加上 Flat Filter 半窗邻域后的 1-based 切片边界。
 
     边界裁剪到真实历史范围。构造 ``[lo, hi]`` 邻域子矩阵执行
     :func:`gpr_processing.flat_reflection_filter` 后裁剪回可见窗口，与对
@@ -250,7 +250,7 @@ def apply_flat_filter_windowed(
     """对可见窗口执行 Flat Filter，成本受窗口+邻域约束而非完整历史。
 
     返回 ``(filtered_window_matrix, filtered)``：``filtered_window_matrix``
-    是 ``[n_samples, BSCAN_WINDOW_TRACES]``（不足 64 道右侧 NaN 填充）；
+    是 ``[n_samples, BSCAN_WINDOW_TRACES]``（不足 256 道右侧 NaN 填充）；
     ``filtered=False`` 表示历史道数不足以支撑该滤波窗口（与既有"等待N道，
     显示未滤波数据"语义一致），此时返回未滤波窗口。
 

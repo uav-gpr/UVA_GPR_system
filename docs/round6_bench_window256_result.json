@@ -1,0 +1,230 @@
+{
+  "配置": {
+    "n_samples": 1475,
+    "n_history": 1000,
+    "flat_window": 31,
+    "repeat_pure": 50,
+    "repeat_gui": 30,
+    "预算_ms_per_refresh": 40.0
+  },
+  "纯NumPy_64档": {
+    "window": 64,
+    "last_window_start": 937,
+    "flat_off_bscan_window_from_rows_ms": {
+      "p50_ms": 0.149,
+      "p95_ms": 0.161,
+      "max_ms": 0.308
+    },
+    "flat_on_apply_flat_filter_windowed_ms": {
+      "p50_ms": 2.44,
+      "p95_ms": 2.893,
+      "max_ms": 3.72
+    }
+  },
+  "纯NumPy_256档": {
+    "window": 256,
+    "last_window_start": 745,
+    "flat_off_bscan_window_from_rows_ms": {
+      "p50_ms": 1.707,
+      "p95_ms": 2.165,
+      "max_ms": 2.442
+    },
+    "flat_on_apply_flat_filter_windowed_ms": {
+      "p50_ms": 8.543,
+      "p95_ms": 10.73,
+      "max_ms": 12.246
+    }
+  },
+  "纯NumPy_256档_flat窗口127_末窗": {
+    "window": 256,
+    "flat_window": 127,
+    "start": 745,
+    "subset_cols": 319,
+    "flat_on_apply_flat_filter_windowed_ms": {
+      "p50_ms": 10.31,
+      "p95_ms": 12.371,
+      "max_ms": 13.291
+    }
+  },
+  "纯NumPy_256档_flat窗口127_中段382列": {
+    "window": 256,
+    "flat_window": 127,
+    "start": 400,
+    "subset_cols": 382,
+    "flat_on_apply_flat_filter_windowed_ms": {
+      "p50_ms": 11.874,
+      "p95_ms": 15.737,
+      "max_ms": 17.403
+    }
+  },
+  "GUI_64档_flat关": {
+    "window": 64,
+    "flat_enabled": false,
+    "flat_window": 31,
+    "history": 1000,
+    "n_samples": 1475,
+    "refresh_plus_paint_ms": {
+      "p50_ms": 0.648,
+      "p95_ms": 4.137,
+      "max_ms": 5.717
+    }
+  },
+  "GUI_64档_flat开": {
+    "window": 64,
+    "flat_enabled": true,
+    "flat_window": 31,
+    "history": 1000,
+    "n_samples": 1475,
+    "refresh_plus_paint_ms": {
+      "p50_ms": 4.136,
+      "p95_ms": 7.596,
+      "max_ms": 7.806
+    }
+  },
+  "GUI_256档_flat关": {
+    "window": 256,
+    "flat_enabled": false,
+    "flat_window": 31,
+    "history": 1000,
+    "n_samples": 1475,
+    "refresh_plus_paint_ms": {
+      "p50_ms": 6.648,
+      "p95_ms": 8.833,
+      "max_ms": 9.948
+    }
+  },
+  "GUI_256档_flat开": {
+    "window": 256,
+    "flat_enabled": true,
+    "flat_window": 31,
+    "history": 1000,
+    "n_samples": 1475,
+    "refresh_plus_paint_ms": {
+      "p50_ms": 23.22,
+      "p95_ms": 28.621,
+      "max_ms": 30.039
+    }
+  },
+  "GUI_256档_flat开_窗口127": {
+    "window": 256,
+    "flat_enabled": true,
+    "flat_window": 127,
+    "history": 1000,
+    "n_samples": 1475,
+    "refresh_plus_paint_ms": {
+      "p50_ms": 25.767,
+      "p95_ms": 31.069,
+      "max_ms": 33.466
+    }
+  },
+  "功能契约_300道": {
+    "all_ok": true,
+    "checks": [
+      {
+        "check": "300道逐道追加_历史=300",
+        "ok": true,
+        "detail": "count=300"
+      },
+      {
+        "check": "300道_显示窗起点=45(follow-latest)",
+        "ok": true,
+        "detail": "start=45"
+      },
+      {
+        "check": "300道_滑块最大=45",
+        "ok": true,
+        "detail": "slider_max=45"
+      },
+      {
+        "check": "300道_标签=显示 45–300 / 共 300 道",
+        "ok": true,
+        "detail": "label='显示 45–300 / 共 300 道'"
+      },
+      {
+        "check": "300道_图像宽=256",
+        "ok": true,
+        "detail": "width=256"
+      },
+      {
+        "check": "300道_窗口矩阵形状=[1475,256]",
+        "ok": true,
+        "detail": "shape=(1475, 256)"
+      },
+      {
+        "check": "300道_256列全部有限(无NaN)",
+        "ok": true,
+        "detail": "finite_cols=256"
+      },
+      {
+        "check": "300道_首列=第45道",
+        "ok": true,
+        "detail": "matrix[:,0]==rows[44]"
+      },
+      {
+        "check": "300道_末列=第300道",
+        "ok": true,
+        "detail": "matrix[:,255]==rows[299]"
+      },
+      {
+        "check": "300道_xRange=[44.5,300.5]",
+        "ok": true,
+        "detail": "xRange=[44.5, 300.5]"
+      },
+      {
+        "check": "100道_有限列=100",
+        "ok": true,
+        "detail": "finite_cols=100"
+      },
+      {
+        "check": "100道_列100..255全NaN",
+        "ok": true,
+        "detail": "nan_cols=156"
+      },
+      {
+        "check": "100道_图像宽=256",
+        "ok": true,
+        "detail": "width=256"
+      },
+      {
+        "check": "100道_标签=显示 1–100 / 共 100 道",
+        "ok": true,
+        "detail": "label='显示 1–100 / 共 100 道'"
+      },
+      {
+        "check": "拖到20_标签=显示 20–275 / 共 300 道",
+        "ok": true,
+        "detail": "label='显示 20–275 / 共 300 道'"
+      },
+      {
+        "check": "拖到20_256列全部有限",
+        "ok": true,
+        "detail": "finite_cols=256"
+      },
+      {
+        "check": "拖到20_首列=第20道",
+        "ok": true,
+        "detail": "matrix20[:,0]==rows[19]"
+      },
+      {
+        "check": "拖到20_末列=第275道",
+        "ok": true,
+        "detail": "matrix20[:,255]==rows[274]"
+      },
+      {
+        "check": "拖到45_标签=显示 45–300 / 共 300 道",
+        "ok": true,
+        "detail": "label='显示 45–300 / 共 300 道'"
+      },
+      {
+        "check": "拖到45_首列=第45道",
+        "ok": true,
+        "detail": "matrix45[:,0]==rows[44]"
+      },
+      {
+        "check": "越界50_收敛到45",
+        "ok": true,
+        "detail": "start=45, label='显示 45–300 / 共 300 道'"
+      }
+    ]
+  }
+}

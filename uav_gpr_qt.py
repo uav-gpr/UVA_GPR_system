@@ -4509,7 +4509,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.remote_enable = QtWidgets.QCheckBox("Remote send")
         self.remote_enable.setObjectName("remote_enable_input")
         self.remote_enable.setChecked(True)
-        self.remote_host = QtWidgets.QLineEdit("127.0.0.1")
+        # 第5轮修复（真机反馈）：默认 IP 不再预填 127.0.0.1——开机自动连接
+        # 定时器遇到空 IP 会跳过（connect_remote_sender 的空值守卫），只有
+        # 用户填入真实地址后才会连接。占位文字提示该填什么。
+        self.remote_host = QtWidgets.QLineEdit("")
+        self.remote_host.setPlaceholderText("例: 192.168.144.10")
         self.remote_host.setObjectName("remote_host_input")
         self.remote_host.setMaximumWidth(140)
         self.remote_port = QtWidgets.QSpinBox()
@@ -5381,11 +5385,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "remote_enable") or not self.remote_enable.isChecked():
             return
         if self.remote_sender is not None:
-            self.log("Remote sender already running")
+            # 第5轮修复（真机反馈）：Connect 按钮为连接/断开切换——已连接时
+            # 点击=断开，用户才能修改 IP 后重连（旧实现只会提示已运行，
+            # IP 一旦创建发送器就被钉死到重启）。
+            self.disconnect_remote_sender()
             return
         host = self.remote_host.text().strip()
         if not host:
-            self.log("Remote IP is empty")
+            self.log("Remote IP 为空：请先在“地面站 IP”框填入地面端地址")
             return
         # 第2轮 §3.7：连接（通道）身份统一由服务签发（idle 式，永不携带 trace；
         # 任务消息各自携带自己的 run_id）。生产代码不得再有第二处 run_id 拼接。
@@ -5401,7 +5408,25 @@ class MainWindow(QtWidgets.QMainWindow):
             outbox_dir=Path(self.output_dir.text()),
         )
         self.remote_sender.start()
+        # 第5轮修复：连接中锁定 IP/端口输入（断开后自动解锁），状态一目了然。
+        self.remote_host.setEnabled(False)
+        self.remote_port.setEnabled(False)
+        self.remote_connect.setText("断开 Disconnect")
         self.log(f"Remote sender connecting: {host}:{self.remote_port.value()}")
+
+    def disconnect_remote_sender(self) -> None:
+        """断开发送线程（第5轮真机反馈）：未发送数据保留在磁盘 outbox，
+        重连新地址后自动补传，绝不丢数据。"""
+        sender = self.remote_sender
+        if sender is None:
+            return
+        self.log("正在断开远程连接（未发送数据保留在磁盘 outbox，重连后自动补传）...")
+        sender.stop(timeout_ms=2000, drain=False)
+        self.remote_sender = None
+        self.remote_host.setEnabled(True)
+        self.remote_port.setEnabled(True)
+        self.remote_connect.setText("Connect")
+        self.log("Remote sender 已断开：可修改“地面站 IP/端口”后重新连接")
 
     def _is_acquisition_running(self) -> bool:
         worker_running = self.worker is not None and self.worker.isRunning()

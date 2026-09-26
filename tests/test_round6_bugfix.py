@@ -27,6 +27,15 @@ AspectRatioWidget 按当前宽度给自己加 maximumHeight=width/ratio 硬上�
 min(均分份额, width/ratio)——默认 2.0 大窗口外观不变、比例可容纳时精确
 生效、视图放不下时物理回落均分。另按 captain 批准方案一在设置中心
 "处理参数"页顶部加 B-scan 显示设置直达入口（UX 入口困惑层）。
+
+t5 锁定（真机反馈：空中端开机自动连接 127.0.0.1 且 IP 无法更改）：
+1. 默认"地面站 IP"为空（不再预填 127.0.0.1），占位文字提示格式；
+   开机 1.2s 自动连接定时器遇空 IP 跳过（不创建 sender）。
+2. Connect 按钮为连接/断开切换：连接后 IP/端口输入框禁用、按钮变
+   "断开 Disconnect"；点击断开 → sender.stop(drain=False)（未发送数据
+   保留磁盘 outbox，重连自动补传）→ sender 置 None、输入框解锁、
+   按钮回 "Connect" → 可改 IP 后重连到新地址（RemoteSender 以新 host
+   构造）。旧实现无任何断开路径，IP 一旦创建发送器即被钉死到重启。
 """
 
 from __future__ import annotations
@@ -349,6 +358,72 @@ class AspectRatioRealWindowTests(unittest.TestCase):
             self.window.bscan_dialog.aspect.value(),
             self.window.bscan_settings.aspect_ratio,
         )
+
+
+class RemoteConnectToggleTests(unittest.TestCase):
+    """t5：开机不自动连 127.0.0.1 + Connect 按钮连接/断开切换。
+
+    真机反馈：空中端默认预填 127.0.0.1 且开机自动连接，连接后 IP 被钉死
+    （旧实现无任何断开路径，Connect 点击只会提示 already running）。
+    修复 = 默认空 IP（自动连接定时器遇空跳过）+ Connect 按钮切换连接/
+    断开（断开 drain=False，未发送数据留磁盘 outbox 重连补传）+ 连接中
+    锁定 IP/端口输入框。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance()
+        if cls.app is None:
+            cls.app = QtWidgets.QApplication([])
+
+    def setUp(self) -> None:
+        self.window = air.MainWindow()
+
+    def tearDown(self) -> None:
+        self.window.close()
+        self.app.processEvents()
+
+    def test_default_host_empty_not_127(self) -> None:
+        self.assertEqual(self.window.remote_host.text(), "")
+        self.assertNotEqual(self.window.remote_host.text(), "127.0.0.1")
+
+    def test_startup_connect_with_empty_host_creates_no_sender(self) -> None:
+        # 开机定时器（1.2s）触发的就是 connect_remote_sender：空 IP 必须跳过。
+        self.window.connect_remote_sender()
+        self.assertIsNone(self.window.remote_sender)
+
+    def test_connect_toggle_locks_fields_and_disconnect_releases(self) -> None:
+        constructed_hosts: list[str] = []
+
+        class FakeSender:
+            def __init__(self, host, port, run_id, status_cb, command_cb, outbox_dir=None):
+                constructed_hosts.append(host)
+                self.host = host
+                self.start = MagicMock()
+                self.stop = MagicMock(return_value=True)
+
+        with unittest.mock.patch.object(air, "RemoteSender", FakeSender):
+            # 1. 填入第一版地址并连接：IP/端口锁定、按钮变"断开"
+            self.window.remote_host.setText("192.168.144.99")
+            self.window.connect_remote_sender()
+            self.assertIsNotNone(self.window.remote_sender)
+            first_sender = self.window.remote_sender
+            self.assertFalse(self.window.remote_host.isEnabled(), "连接中必须锁定 IP 输入")
+            self.assertFalse(self.window.remote_port.isEnabled())
+            self.assertIn("断开", self.window.remote_connect.text())
+            self.assertEqual(constructed_hosts, ["192.168.144.99"])
+
+            # 2. 再点一次 = 断开：stop(drain=False) 被调、sender 置空、输入解锁
+            self.window.connect_remote_sender()
+            self.assertIsNone(self.window.remote_sender)
+            first_sender.stop.assert_called_with(timeout_ms=2000, drain=False)
+            self.assertTrue(self.window.remote_host.isEnabled(), "断开后必须可编辑 IP")
+            self.assertEqual(self.window.remote_connect.text(), "Connect")
+
+            # 3. 改成新地址重连：新地址真实生效（旧实现被钉死无法做到）
+            self.window.remote_host.setText("10.0.0.5")
+            self.window.connect_remote_sender()
+            self.assertEqual(constructed_hosts[-1], "10.0.0.5", "断开后必须能连到新 IP")
 
 
 if __name__ == "__main__":

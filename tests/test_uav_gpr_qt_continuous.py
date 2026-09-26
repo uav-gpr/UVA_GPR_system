@@ -1964,16 +1964,33 @@ class DelayedRemoteSenderTests(unittest.TestCase):
         self._cleanup(window)
 
     def test_timer_fires_while_open_still_creates_sender(self) -> None:
+        # 第5轮契约变更（真机反馈：开机自动连 127.0.0.1 且 IP 被钉死到重启）：
+        # 默认"地面站 IP"为空 → 定时器触发但**不创建 sender**（不再自动连
+        # 127.0.0.1）；填入真实 IP 后同一触发路径才创建 sender（新契约由
+        # test_round6_bugfix.RemoteConnectToggleTests 锁定切换行为）。
         window = air.MainWindow()
         window.remote_enable.setChecked(True)
         try:
+            self.assertEqual(
+                window.remote_host.text(), "", "默认 IP 必须为空（不再自动连 127.0.0.1）"
+            )
             with unittest.mock.patch.object(
                 air.RemoteSender, "_connect", side_effect=ConnectionError("no ground station")
             ):
                 loop = QtCore.QEventLoop()
                 QtCore.QTimer.singleShot(1500, loop.quit)
                 loop.exec()
-                self.assertIsNotNone(window.remote_sender, "窗口打开且定时器触发时应创建 sender")
+                self.assertIsNone(
+                    window.remote_sender, "空 IP 时定时器触发不得创建 sender（新契约）"
+                )
+            # 新契约正向面：用户填入真实 IP 后，手动/按钮路径（connect_remote_sender）
+            # 创建 sender——该路径与定时器触发走的是同一函数。
+            window.remote_host.setText("192.168.144.10")
+            with unittest.mock.patch.object(
+                air.RemoteSender, "_connect", side_effect=ConnectionError("no ground station")
+            ):
+                window.connect_remote_sender()
+                self.assertIsNotNone(window.remote_sender, "填入 IP 后手动连接应创建 sender")
         finally:
             self._cleanup(window)
         self.assertFalse(

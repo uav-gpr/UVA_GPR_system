@@ -25,38 +25,60 @@ class BScanWindowTests(unittest.TestCase):
             bscan_processing_signature(True, np.inf)
 
     def test_window_ranges_for_requested_trace_counts(self) -> None:
+        # 扩容 64→256（任务 t1）：窗口契约断言随 BSCAN_WINDOW_TRACES 同步更新，
+        # 64 窗时代的 65→2 / 100→37 / 130→67 边界值改为不足一窗（→1），
+        # 并补充 256/257 精确边界与 300/1000 大历史断言（0 删除，纯换算）。
         expected_max = {
             0: 1,
             1: 1,
             63: 1,
             64: 1,
-            65: 2,
-            100: 37,
-            130: 67,
+            65: 1,
+            100: 1,
+            130: 1,
+            256: 1,
+            257: 2,
+            300: 45,
+            1000: 745,
         }
         for total, maximum in expected_max.items():
             self.assertEqual(bscan_window_max_start(total), maximum)
-        self.assertEqual(bscan_window_bounds(65, 1), (1, 64))
-        self.assertEqual(bscan_window_bounds(65, 2), (2, 65))
-        self.assertEqual(bscan_window_bounds(100, 37), (37, 100))
-        self.assertEqual(bscan_window_bounds(130, 67), (67, 130))
+        self.assertEqual(bscan_window_bounds(65, 1), (1, 65))
+        # 65 道不足一窗：请求起点 2 收敛到 max_start=1（64 窗时代为 (2,65)）。
+        self.assertEqual(bscan_window_bounds(65, 2), (1, 65))
+        self.assertEqual(bscan_window_bounds(256, 1), (1, 256))
+        self.assertEqual(bscan_window_bounds(257, 1), (1, 256))
+        self.assertEqual(bscan_window_bounds(257, 2), (2, 257))
+        self.assertEqual(bscan_window_bounds(300, 45), (45, 300))
+        # 100/130 道不足一窗：原起点 37/67 收敛到 max_start=1（64 窗时代保留）。
+        self.assertEqual(bscan_window_bounds(100, 37), (1, 100))
+        self.assertEqual(bscan_window_bounds(130, 67), (1, 130))
 
     def test_short_scan_is_padded_without_stretching_trace_positions(self) -> None:
         matrix = np.arange(2 * 63, dtype=float).reshape(2, 63)
         window = select_bscan_window(matrix)
         self.assertEqual(window.matrix.shape, (2, BSCAN_WINDOW_TRACES))
         np.testing.assert_array_equal(window.matrix[:, :63], matrix)
-        self.assertTrue(np.isnan(window.matrix[:, 63]).all())
+        # 扩容 64→256：63 道之后到窗口右缘（列 63..255）全部 NaN 填充。
+        self.assertTrue(np.isnan(window.matrix[:, 63:]).all())
         self.assertEqual((window.start_trace, window.end_trace), (1, 63))
 
     def test_history_and_latest_following(self) -> None:
-        self.assertEqual(bscan_start_after_append(1, 64, 65, True), 2)
-        self.assertEqual(bscan_start_after_append(1, 64, 65, False), 2)
-        self.assertEqual(bscan_start_after_append(2, 65, 100, True), 37)
-        self.assertEqual(bscan_start_after_append(1, 65, 100, False), 1)
+        # 扩容 64→256（任务 t1）：
+        # 不足一窗（65 < 256）时追加不产生窗口滑动（max_start 保持 1）。
+        self.assertEqual(bscan_start_after_append(1, 64, 65, True), 1)
+        self.assertEqual(bscan_start_after_append(1, 64, 65, False), 1)
+        # 跨过 256 道边界后 follow-latest 追随到 max_start(after)=2。
+        self.assertEqual(bscan_start_after_append(1, 256, 257, True), 2)
+        self.assertEqual(bscan_start_after_append(1, 256, 257, False), 2)
+        # 历史足够长时 follow-latest 跳到新 max_start；非 follow 保持原起点。
+        self.assertEqual(bscan_start_after_append(2, 257, 300, True), 45)
+        self.assertEqual(bscan_start_after_append(1, 257, 300, False), 1)
 
     def test_same_start_gives_aligned_absolute_trace_slice_for_hh_and_vv(self) -> None:
-        hh = np.arange(3 * 100, dtype=float).reshape(3, 100)
+        # 扩容 64→256（任务 t1）：100 道在 256 窗下不足一窗（起点会被收敛到 1），
+        # 改用 300 道历史（max_start=45）保持"同起点 → HH/VV 绝对道对齐"意图。
+        hh = np.arange(3 * 300, dtype=float).reshape(3, 300)
         vv = hh + 10000.0
         hh_window = select_bscan_window(hh, 37)
         vv_window = select_bscan_window(vv, 37)
@@ -85,8 +107,10 @@ class BScanWindowTests(unittest.TestCase):
                 bscan_window_max_start(value)
             with self.assertRaises(TypeError):
                 bscan_window_bounds(10, value)
-        self.assertEqual(bscan_window_max_start(np.int64(65)), 2)
-        self.assertEqual(bscan_window_bounds(np.int64(65), np.int64(2)), (2, 65))
+        self.assertEqual(bscan_window_max_start(np.int64(257)), 2)
+        # 65 道不足一窗：起点 2 收敛到 1；257 道时起点 2 合法保留。
+        self.assertEqual(bscan_window_bounds(np.int64(65), np.int64(2)), (1, 65))
+        self.assertEqual(bscan_window_bounds(np.int64(257), np.int64(2)), (2, 257))
 
     def test_trace_validation_and_time_axis_compatibility(self) -> None:
         time_ns = np.array([0.0, 2.0, 4.0, 6.0])

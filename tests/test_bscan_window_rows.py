@@ -23,7 +23,12 @@ def _rows(n_traces: int, n_samples: int, seed: int = 7) -> list[np.ndarray]:
 class BScanWindowFromRowsTests(unittest.TestCase):
     def test_various_trace_counts(self) -> None:
         # 传入极大 start_trace：自动收敛到 max_start（follow-latest 窗口语义）。
-        for n_traces, expected_start in ((0, 1), (1, 1), (63, 1), (64, 1), (65, 2), (100, 37), (1000, 937)):
+        # 扩容 64→256（任务 t1）：64 窗时代的 (65,2)/(100,37)/(1000,937) 换算为
+        # (65,1)/(100,1)/(1000,745)，并补充 256/257 精确边界（0 删除，纯换算）。
+        for n_traces, expected_start in (
+            (0, 1), (1, 1), (63, 1), (64, 1), (65, 1), (100, 1),
+            (256, 1), (257, 2), (1000, 745),
+        ):
             rows = _rows(n_traces, 5)
             window = bscan_window_from_rows(rows, 10**9, n_samples=5)
             self.assertEqual(window.total_traces, n_traces)
@@ -86,15 +91,21 @@ class BScanWindowFromRowsTests(unittest.TestCase):
 
 class FlatFilterWindowedTests(unittest.TestCase):
     def test_bounds_clamped(self) -> None:
-        # 可见窗口 1..64 + half=15 邻域 → [1, 79]。
-        self.assertEqual(flat_filter_window_bounds(1000, 1, 31), (1, 79))
-        # 937..1000 可见 → [922, 1000]。
-        self.assertEqual(flat_filter_window_bounds(1000, 937, 31), (922, 1000))
+        # 扩容 64→256（任务 t1）：可见窗口 1..256 + half=15 邻域 → [1, 271]。
+        self.assertEqual(flat_filter_window_bounds(1000, 1, 31), (1, 271))
+        # 起点 937 超过 max_start(1000)=745 → 收敛到 745：可见 745..1000 →
+        # 邻域 [730, 1000]（64 窗时代 max_start=937 → [922, 1000]）。
+        self.assertEqual(flat_filter_window_bounds(1000, 937, 31), (730, 1000))
+        # 中段合法窗口 400..655 可见 → [385, 670]。
+        self.assertEqual(flat_filter_window_bounds(1000, 400, 31), (385, 670))
         self.assertEqual(flat_filter_window_bounds(50, 1, 31), (1, 50))
 
     def test_elementwise_equal_to_full_history_filter(self) -> None:
-        """窗口化滤波与全历史滤波逐元素一致（可见 64 道范围）。"""
-        for total, start, window in ((70, 1, 31), (200, 50, 31), (1000, 937, 31), (100, 10, 95)):
+        """窗口化滤波与全历史滤波逐元素一致（可见 256 道范围；扩容 64→256）。"""
+        # 扩容 64→256（任务 t1）：256 窗下起点必须 ≤ max_start(total) 才保留
+        # （更小历史会被收敛到 1），故用例取合法起点：(300,45) 为满 256 道
+        # 可见窗口 + 邻域子矩阵路径，(1000,745) 为 follow-latest 末窗路径。
+        for total, start, window in ((70, 1, 31), (200, 1, 31), (300, 45, 31), (1000, 745, 31), (100, 1, 95)):
             rows = _rows(total, 8, seed=3)
             full = np.column_stack(rows)
             filtered_full = flat_reflection_filter(full, window_size=window)
@@ -118,11 +129,13 @@ class FlatFilterWindowedTests(unittest.TestCase):
             apply_flat_filter_windowed(rows, 1, 30)
 
     def test_follow_latest_window_semantics(self) -> None:
-        rows = _rows(65, 4)
+        # 扩容 64→256（任务 t1）：用 300 道历史（max_start=45）保持原断言意图
+        # ——合法起点保留、越界起点收敛到最大起点。
+        rows = _rows(300, 4)
         window = bscan_window_from_rows(rows, 2)
-        self.assertEqual((window.start_trace, window.end_trace), (2, 65))
+        self.assertEqual((window.start_trace, window.end_trace), (2, 257))
         window = bscan_window_from_rows(rows, 100)  # 越界收敛到最大起点
-        self.assertEqual((window.start_trace, window.end_trace), (2, 65))
+        self.assertEqual((window.start_trace, window.end_trace), (45, 300))
 
 
 if __name__ == "__main__":

@@ -77,17 +77,104 @@ class GroundBScanGuiTests(unittest.TestCase):
                 }))
                 np.testing.assert_array_equal(window.bscan_time_ns, new_time)
                 window.clear_bscan()
+                # 扩容 64→256（任务 t1）：喂 257 道历史保持滑块 max=2 的原断言意图。
                 window.bscan_rows = {
-                    name: [np.full(4, float(index)) for index in range(65)]
+                    name: [np.full(4, float(index)) for index in range(257)]
                     for name in ground.UI_CHANNELS
                 }
                 window.refresh_bscan_views()
                 self.assertEqual(window.bscan_window_slider.maximum(), 2)
-                self.assertEqual(window.bscan_images["S11"].width(), 64)
+                self.assertEqual(window.bscan_images["S11"].width(), 256)
                 self.assertEqual(window.bscan_images["S11"].height(), 4)
                 self.assertEqual(window.bscan_images["S11"].width(), window.bscan_images["S22"].width())
                 window.bscan_window_slider.setValue(2)
                 self.assertIn("2", window.bscan_window_label.text())
+            finally:
+                window.close()
+                app.processEvents()
+        finally:
+            temp.cleanup()
+
+    def test_300_trace_history_shows_last_256(self) -> None:
+        """扩容 64→256（任务 t1）锁定测试：300 道历史走生产追加路径
+        （_append_bscan_trace），显示窗必须是最后 256 道；滑块范围、
+        NaN 填充、setRect/xRange 全部跟随 BSCAN_WINDOW_TRACES=256。"""
+        class DummyReceiver(QtCore.QObject):
+            status = QtCore.Signal(str)
+            command_status = QtCore.Signal(str)
+            trace_received = QtCore.Signal(dict, bytes, str)
+
+            def __init__(self, *_args) -> None:
+                super().__init__()
+
+            def start(self) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+            def wait(self, _timeout: int) -> bool:
+                return True
+
+            def send_command(self, _action: str, _params=None) -> None:
+                pass
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        temp = tempfile.TemporaryDirectory()
+        try:
+            with patch.object(ground, "ReceiverThread", DummyReceiver):
+                window = ground.GroundStationWindow("127.0.0.1", 0, Path(temp.name))
+            try:
+                rows = [np.arange(8, dtype=float) + index for index in range(300)]
+                time_ns = np.linspace(0.0, 40.0, 8)
+                for row in rows:
+                    self.assertTrue(window._append_bscan_trace(
+                        time_ns, {"S11": row, "S22": row + 1.0}
+                    ))
+                window.refresh_bscan_views()
+                app.processEvents()
+                # follow-latest：显示窗收敛到最后 256 道（起点 45）。
+                self.assertEqual(window.bscan_trace_count(), 300)
+                self.assertEqual(window.bscan_window_start, 45)
+                self.assertEqual(window.bscan_window_slider.maximum(), 45)
+                self.assertEqual(
+                    window.bscan_window_label.text(), "显示 45–300 / 共 300 道"
+                )
+                self.assertEqual(window.bscan_images["S11"].width(), 256)
+                self.assertEqual(window.bscan_images["S11"].height(), 8)
+                matrix, _levels = window._bscan_display_window("S11")
+                self.assertEqual(matrix.shape, (8, 256))
+                self.assertEqual(int(np.sum(np.any(np.isfinite(matrix), axis=0))), 256)
+                np.testing.assert_array_equal(matrix[:, 0], rows[44])
+                np.testing.assert_array_equal(matrix[:, 255], rows[299])
+                x_range = window.bscan_plots["S11"].getViewBox().viewRange()[0]
+                self.assertAlmostEqual(x_range[0], 44.5)
+                self.assertAlmostEqual(x_range[1], 300.5)
+                # 不足一窗：100 道 → 右侧列 100..255 全 NaN 填充。
+                window.clear_bscan()
+                for row in rows[:100]:
+                    self.assertTrue(window._append_bscan_trace(
+                        time_ns, {"S11": row, "S22": row + 1.0}
+                    ))
+                window.refresh_bscan_views()
+                matrix100, _ = window._bscan_display_window("S11")
+                self.assertEqual(window.bscan_images["S11"].width(), 256)
+                self.assertTrue(np.all(np.isnan(matrix100[:, 100:])))
+                np.testing.assert_array_equal(matrix100[:, 0], rows[0])
+                np.testing.assert_array_equal(matrix100[:, 99], rows[99])
+                # 拖滑块到合法中段起点 20 → 显示 20–275。
+                window.clear_bscan()
+                for row in rows:
+                    window._append_bscan_trace(time_ns, {"S11": row, "S22": row + 1.0})
+                window.refresh_bscan_views()
+                window.bscan_window_slider.setValue(20)
+                app.processEvents()
+                self.assertEqual(
+                    window.bscan_window_label.text(), "显示 20–275 / 共 300 道"
+                )
+                matrix20, _ = window._bscan_display_window("S11")
+                np.testing.assert_array_equal(matrix20[:, 0], rows[19])
+                np.testing.assert_array_equal(matrix20[:, 255], rows[274])
             finally:
                 window.close()
                 app.processEvents()

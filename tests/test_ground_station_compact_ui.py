@@ -46,7 +46,7 @@
     状态栏三项）几何尺寸均非零；
 28. 1366×768 与 1920×1080 模拟下主窗口结构相同、HH/VV 顺序不变、PlotWidget
     仍恰好两个；
-29. B-scan 0 在上、最多 64 道/屏；aspect_ratio 设置仍生效；
+29. B-scan 0 在上、最多 256 道/屏（扩容 64→256）；aspect_ratio 设置仍生效；
 30. 第2轮审查修复的 3 条 on_trace 测试继续通过。
 
 第3轮审查修复新增覆盖（独立审查发现的窗口尺寸策略缺陷 + 布局测试缺口）：
@@ -278,8 +278,9 @@ class GroundStationCompactUiTests(unittest.TestCase):
         )
         self.assertIsNotNone(self.window.bscan_window_label)
         # 滑块加入后仍能切换窗口并更新计数。
+        # 扩容 64→256（任务 t1）：257 道历史保持滑块 max=2 的原断言意图。
         self.window.bscan_rows = {
-            name: [np.full(4, float(index)) for index in range(65)]
+            name: [np.full(4, float(index)) for index in range(257)]
             for name in ground.UI_CHANNELS
         }
         self.window.bscan_time_ns = np.arange(4, dtype=float)
@@ -1327,20 +1328,21 @@ class GroundStationCompactUiTests(unittest.TestCase):
             units = plot.getPlotItem().getAxis("left").labelUnits
             self.assertEqual(units, "ns")
 
-    def test_bscan_max_64_traces_per_screen(self) -> None:
-        # B-scan 每屏固定 64 道，初始 X 范围与之匹配。
+    def test_bscan_max_256_traces_per_screen(self) -> None:
+        # 扩容 64→256（任务 t1）：B-scan 每屏固定 256 道，初始 X 范围与之匹配。
         for name, plot in self.window.bscan_plots.items():
             x_range = plot.getViewBox().viewRange()[0]
             self.assertEqual(
-                x_range[1] - x_range[0], 64.0,
-                f"{name} 初始 X 范围应覆盖 64 道",
+                x_range[1] - x_range[0], 256.0,
+                f"{name} 初始 X 范围应覆盖 256 道",
             )
-        # BSCAN_WINDOW_TRACES 仍是 64（常量契约）。
-        self.assertEqual(ground.BSCAN_WINDOW_TRACES, 64)
+        # BSCAN_WINDOW_TRACES 仍是 256（常量契约）。
+        self.assertEqual(ground.BSCAN_WINDOW_TRACES, 256)
 
     def test_slider_value_drives_bscan_window_change(self) -> None:
         # 滑块跟随总道数变化；on_bscan_window_changed 会更新视图与文字。
-        # 先喂 65 条兼容 Trace，让滑块范围变成 1..2；标签应反映“共 65 道”。
+        # 扩容 64→256（任务 t1）：先喂 257 条兼容 Trace（257-256+1=2），
+        # 保持"滑块范围 1..2、可拖到 2、标签反映总道数"的原断言意图。
         from bscan_view import bscan_window_max_start  # type: ignore
         time_ns = np.arange(4, dtype=float)
         payload = self._dual_payload(
@@ -1348,7 +1350,7 @@ class GroundStationCompactUiTests(unittest.TestCase):
             channels=["S11", "S22"],
             processing={"dew" + "ow_enabled": False},
         )
-        for i in range(1, 66):
+        for i in range(1, 258):
             header = self._trace_header(
                 i,
                 channels=["S11", "S22"],
@@ -1359,16 +1361,16 @@ class GroundStationCompactUiTests(unittest.TestCase):
                 gnss={"fix_quality": 1, "latitude": 30.0, "longitude": 114.0},
             )
             self.window.on_trace(header, payload, f"t{i}.npz")
-        # 共 65 道时，最大可拖起点为 65-64+1=2。
+        # 共 257 道时，最大可拖起点为 257-256+1=2。
         self.assertEqual(self.window.bscan_window_slider.maximum(), 2)
         self.assertEqual(
             self.window.bscan_window_slider.maximum(),
-            bscan_window_max_start(65),
+            bscan_window_max_start(257),
         )
-        # 拖到第 2 道起点：标签应反映"显示 2–65 / 共 65 道"。
+        # 拖到第 2 道起点：标签应反映"显示 2–257 / 共 257 道"。
         self.window.bscan_window_slider.setValue(2)
         self.app.processEvents()
-        self.assertIn("共 65 道", self.window.bscan_window_label.text())
+        self.assertIn("共 257 道", self.window.bscan_window_label.text())
 
     def test_aspect_ratio_setting_still_takes_effect(self) -> None:
         # 长宽比设置仍生效：先记录基线，再 apply 一份不同长宽比，确认容器更新。

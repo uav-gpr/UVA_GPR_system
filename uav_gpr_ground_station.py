@@ -8,11 +8,13 @@ import hashlib
 import io
 import json
 import math
+import os
 import socket
 import struct
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -40,7 +42,7 @@ from ground_trace_pipeline import (
     decode_ground_trace_payload,
     set_metrics as set_ground_decoder_metrics,
 )
-from gnss_map_widget import GnssMapWidget
+from ground_gnss import GroundGnssMapWidget as GnssMapWidget, normalize_gnss
 from gpr_processing import flat_reflection_filter
 from pipeline_metrics import PipelineMetrics
 # 第2轮 §3.7-9：地面 run_id 词汇表的**唯一正则源**（air_task/idle/校准/local
@@ -63,6 +65,44 @@ CHANNEL_LABELS = {"S11": "HH (S11)", "S22": "VV (S22)"}
 #: §5.4：空中→地面校准回程消息类型前缀（旧地面端落入 handle_client 的
 #: "忽略未知消息"分支；R-C-13 有测试）。
 _CALIBRATION_MESSAGE_PREFIX = "calibration_"
+
+# ---------------------------------------------------------------------------
+# 第7轮（D1+D5）：地面端「空中端设备」面板——协议词表
+#
+# 协议铁律（第7轮计划 §4.6/§5）：全部经既有 ``command`` 消息**新增 action 值**
+# 实现，严禁新增消息 type（空中端接收逻辑对未知 type 会直接断链）；回执走
+# 既有 ``command_ack`` 通道 + 新增 ``result``/``supported`` 结果字段（既有
+# ack 字段零改动）。词表与 t1 黑匣子（uav_gpr_air_service.py）完全一致；
+# 需改词表必须先上报 captain。
+# ---------------------------------------------------------------------------
+
+#: 设备面板远程 action 词表（与 t1 黑匣子逐字一致）。
+AIR_DEVICE_ACTIONS: tuple[str, ...] = (
+    "get_status",
+    "test_vna",
+    "list_serial_ports",
+    "set_gnss_port",
+    "test_gnss",
+    "set_engine",
+    "set_device_source",
+)
+
+#: 各 action 的中文标签（面板提示与测试定位用）。
+AIR_DEVICE_ACTION_LABELS: dict[str, str] = {
+    "get_status": "设备状态总览",
+    "test_vna": "测试雷达",
+    "list_serial_ports": "列出串口",
+    "set_gnss_port": "设置 GNSS 串口",
+    "test_gnss": "测试 GNSS",
+    "set_engine": "切换采集引擎",
+    "set_device_source": "切换模拟器",
+}
+
+#: 采集引擎取值（与空中端 air_config.json 的 engine 字段一致）。
+AIR_ENGINE_VALUES: tuple[str, ...] = ("continuous", "legacy")
+
+#: 设备来源取值（与空中端 air_config.json 的 device_source 字段一致）。
+AIR_DEVICE_SOURCE_VALUES: tuple[str, ...] = ("usb", "simulated")
 
 
 def is_not_older_than(run_x: object, baseline: object) -> bool:
@@ -140,11 +180,18 @@ def gnss_from_sources(data: object, header: dict[str, object]) -> dict[str, obje
     """Prefer NPZ GNSS metadata and fall back to the telemetry trace header."""
     values: list[object] = []
     files = getattr(data, "files", ())
-    if "gnss" in files:
-        values.append(data["gnss"])
+    try:
+        if "gnss" in files:
+            values.append(data["gnss"])
+    except Exception:
+        # GNSS is optional: a corrupt/object-array field cannot reject radar data.
+        pass
     values.append(header.get("gnss"))
     for value in values:
-        parsed = _json_object(value)
+        try:
+            parsed = normalize_gnss(value)
+        except Exception:
+            continue
         if parsed:
             return parsed
     return {}
@@ -565,6 +612,10 @@ class ReceiverThread(QtCore.QThread):
     run_switched = QtCore.Signal(str)
     #: 第2轮 §5.4：校准回程消息（绝不进 _accept_trace/display FIFO，R-C-17）。
     calibration_message = QtCore.Signal(dict)
+    #: 第7轮：带结果字段的 command_ack 完整回执（设备面板消费；既有 ack 通道
+    #: + 新增 result/supported 结果字段，既有字段零改动）。老空中端的纯 ack
+    #: 同样转发，由面板据此判定「对方版本不支持此功能」。
+    command_result = QtCore.Signal(dict)
 
     def __init__(self, host: str, port: int, out_dir: Path, metrics=None) -> None:
         super().__init__()
@@ -719,6 +770,21 @@ class ReceiverThread(QtCore.QThread):
                 except OSError:
                     pass
 
+    def _send_frame_locked(
+        self, sock: socket.socket, header: dict[str, object], payload: bytes = b""
+    ) -> None:
+        """第7轮 t7 修复（F1）：全部出站帧统一经既有 _send_lock 串行化。
+
+        一帧 = 3-4 段 sendall；hello-ack/ack_trace 在接收线程、command 在
+        主线程并发裸发时同一条 client socket 上会字节交错破帧（终验 F1）。
+        send_command 自 R-A-05 起已持 _send_lock；本助手把 hello-ack 与
+        ack_trace 纳入同一把锁。锁内只做一次完整帧发送，绝不嵌套
+        _sock_lock（无锁序倒置：send_command 先取后放 _sock_lock 再取
+        _send_lock；接收线程只在 _send_lock 内短暂阻塞）。
+        """
+        with self._send_lock:
+            send_frame(sock, header, payload)
+
     def send_command(self, action: str, params: dict[str, object] | None = None) -> None:
         with self._sock_lock:
             client = self._client
@@ -733,8 +799,8 @@ class ReceiverThread(QtCore.QThread):
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
         }
         try:
-            with self._send_lock:
-                send_frame(client, header)
+            # 第7轮 t7 修复（F1）：改经统一加锁出口，行为不变。
+            self._send_frame_locked(client, header)
             self.command_status.emit(f"Command sent: {action}")
         except Exception as exc:
             self.command_status.emit(f"Command failed: {exc}")
@@ -812,7 +878,11 @@ class ReceiverThread(QtCore.QThread):
             if header.get("protocol") != PROTOCOL:
                 raise ValueError(f"unsupported protocol: {header.get('protocol')}")
             if msg_type == "hello":
-                send_frame(sock, {"type": "ack", "protocol": PROTOCOL, "timestamp": datetime.now().isoformat(timespec="seconds")})
+                # 第7轮 t7 修复（F1）：hello-ack 纳入 _send_lock 串行化。
+                self._send_frame_locked(
+                    sock,
+                    {"type": "ack", "protocol": PROTOCOL, "timestamp": datetime.now().isoformat(timespec="seconds")},
+                )
                 # 第2轮 R-A-19/R-A-19b：hello 是 run 切换双触发之一（接收线程
                 # 内串行执行；词汇表唯一判据 = classify_run_id）。
                 self._on_hello_run_id(header.get("run_id"))
@@ -838,6 +908,12 @@ class ReceiverThread(QtCore.QThread):
                 # command_ack 只表示停止/启动命令已被空中端接受，不等于采集
                 # 已停止（第1轮检查点D）：最终状态由 acquisition_status 决定。
                 self.command_status.emit(f"Remote accepted: {header.get('action')}")
+                # 第7轮：完整回执（含 result/supported 结果字段）转发设备面板；
+                # 旧空中端的纯 ack 同样转发，面板据此显示「对方版本不支持此功能」。
+                self.command_result.emit(dict(header))
+            elif msg_type == "heartbeat":
+                # 链路空闲保活心跳：直接忽略无需处理，保持 TCP 连接活跃防止超时
+                pass
             elif msg_type == "acquisition_status":
                 # 第1轮检查点D：向后兼容状态消息（旧接收端会落入 else 分支忽略）。
                 # R-A-19b：补传 run 的 stopped/drain_failed 到达即该 run 结束——
@@ -918,7 +994,8 @@ class ReceiverThread(QtCore.QThread):
             self._seen_traces[key] = disk_sha
         if seen_sha is not None:
             if seen_sha == actual_sha:
-                send_frame(
+                # 第7轮 t7 修复（F1）：duplicate ack_trace 纳入 _send_lock。
+                self._send_frame_locked(
                     sock,
                     {
                         "type": "ack_trace",
@@ -947,7 +1024,8 @@ class ReceiverThread(QtCore.QThread):
                 pass
         # 只记录经过验证的 actual_sha（不直接信任 header）。
         self._seen_traces[key] = actual_sha
-        send_frame(
+        # 第7轮 t7 修复（F1）：ack_trace 纳入 _send_lock 串行化。
+        self._send_frame_locked(
             sock,
             {
                 "type": "ack_trace",
@@ -1369,6 +1447,564 @@ class BscanSettingsDialog(QtWidgets.QDialog):
         self.accept()
 
 
+class AirDevicePanel(QtWidgets.QWidget):
+    """第7轮 D1+D5：空中端设备远程面板（黑匣子全遥控，独立非模态窗口）。
+
+    五项能力全部经既有 ``command`` 消息新增 action 实现（:data:`AIR_DEVICE_ACTIONS`，
+    与 t1 黑匣子词表逐字一致）；回执走既有 ``command_ack`` 通道 + 新增
+    ``result``/``supported`` 结果字段（既有字段零改动）。老空中端对未知
+    action 只回纯 ack（无 result 字段）→ 面板明确显示「对方版本不支持此
+    功能」，不崩不静默（§4.6 互操作红线）。
+
+    主动作面板是独立顶层子窗口（Qt.Window），不进主界面中央布局——第1轮
+    冻结契约「主界面按钮只有 开始/停止/暂停/继续」不受影响。
+    """
+
+    #: 状态总览默认刷新间隔（计划第九节：每 5 秒；构造可注入便于测试）。
+    DEFAULT_REFRESH_INTERVAL_MS = 5000
+    #: 互操作兜底文案（老空中端 / 旧版黑匣子未实现该 action 时显示）。
+    UNSUPPORTED_TEXT = "对方版本不支持此功能"
+
+    def __init__(
+        self,
+        window: "GroundStationWindow",
+        *,
+        refresh_interval_ms: int | None = None,
+    ) -> None:
+        super().__init__(window, QtCore.Qt.WindowType.Window)
+        self.setObjectName("device_panel")
+        self.setWindowTitle("空中端设备")
+        self.resize(620, 720)
+        self._window = window
+        self._refresh_interval_ms = (
+            self.DEFAULT_REFRESH_INTERVAL_MS
+            if refresh_interval_ms is None
+            else int(refresh_interval_ms)
+        )
+        #: 已发送待回执的 action → 发送时刻（monotonic 秒）。
+        self._pending: dict[str, float] = {}
+        #: 链路连接状态（由主窗口 _set_remote_connected 同步；未连接绝不发送）。
+        self._link_connected = False
+        #: 最近一次 get_status 回执（原样保留供测试与诊断）。
+        self.last_status_result: dict[str, object] = {}
+        self.last_status_at: str = ""
+        #: 用户改过下拉但尚未应用的脏标记：自动同步不得覆盖未应用的选择。
+        self._engine_dirty = False
+        self._source_dirty = False
+        self._build_ui()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(self._refresh_interval_ms)
+        self._timer.timeout.connect(self.refresh_now)
+        self._timer.start()
+
+    # ------------------------------------------------------------------
+    # UI 构建
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # ---- 0. 链路状态 ----
+        self.device_link_label = QtWidgets.QLabel("连接状态：未连接")
+        self.device_link_label.setObjectName("device_link_label")
+        layout.addWidget(self.device_link_label)
+
+        # ---- 1. 设备状态总览（在线/重连中、VNA USB、run_id、是否采集、
+        #         积压、磁盘剩余、程序版本、当前配置）----
+        overview_box = QtWidgets.QGroupBox("设备状态总览")
+        overview_box.setObjectName("device_overview_box")
+        form = QtWidgets.QFormLayout(overview_box)
+        self.device_vna_label = self._form_row(form, "device_vna_label", "雷达 USB")
+        self.device_run_id_label = self._form_row(form, "device_run_id_label", "run_id")
+        self.device_acquiring_label = self._form_row(
+            form, "device_acquiring_label", "是否采集"
+        )
+        self.device_backlog_label = self._form_row(
+            form, "device_backlog_label", "积压"
+        )
+        self.device_disk_label = self._form_row(
+            form, "device_disk_label", "磁盘剩余"
+        )
+        self.device_version_label = self._form_row(
+            form, "device_version_label", "程序版本"
+        )
+        self.device_config_label = self._form_row(
+            form, "device_config_label", "当前配置"
+        )
+        self.device_config_label.setWordWrap(True)
+        self.device_status_updated_label = self._form_row(
+            form, "device_status_updated_label", "总览更新"
+        )
+        layout.addWidget(overview_box)
+
+        refresh_row = QtWidgets.QHBoxLayout()
+        self.manual_refresh_button = QtWidgets.QPushButton("立即刷新")
+        self.manual_refresh_button.setObjectName("device_refresh_button")
+        self.manual_refresh_button.clicked.connect(self.refresh_now)
+        refresh_row.addWidget(self.manual_refresh_button)
+        refresh_row.addStretch(1)
+        layout.addLayout(refresh_row)
+
+        # ---- 2. 测试雷达（固件版本/协议号/最大频率/在线与否）----
+        vna_box = QtWidgets.QGroupBox("测试雷达")
+        vna_box.setObjectName("device_vna_box")
+        vna_layout = QtWidgets.QVBoxLayout(vna_box)
+        self.test_vna_button = QtWidgets.QPushButton("测试雷达")
+        self.test_vna_button.setObjectName("test_vna_button")
+        self.test_vna_button.clicked.connect(self.send_test_vna)
+        self.test_vna_result_label = QtWidgets.QLabel("雷达：未测试")
+        self.test_vna_result_label.setObjectName("test_vna_result_label")
+        self.test_vna_result_label.setWordWrap(True)
+        vna_layout.addWidget(self.test_vna_button)
+        vna_layout.addWidget(self.test_vna_result_label)
+        layout.addWidget(vna_box)
+
+        # ---- 3. GNSS 串口管理（列出 → 选择+波特率 → 测试）----
+        gnss_box = QtWidgets.QGroupBox("GNSS 串口管理")
+        gnss_box.setObjectName("device_gnss_box")
+        gnss_layout = QtWidgets.QVBoxLayout(gnss_box)
+        ports_row = QtWidgets.QHBoxLayout()
+        self.list_ports_button = QtWidgets.QPushButton("列出串口")
+        self.list_ports_button.setObjectName("list_serial_ports_button")
+        self.list_ports_button.clicked.connect(self.send_list_serial_ports)
+        self.gnss_port_combo = QtWidgets.QComboBox()
+        self.gnss_port_combo.setObjectName("gnss_port_combo")
+        ports_row.addWidget(self.list_ports_button)
+        ports_row.addWidget(self.gnss_port_combo, 1)
+        gnss_layout.addLayout(ports_row)
+        set_row = QtWidgets.QHBoxLayout()
+        self.gnss_baud_spin = QtWidgets.QSpinBox()
+        self.gnss_baud_spin.setObjectName("gnss_baud_spin")
+        self.gnss_baud_spin.setRange(1200, 921600)
+        self.gnss_baud_spin.setValue(115200)
+        # 用户手改过就不再用空中端上报值覆盖；否则按空中端实际配置同步
+        # （2026-10-09 现场：M100 在 115200 下丢低电平位，实际用的是 9600，
+        #   面板必须显示真实值，否则一点"设置 GNSS 串口"就把 9600 改回 115200）。
+        self._baud_dirty = False
+        self._syncing_baud = False
+        self.gnss_baud_spin.valueChanged.connect(self._on_baud_edited)
+        self.set_gnss_button = QtWidgets.QPushButton("设置 GNSS 串口")
+        self.set_gnss_button.setObjectName("set_gnss_port_button")
+        self.set_gnss_button.clicked.connect(self.send_set_gnss_port)
+        set_row.addWidget(self.gnss_baud_spin)
+        set_row.addWidget(self.set_gnss_button)
+        set_row.addStretch(1)
+        gnss_layout.addLayout(set_row)
+        test_row = QtWidgets.QHBoxLayout()
+        self.test_gnss_button = QtWidgets.QPushButton("测试 GNSS")
+        self.test_gnss_button.setObjectName("test_gnss_button")
+        self.test_gnss_button.clicked.connect(self.send_test_gnss)
+        test_row.addWidget(self.test_gnss_button)
+        test_row.addStretch(1)
+        gnss_layout.addLayout(test_row)
+        self.gnss_result_label = QtWidgets.QLabel("GNSS：未设置")
+        self.gnss_result_label.setObjectName("gnss_result_label")
+        self.gnss_result_label.setWordWrap(True)
+        gnss_layout.addWidget(self.gnss_result_label)
+        layout.addWidget(gnss_box)
+
+        # ---- 4. 采集引擎切换（continuous | legacy）----
+        engine_box = QtWidgets.QGroupBox("采集引擎切换")
+        engine_box.setObjectName("device_engine_box")
+        engine_layout = QtWidgets.QHBoxLayout(engine_box)
+        self.engine_combo = QtWidgets.QComboBox()
+        self.engine_combo.setObjectName("engine_combo")
+        self.engine_combo.addItem("高速连续 (continuous)", "continuous")
+        self.engine_combo.addItem("兼容 (legacy)", "legacy")
+        # activated 仅用户选择时触发：程序化同步不置脏标记。
+        self.engine_combo.activated.connect(self._mark_engine_dirty)
+        self.apply_engine_button = QtWidgets.QPushButton("应用引擎切换")
+        self.apply_engine_button.setObjectName("apply_engine_button")
+        self.apply_engine_button.clicked.connect(self.send_set_engine)
+        engine_layout.addWidget(self.engine_combo, 1)
+        engine_layout.addWidget(self.apply_engine_button)
+        layout.addWidget(engine_box)
+
+        # ---- 5. 模拟器切换（usb | simulated）----
+        source_box = QtWidgets.QGroupBox("模拟器切换")
+        source_box.setObjectName("device_source_box")
+        source_layout = QtWidgets.QHBoxLayout(source_box)
+        self.device_source_combo = QtWidgets.QComboBox()
+        self.device_source_combo.setObjectName("panel_device_source_combo")
+        self.device_source_combo.addItem("USB 真机 (usb)", "usb")
+        self.device_source_combo.addItem("模拟器 (simulated)", "simulated")
+        self.device_source_combo.activated.connect(self._mark_source_dirty)
+        self.apply_source_button = QtWidgets.QPushButton("应用模拟器切换")
+        self.apply_source_button.setObjectName("apply_device_source_button")
+        self.apply_source_button.clicked.connect(self.send_set_device_source)
+        source_layout.addWidget(self.device_source_combo, 1)
+        source_layout.addWidget(self.apply_source_button)
+        layout.addWidget(source_box)
+
+        layout.addStretch(1)
+
+        # ---- 回执 / 提示栏（回执确认与「不支持」显示的固定位置）----
+        self.panel_notice_label = QtWidgets.QLabel("就绪")
+        self.panel_notice_label.setObjectName("panel_notice_label")
+        self.panel_notice_label.setWordWrap(True)
+        layout.addWidget(self.panel_notice_label)
+
+    @staticmethod
+    def _form_row(
+        form: QtWidgets.QFormLayout, object_name: str, title: str
+    ) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(f"{title}：-")
+        label.setObjectName(object_name)
+        form.addRow(title, label)
+        return label
+
+    # ------------------------------------------------------------------
+    # 刷新节奏（默认 5 秒，可注入）
+    # ------------------------------------------------------------------
+
+    @property
+    def refresh_interval_ms(self) -> int:
+        return self._refresh_interval_ms
+
+    def set_refresh_interval_ms(self, ms: int) -> None:
+        """注入刷新间隔；非法值（<=0）拒绝并保持原值（防误注入）。"""
+        value = int(ms)
+        if value <= 0:
+            return
+        self._refresh_interval_ms = value
+        self._timer.setInterval(value)
+
+    def refresh_now(self) -> bool:
+        """立即请求一次状态总览（定时器与「立即刷新」按钮共用入口）。
+
+        仅在链路已连接且面板可见时发送（面板隐藏/未连接绝不发送，避免往
+        主界面刷「命令发送失败」噪音）；未连接时手动刷新给出明确提示，
+        返回是否实际发送。
+        """
+        if not self._link_connected:
+            self._set_notice("设备状态总览：未连接空中端，无法获取")
+            return False
+        if not self.isVisible():
+            return False
+        return self._send_action("get_status", {})
+
+    # ------------------------------------------------------------------
+    # 链路状态同步（主窗口 _set_remote_connected 调用）
+    # ------------------------------------------------------------------
+
+    def set_link_connected(self, connected: bool) -> None:
+        self._link_connected = bool(connected)
+        if connected:
+            self.device_link_label.setText("连接状态：已连接")
+            return
+        self.device_link_label.setText("连接状态：未连接")
+        self._pending.clear()
+        self._engine_dirty = False
+        self._source_dirty = False
+        self._set_notice("与空中端连接已断开")
+        self._set_overview_placeholder("未连接")
+
+    # ------------------------------------------------------------------
+    # 发送（全部经既有 command 通道 + AIR_DEVICE_ACTIONS 新 action）
+    # ------------------------------------------------------------------
+
+    def _send_action(
+        self, action: str, params: dict[str, object] | None = None
+    ) -> bool:
+        receiver = getattr(self._window, "receiver", None)
+        send = getattr(receiver, "send_command", None)
+        if not callable(send) or not self._link_connected:
+            self._set_notice(f"{self._action_label(action)}：未连接空中端，无法发送")
+            return False
+        self._pending[action] = time.monotonic()
+        try:
+            send(action, dict(params or {}))
+        except Exception as exc:  # noqa: BLE001 - 发送失败必须可见，不得静默
+            self._pending.pop(action, None)
+            self._set_notice(f"{self._action_label(action)}：发送失败（{exc}）")
+            return False
+        self._set_notice(f"{self._action_label(action)}：已发送，等待空中端回执…")
+        return True
+
+    @staticmethod
+    def _action_label(action: str) -> str:
+        return AIR_DEVICE_ACTION_LABELS.get(action, action)
+
+    def send_test_vna(self) -> None:
+        self._send_action("test_vna")
+
+    def send_list_serial_ports(self) -> None:
+        self._send_action("list_serial_ports")
+
+    def send_set_gnss_port(self) -> None:
+        # 下拉项由 list_serial_ports 回执填充时 currentData=纯端口名；
+        # 优先取 data，回退到显示文本（手工输入场景）。
+        port = str(
+            self.gnss_port_combo.currentData()
+            or self.gnss_port_combo.currentText()
+            or ""
+        ).strip()
+        if not port:
+            self._set_notice("设置 GNSS 串口：请先「列出串口」并选择串口")
+            return
+        self._baud_dirty = False   # 本次按下即采用当前框内值，之后继续跟随空中端上报
+        self._send_action(
+            "set_gnss_port",
+            {"port": port, "baud": int(self.gnss_baud_spin.value())},
+        )
+
+    def _on_baud_edited(self, _value: int) -> None:
+        """用户手改波特率 → 标记 dirty，自动同步不再覆盖他的输入。"""
+        if not self._syncing_baud:
+            self._baud_dirty = True
+
+    def send_test_gnss(self) -> None:
+        self._send_action("test_gnss")
+
+    def send_set_engine(self) -> None:
+        engine = str(self.engine_combo.currentData() or "")
+        self._send_action("set_engine", {"engine": engine})
+
+    def send_set_device_source(self) -> None:
+        source = str(self.device_source_combo.currentData() or "")
+        self._send_action("set_device_source", {"device_source": source})
+
+    def _mark_engine_dirty(self, _index: int) -> None:
+        self._engine_dirty = True
+
+    def _mark_source_dirty(self, _index: int) -> None:
+        self._source_dirty = True
+
+    # ------------------------------------------------------------------
+    # 回执处理（既有 command_ack 通道 + result/supported 结果字段）
+    # ------------------------------------------------------------------
+
+    def on_command_result(self, header: dict) -> None:
+        """主窗口转发的 command_ack 完整回执（仅处理设备面板词表内 action）。"""
+        action = str(header.get("action") or "")
+        if action not in AIR_DEVICE_ACTIONS:
+            return  # 既有命令（start/stop/…）的 ack 与设备面板无关
+        label = self._action_label(action)
+        was_pending = self._pending.pop(action, None) is not None
+        result = header.get("result")
+        if header.get("supported") is False or not isinstance(result, dict):
+            # 互操作兜底：老空中端/旧版黑匣子对该 action 无结果字段 →
+            # 明确显示「不支持」，不崩不静默（§4.6 红线 5）。
+            self._mark_unsupported(action)
+            return
+        assert isinstance(result, dict)
+        ok_value = result.get("ok")
+        error_text = result.get("error")
+        if ok_value is False or (
+            ok_value is None and isinstance(error_text, str) and bool(error_text)
+        ):
+            self._set_notice(f"{label}：空中端回执失败（{error_text or '未知错误'}）")
+            self._log(f"{label}：空中端回执失败（{error_text or '未知错误'}）")
+            return
+        if action == "get_status":
+            self._apply_status(result, was_pending=was_pending)
+        elif action == "test_vna":
+            self._apply_vna(result)
+        elif action == "list_serial_ports":
+            self._apply_ports(result)
+        elif action == "set_gnss_port":
+            self._apply_set_gnss(result)
+        elif action == "test_gnss":
+            self._apply_test_gnss(result)
+        elif action == "set_engine":
+            self._apply_set_engine(result)
+        elif action == "set_device_source":
+            self._apply_set_source(result)
+
+    def _mark_unsupported(self, action: str) -> None:
+        label = self._action_label(action)
+        self._set_notice(f"{label}：{self.UNSUPPORTED_TEXT}")
+        self._log(f"{label}：{self.UNSUPPORTED_TEXT}")
+        if action == "get_status":
+            self._set_overview_placeholder("对方不支持")
+        elif action == "test_vna":
+            self.test_vna_result_label.setText(f"雷达：{self.UNSUPPORTED_TEXT}")
+        elif action == "test_gnss":
+            self.gnss_result_label.setText(f"GNSS 测试：{self.UNSUPPORTED_TEXT}")
+
+    # ---- 各 action 结果应用 ----
+
+    def _apply_status(self, result: dict[str, object], *, was_pending: bool) -> None:
+        self.last_status_result = dict(result)
+        self.last_status_at = datetime.now().strftime("%H:%M:%S")
+        if bool(result.get("reconnecting")):
+            link_text = "连接状态：已连接（对方重连中）"
+        elif result.get("online") is True:
+            link_text = "连接状态：已连接（空中端在线）"
+        elif result.get("online") is False:
+            link_text = "连接状态：已连接（对方未就绪）"
+        else:
+            link_text = "连接状态：已连接"
+        self.device_link_label.setText(link_text)
+        self.device_vna_label.setText(
+            "雷达 USB：" + self._tri_text(result.get("vna_usb"), "已连接", "未连接")
+        )
+        self.device_run_id_label.setText(f"run_id：{result.get('run_id') or '-'}")
+        self.device_acquiring_label.setText(
+            "是否采集：" + self._tri_text(result.get("acquiring"), "采集中", "未采集")
+        )
+        backlog = result.get("backlog")
+        self.device_backlog_label.setText(
+            "积压：未知" if backlog is None else f"积压：{backlog} 条"
+        )
+        disk = result.get("disk_free_gb")
+        self.device_disk_label.setText(
+            "磁盘剩余：未知"
+            if not isinstance(disk, (int, float)) or isinstance(disk, bool)
+            else f"磁盘剩余：{float(disk):.1f} GB"
+        )
+        self.device_version_label.setText(f"程序版本：{result.get('version') or '-'}")
+        config = result.get("config") if isinstance(result.get("config"), dict) else {}
+        self.device_config_label.setText("当前配置：" + self._config_text(config))
+        self.device_status_updated_label.setText(f"总览更新：{self.last_status_at}")
+        self._sync_combos_from_config(config)
+        # 自动刷新（非本次请求触发）不覆盖「等待回执」类提示。
+        if was_pending:
+            self._set_notice("设备状态总览：已更新（回执正常）")
+
+    def _apply_vna(self, result: dict[str, object]) -> None:
+        online = self._tri_text(result.get("online"), "在线", "离线")
+        firmware = str(result.get("firmware") or "-")
+        protocol = result.get("protocol")
+        protocol_text = "-" if protocol is None else str(protocol)
+        max_freq = result.get("max_freq_hz")
+        if isinstance(max_freq, (int, float)) and not isinstance(max_freq, bool) and max_freq > 0:
+            max_text = f"{float(max_freq) / 1e9:.2f} GHz"
+        else:
+            max_text = "-"
+        self.test_vna_result_label.setText(
+            f"雷达：{online}｜固件 {firmware}｜协议 {protocol_text}｜最大频率 {max_text}"
+        )
+        self._set_notice("测试雷达：已收到回执")
+
+    def _apply_ports(self, result: dict[str, object]) -> None:
+        ports = result.get("ports")
+        items: list[tuple[str, str]] = []
+        if isinstance(ports, list):
+            for entry in ports:
+                if isinstance(entry, dict) and entry.get("port"):
+                    items.append(
+                        (str(entry["port"]), str(entry.get("description") or ""))
+                    )
+                elif isinstance(entry, str) and entry.strip():
+                    items.append((entry.strip(), ""))
+        self.gnss_port_combo.clear()
+        if items:
+            for port, description in items:
+                text = f"{port}（{description}）" if description else port
+                self.gnss_port_combo.addItem(text, port)
+            self._set_notice(f"列出串口：发现 {len(items)} 个，请在下拉中选择")
+        else:
+            self._set_notice("列出串口：空中端未发现可用串口")
+
+    def _apply_set_gnss(self, result: dict[str, object]) -> None:
+        port = str(result.get("port") or "-")
+        baud = result.get("baud")
+        baud_text = str(baud) if baud is not None else "-"
+        self.gnss_result_label.setText(
+            f"GNSS 串口：已设置 {port} @ {baud_text}（空中端已确认）"
+        )
+        self._set_notice(
+            f"回执确认：GNSS 串口已设置（{port} @ {baud_text}），空中端已回写配置"
+        )
+
+    def _apply_test_gnss(self, result: dict[str, object]) -> None:
+        self.gnss_result_label.setText(self._window.gnss_map.status.text())
+        self._set_notice("测试 GNSS：已收到回执")
+
+    def _apply_set_engine(self, result: dict[str, object]) -> None:
+        engine = str(result.get("engine") or "")
+        name = {"continuous": "高速连续", "legacy": "兼容"}.get(engine, engine or "-")
+        self._engine_dirty = False
+        self._set_notice(
+            f"回执确认：采集引擎已切换为 {name}（{engine or '-'}），空中端已回写配置"
+        )
+
+    def _apply_set_source(self, result: dict[str, object]) -> None:
+        source = str(result.get("device_source") or "")
+        name = {"usb": "USB 真机", "simulated": "模拟器"}.get(source, source or "-")
+        self._source_dirty = False
+        self._set_notice(
+            f"回执确认：设备来源已切换为 {name}（{source or '-'}），空中端已回写配置"
+        )
+
+    # ---- 展示辅助 ----
+
+    def _sync_combos_from_config(self, config: dict[str, object]) -> None:
+        """把空中端上报的当前配置同步进下拉（未应用的本地编辑不被覆盖）。"""
+        baud = config.get("gnss_baud")
+        if (isinstance(baud, int) and not isinstance(baud, bool)
+                and not self._baud_dirty and not self._syncing_baud
+                and self.gnss_baud_spin.minimum() <= baud <= self.gnss_baud_spin.maximum()):
+            self._syncing_baud = True
+            try:
+                self.gnss_baud_spin.setValue(baud)
+            finally:
+                self._syncing_baud = False
+        engine = config.get("engine")
+        if engine in AIR_ENGINE_VALUES and not self._engine_dirty:
+            index = self.engine_combo.findData(engine)
+            if index >= 0:
+                self.engine_combo.setCurrentIndex(index)
+        source = config.get("device_source")
+        if source in AIR_DEVICE_SOURCE_VALUES and not self._source_dirty:
+            index = self.device_source_combo.findData(source)
+            if index >= 0:
+                self.device_source_combo.setCurrentIndex(index)
+
+    def _set_overview_placeholder(self, reason: str) -> None:
+        self.device_vna_label.setText(f"雷达 USB：{reason}")
+        self.device_run_id_label.setText(f"run_id：{reason}")
+        self.device_acquiring_label.setText(f"是否采集：{reason}")
+        self.device_backlog_label.setText(f"积压：{reason}")
+        self.device_disk_label.setText(f"磁盘剩余：{reason}")
+        self.device_version_label.setText(f"程序版本：{reason}")
+        self.device_config_label.setText(f"当前配置：{reason}")
+        self.device_status_updated_label.setText("总览更新：从未")
+
+    def _set_notice(self, text: str) -> None:
+        self.panel_notice_label.setText(text)
+
+    def _log(self, text: str) -> None:
+        log = getattr(self._window, "log", None)
+        if callable(log):
+            try:
+                log(f"[设备面板] {text}")
+            except Exception:  # noqa: BLE001 - 日志失败不得影响面板
+                pass
+
+    @staticmethod
+    def _tri_text(value: object, true_text: str, false_text: str) -> str:
+        if value is True:
+            return true_text
+        if value is False:
+            return false_text
+        return "未知"
+
+    @staticmethod
+    def _config_text(config: object) -> str:
+        if not isinstance(config, dict) or not config:
+            return "-"
+        known_order = (
+            "engine",
+            "device_source",
+            "gnss_port",
+            "gnss_baud",
+            "ground_host",
+            "output_dir",
+        )
+        parts: list[str] = []
+        for key in known_order:
+            if key in config:
+                parts.append(f"{key}={config[key]}")
+        for key in sorted(config):
+            if key not in known_order:
+                parts.append(f"{key}={config[key]}")
+        return "，".join(parts)
+
+
 # 地面站主窗口尺寸约束：最小尺寸保证菜单/按钮/两幅 B-scan/GNSS/状态栏均可
 # 显示；目标尺寸为常见桌面分辨率；初始窗口尺寸上限防止初始窗口大于屏幕
 # 可视区域（注意：代码未调用 setMaximumSize()，用户仍可手动把窗口拉大）。
@@ -1469,8 +2105,41 @@ class CalibrationWizard(QtWidgets.QDialog):
         self._steps: list[str] = []
         self._step_index = 0
         self._steps_done = 0
+        self._completed_steps: set[str] = set()
         self._solved = False
         self._capturing = False
+
+        # 第8轮：会话与生效校准解耦、文件完整内容导出、能力与幂等
+        self._active_calibration: dict | None = None
+        self._active_background: dict | None = None
+        self._last_osl_json_content: str | None = None
+        self._pending_step: str | None = None
+        self._pending_is_recapture = False
+        self._pending_request_id: str | None = None
+        self._completed_request_ids: set[str] = set()
+        self._air_supports_step_done: bool | None = None
+        self._pending_export_path: str | None = None
+        self._pending_export_paths: dict[str, str | None] = {}
+        self._pending_import_content: str | None = None
+        self._pending_import_filename: str | None = None
+        self._import_pending_cal_id: str | None = None
+        self._watchdog_query_token: str | None = None
+        self._watchdog_query_pending: bool = False
+        self._watchdog_query_context: tuple[str | None, str | None, str | None] | None = None
+        self._legacy_fallback_count: int = 0
+
+        self._capture_watchdog_timer = QtCore.QTimer(self)
+        self._capture_watchdog_timer.setSingleShot(True)
+        self._capture_watchdog_timer.timeout.connect(self._on_capture_watchdog_timeout)
+
+        self._import_timer = QtCore.QTimer(self)
+        self._import_timer.setSingleShot(True)
+        self._import_timer.timeout.connect(self._on_import_timeout)
+
+        self._legacy_fallback_timer = QtCore.QTimer(self)
+        self._legacy_fallback_timer.setSingleShot(True)
+        self._legacy_fallback_timer.timeout.connect(self._on_legacy_fallback_timeout)
+        self._legacy_fallback_step: str | None = None
 
         self._build_ui()
         self._set_session_controls()
@@ -1551,6 +2220,37 @@ class CalibrationWizard(QtWidgets.QDialog):
         plan_grid.addWidget(self.cal_dwell, 3, 3)
 
         main_layout.addWidget(plan_group)
+
+        # ---- 第8轮：校准文件加载与导出操作栏 ----
+        file_bar = QtWidgets.QHBoxLayout()
+        file_bar.setObjectName("calibration_file_bar")
+        file_bar.setSpacing(8)
+
+        self.import_button = QtWidgets.QPushButton("导入校准文件")
+        self.import_button.setObjectName("calibration_import_button")
+        self.import_button.setMinimumHeight(30)
+        self.import_button.clicked.connect(lambda: self.import_calibration_file())
+
+        self.export_button = QtWidgets.QPushButton("导出校准文件")
+        self.export_button.setObjectName("calibration_export_button")
+        self.export_button.setMinimumHeight(30)
+        self.export_button.clicked.connect(lambda: self.export_calibration_file())
+
+        self.query_button = QtWidgets.QPushButton("查询生效状态")
+        self.query_button.setObjectName("calibration_query_button")
+        self.query_button.setMinimumHeight(30)
+        self.query_button.clicked.connect(self.query_active_calibration)
+
+        self.active_cal_label = QtWidgets.QLabel("当前生效: OSL[未启用] | 背景[未启用]")
+        self.active_cal_label.setObjectName("calibration_active_label")
+        self.active_cal_label.setStyleSheet("QLabel { font-weight: bold; color: #0d47a1; }")
+
+        file_bar.addWidget(self.import_button)
+        file_bar.addWidget(self.export_button)
+        file_bar.addWidget(self.query_button)
+        file_bar.addWidget(self.active_cal_label, 1)
+
+        main_layout.addLayout(file_bar)
 
         # ---- 2. 分步采集表格与进度区 ----
         steps_group = QtWidgets.QGroupBox("分步采集状态与进度")
@@ -1705,25 +2405,39 @@ class CalibrationWizard(QtWidgets.QDialog):
     def set_connected(self, connected: bool) -> None:
         self._connected = bool(connected)
         if not self._connected:
+            self._stop_capture_watchdog()
+            self._cancel_legacy_fallback()
+            if self._capturing:
+                self._capturing = False
+                if self._pending_step:
+                    self._revert_step_row(self._pending_step, "空中端断开连接")
+                self._revert_all_pending_steps("空中端断开连接")
             self.status_label.setText("未连接空中端（开始校准已禁用）")
-        elif self._cal_id is None:
-            self.status_label.setText("已连接空中端：请配置计划后点击\"开始校准\"")
+        else:
+            if self._cal_id is None:
+                self.status_label.setText("已连接空中端：请配置计划后点击\"开始校准\"")
+            else:
+                self.status_label.setText(f"已连接空中端（会话 cal_id={self._cal_id}）")
         self._set_session_controls()
 
     def _set_session_controls(self) -> None:
         session_active = self._cal_id is not None
-        self.begin_button.setEnabled(self._connected and not session_active)
+        self.begin_button.setEnabled(self._connected and not session_active and not self._capturing)
         self.capture_button.setEnabled(
-            session_active and self._step_index < len(self._steps) and not self._capturing
+            self._connected and session_active and self._step_index < len(self._steps) and not self._capturing
         )
         self.recapture_button.setEnabled(
-            session_active and self.recapture_combo.count() > 0 and not self._capturing
+            self._connected and session_active and self.recapture_combo.count() > 0 and not self._capturing
         )
         self.finish_button.setEnabled(
-            session_active and self._steps_done >= len(self._steps) and not self._solved and not self._capturing
+            self._connected and session_active and self._steps_done >= len(self._steps) and not self._solved and not self._capturing
         )
-        self.activate_button.setEnabled(session_active and self._solved and not self._capturing)
-        self.cancel_button.setEnabled(session_active)
+        self.activate_button.setEnabled(self._connected and session_active and self._solved and not self._capturing)
+        self.cancel_button.setEnabled(self._connected and session_active and not self._capturing)
+
+        self.import_button.setEnabled(self._connected and not self._capturing)
+        self.export_button.setEnabled(self._connected and not self._capturing)
+        self.query_button.setEnabled(self._connected and not self._capturing)
 
         for widget in (
             self.mode_combo,
@@ -1735,7 +2449,7 @@ class CalibrationWizard(QtWidgets.QDialog):
             self.cal_power,
             self.cal_dwell,
         ):
-            widget.setEnabled(not session_active)
+            widget.setEnabled(self._connected and not session_active and not self._capturing)
 
     def _refresh_step_highlight(self) -> None:
         total = len(self._steps)
@@ -1751,8 +2465,8 @@ class CalibrationWizard(QtWidgets.QDialog):
             self.instruction_label.setText("所有步骤已采集完毕！请点击“解算并生成”完成校准解算。")
 
         self.recapture_combo.clear()
-        for idx, step_name in enumerate(self._steps):
-            if idx < self._steps_done or idx == self._step_index:
+        for step_name in self._steps:
+            if step_name in self._completed_steps:
                 self.recapture_combo.addItem(step_name, step_name)
 
         if current_step:
@@ -1761,18 +2475,179 @@ class CalibrationWizard(QtWidgets.QDialog):
                     self.steps_table.selectRow(row)
                     break
 
+    def current_step_name(self) -> str | None:
+        """返回当前待采步骤名称（供测试与调度使用）。"""
+        if 0 <= self._step_index < len(self._steps):
+            return self._steps[self._step_index]
+        return None
+
     # ---- 编排命令（既有 type="command" + 新 action，R-C-12）----
 
-    def _send(self, action: str, params: dict[str, object]) -> None:
+    def _send(self, action: str, params: dict[str, object]) -> bool:
         receiver = getattr(self._window, "receiver", None)
         send = getattr(receiver, "send_command", None)
         if not callable(send):
             self.status_label.setText("未连接空中端（无法发送校准命令）")
-            return
+            return False
         send(action, params)
+        return True
+
+    # ---- Watchdog 超时防抖与旧端平滑降级 ----
+
+    def _reset_watchdog_query(self) -> None:
+        """Retire replies belonging to a completed/cancelled capture."""
+        self._watchdog_query_token = None
+        self._watchdog_query_pending = False
+        self._watchdog_query_context = None
+
+    def _start_capture_watchdog(self) -> None:
+        self._reset_watchdog_query()
+        repeats = int(self.repeats.value())
+        pts = int(self.cal_points.value())
+        ifbw = int(self.cal_ifbw.value())
+        t_sweep = pts / max(ifbw, 100) + 0.05
+        total_sec = repeats * t_sweep + 20.0
+        timeout_ms = int(max(30.0, total_sec * 2.0) * 1000)
+        self._capture_watchdog_timer.start(timeout_ms)
+
+    def _pet_capture_watchdog(self) -> None:
+        if self._capture_watchdog_timer.isActive():
+            repeats = int(self.repeats.value())
+            pts = int(self.cal_points.value())
+            ifbw = int(self.cal_ifbw.value())
+            t_sweep = pts / max(ifbw, 100) + 0.05
+            total_sec = repeats * t_sweep + 20.0
+            timeout_ms = int(max(30.0, total_sec * 2.0) * 1000)
+            self._capture_watchdog_timer.start(timeout_ms)
+
+    def _stop_capture_watchdog(self) -> None:
+        if self._capture_watchdog_timer.isActive():
+            self._capture_watchdog_timer.stop()
+        self._reset_watchdog_query()
+
+    def _on_capture_watchdog_timeout(self) -> None:
+        if not self._capturing or self._cal_id is None or not self._pending_request_id:
+            self._reset_watchdog_query()
+            return
+        self.status_label.setText("等待空中端响应超时，正在查询远程实际状态…")
+        req_id = f"req_wd_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        self._watchdog_query_token = req_id
+        self._watchdog_query_pending = True
+        self._watchdog_query_context = (
+            self._cal_id, self._pending_request_id, self._pending_step
+        )
+        self._send("cal_query_active", {"request_id": req_id})
+
+    def _schedule_legacy_fallback(self, step: str) -> None:
+        self._cancel_legacy_fallback()
+        self._legacy_fallback_step = step
+        if self._air_supports_step_done is False:
+            self._complete_step(step)
+        # None is unknown, not an old peer. True owes a real step_done.
+        # Elapsed time is never evidence that either peer finished its worker.
+
+    def _cancel_legacy_fallback(self) -> None:
+        if self._legacy_fallback_timer.isActive():
+            self._legacy_fallback_timer.stop()
+        self._legacy_fallback_step = None
+
+    def _on_legacy_fallback_timeout(self) -> None:
+        # A queued timeout can outlive cancellation or capability negotiation.
+        if (self._air_supports_step_done is False
+                and self._legacy_fallback_step and self._capturing
+                and self._legacy_fallback_step == self._pending_step):
+            step = self._legacy_fallback_step
+            self._complete_step(step)
+            self.status_label.setText(f"步骤 {step} 完成（已确认旧空中端模式）")
+
+    def _on_import_timeout(self) -> None:
+        self.status_label.setText("导入校准文件超时：空中端未响应")
+        self.query_active_calibration()
+
+    def _complete_step(self, step: str) -> None:
+        self._stop_capture_watchdog()
+        self._cancel_legacy_fallback()
+        self._capturing = False
+        self._pending_step = None
+        self._pending_request_id = None
+        self._pending_is_recapture = False
+        self._legacy_fallback_count = 0
+        if step:
+            self._completed_steps.add(step)
+            self._update_step_row(step, "已完成", "")
+        self._steps_done = len(self._completed_steps)
+
+        first_uncompleted_idx = next(
+            (i for i, s in enumerate(self._steps) if s not in self._completed_steps),
+            len(self._steps)
+        )
+        self._step_index = first_uncompleted_idx
+
+        if self._step_index >= len(self._steps):
+            self.instruction_label.setText("所有步骤已采集完毕！请点击“解算并生成”完成校准解算。")
+        else:
+            next_step = self._steps[self._step_index]
+            self.instruction_label.setText(self._get_step_instruction(next_step))
+
+        self.status_label.setText(f"步骤 {step} 完成（{self._steps_done}/{len(self._steps)}）")
+        self._refresh_step_highlight()
+        self._set_session_controls()
+
+    def _revert_step_row(self, step: str, reason: str = "") -> None:
+        if step in self._completed_steps:
+            self._update_step_row(step, "已完成", f"重采拒绝: {reason}" if reason else "")
+        else:
+            self._update_step_row(step, "待采集", f"拒绝: {reason}" if reason else "")
+
+    def _revert_all_pending_steps(self, reason: str = "") -> None:
+        for row in range(self.steps_table.rowCount()):
+            item_step = self.steps_table.item(row, 0)
+            item_status = self.steps_table.item(row, 1)
+            if item_step and item_status and "请求" in item_status.text():
+                s = item_step.text()
+                self._revert_step_row(s, reason)
+
+    def _update_active_calibration_display(self) -> None:
+        osl_info = "未启用"
+        if self._active_calibration:
+            ports = self._active_calibration.get("ports") or []
+            ports_str = "+".join(ports) if ports else "P1"
+            pts = self._active_calibration.get("points")
+            pts_str = f", {pts}点" if pts else ""
+            band = self._active_calibration.get("valid_band_hz")
+            band_str = ""
+            if isinstance(band, (list, tuple)) and len(band) == 2:
+                band_str = f", {band[0]/1e6:.1f}-{band[1]/1e6:.1f} MHz"
+            elif isinstance(band, str):
+                band_str = f", {band}"
+            cal_id = self._active_calibration.get("cal_id") or ""
+            fn = self._active_calibration.get("filename")
+            fn_str = f" [{fn}]" if fn else ""
+            osl_info = f"{ports_str}{pts_str}{band_str}{fn_str}"
+
+        bg_info = "未启用"
+        if self._active_background:
+            pts = self._active_background.get("points")
+            pts_str = f"{pts}点" if pts else "已生效"
+            bg_info = f"{pts_str}"
+
+        text = f"当前生效: OSL[{osl_info}] | 背景[{bg_info}]"
+        self.active_cal_label.setText(text)
+
+        if hasattr(self._window, "calibration_status_label"):
+            self._window.calibration_status_label.setText(f"校准: OSL[{osl_info}]")
+
+    # ---- 交互动作实现 ----
 
     def begin_calibration(self) -> None:
-        cal_id = f"cal_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if not self._connected:
+            self.status_label.setText("未连接空中端（开始校准已禁用）")
+            return
+        if self._cal_id is not None:
+            return
+        self._stop_capture_watchdog()
+        self._cancel_legacy_fallback()
+        cal_id = f"cal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}" 
         mode = str(self.mode_combo.currentData() or "osl")
         steps = list(self.OSL_STEPS) if mode == "osl" else ["Background"]
         params: dict[str, object] = {
@@ -1793,8 +2668,11 @@ class CalibrationWizard(QtWidgets.QDialog):
         self._steps = steps
         self._step_index = 0
         self._steps_done = 0
+        self._completed_steps = set()
         self._solved = False
         self._capturing = False
+        self._pending_step = None
+        self._pending_request_id = None
 
         self.steps_table.setRowCount(0)
         for name in steps:
@@ -1806,50 +2684,456 @@ class CalibrationWizard(QtWidgets.QDialog):
         self._set_session_controls()
 
     def capture_next_step(self) -> None:
-        if self._cal_id is None or self._step_index >= len(self._steps):
+        if self._cal_id is None or self._capturing or self._step_index >= len(self._steps):
             return
         step = self._steps[self._step_index]
+        req_id = f"req_cap_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         self._capturing = True
+        self._pending_step = step
+        self._pending_is_recapture = False
+        self._pending_request_id = req_id
         self._update_step_row(step, "请求采集中…", "")
         self.status_label.setText(f"已发送 cal_capture（{step}）…")
+        self._refresh_step_highlight()
         self._set_session_controls()
-        self._send("cal_capture", {"cal_id": self._cal_id, "step": step})
+        self._start_capture_watchdog()
+        self._send("cal_capture", {
+            "cal_id": self._cal_id,
+            "step": step,
+            "recapture": False,
+            "request_id": req_id,
+        })
 
     def recapture_selected_step(self) -> None:
-        step = self.recapture_combo.currentText()
+        step = self.recapture_combo.currentText().strip()
         if not step:
             return
         self.recapture_step(step)
 
     def recapture_step(self, step: str) -> None:
-        if self._cal_id is None or step not in self._steps:
+        if self._cal_id is None or self._capturing or step not in self._steps:
             return
+        req_id = f"req_recap_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         self._capturing = True
+        self._pending_step = step
+        self._pending_is_recapture = True
+        self._pending_request_id = req_id
+        self._solved = False
         step_idx = self._steps.index(step)
         self._step_index = step_idx
         self._update_step_row(step, "请求重采中…", "")
-        self.status_label.setText(f"已发送 cal_capture（重采 {step}）…")
+        self.status_label.setText(f"已发送 cal_capture（重采 {step}，单次点击直接执行）…")
         self._refresh_step_highlight()
         self._set_session_controls()
-        self._send("cal_capture", {"cal_id": self._cal_id, "step": step})
+        self._start_capture_watchdog()
+        self._send("cal_capture", {
+            "cal_id": self._cal_id,
+            "step": step,
+            "recapture": True,
+            "request_id": req_id,
+        })
 
     def finish_calibration(self) -> None:
-        if self._cal_id is None:
+        if self._cal_id is None or self._capturing:
             return
         self._send("cal_finish", {"cal_id": self._cal_id})
+        self.status_label.setText(f"已发送 cal_finish（cal_id={self._cal_id}）…")
 
     def activate_calibration(self) -> None:
-        if self._cal_id is None:
+        if self._cal_id is None or self._capturing:
             return
         self._send("cal_activate", {"cal_id": self._cal_id})
+        self.status_label.setText(f"已发送 cal_activate（cal_id={self._cal_id}）…")
 
     def cancel_session(self) -> None:
         if self._cal_id is None:
             return
-        self._send("cal_cancel", {"cal_id": self._cal_id, "reason": "地面操作员取消"})
-        self.status_label.setText(f"已发送 cal_cancel（cal_id={self._cal_id}）…")
+        cal_id = self._cal_id
+        self._send("cal_cancel", {"cal_id": cal_id, "reason": "地面操作员取消"})
+        self._stop_capture_watchdog()
+        self._cancel_legacy_fallback()
+        self.status_label.setText(f"已发送 cal_cancel（cal_id={cal_id}）…")
+        self._cal_id = None
+        self._capturing = False
+        self._pending_step = None
+        self._pending_request_id = None
+        self._revert_all_pending_steps("地面操作员取消")
+        self._set_session_controls()
 
-    # ---- 回程展示（calibration_* 消息）----
+    def _notify_warning(self, title: str, text: str) -> None:
+        self.status_label.setText(f"{title}：{text}")
+        if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            QtWidgets.QMessageBox.warning(self, title, text)
+
+    def import_calibration_file(self, file_path: str | None = None) -> bool:
+        """加载已有校准文件并完整传输到空中端激活。"""
+        if not self._connected:
+            self.status_label.setText("未连接空中端（无法导入校准文件）")
+            return False
+        if not isinstance(file_path, str) or not file_path:
+            file_path = None
+        if file_path is None:
+            file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "选择校准文件", "", "JSON 校准文件 (*.json);;所有文件 (*.*)"
+            )
+        if not file_path:
+            return False
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content_str = f.read()
+            data = json.loads(content_str)
+        except Exception as exc:
+            self.status_label.setText(f"读取校准文件失败: {exc}")
+            self._notify_warning("读取失败", f"校准文件不是有效的 JSON: {exc}")
+            return False
+
+        if not isinstance(data, dict):
+            self.status_label.setText("无效校准文件: 根节点必须为 JSON 对象")
+            self._notify_warning("格式错误", "校准文件根节点必须为 JSON 对象")
+            return False
+
+        # 补遗上限 10MB 检查
+        if len(content_str.encode("utf-8")) > 10 * 1024 * 1024:
+            self.status_label.setText("校准文件过大（超过 10 MB 上限）")
+            self._notify_warning("超限", "校准文件超过 10 MB 传输上限")
+            return False
+
+        has_v2 = data.get("format") == "uav_gpr_solt_calibration_v2"
+        has_meas = "measurements" in data or any(k in data for k in ("Open", "Short", "Load", "P1_Open", "P1_Short", "P1_Load"))
+        if not (has_v2 or has_meas):
+            self.status_label.setText("无效校准文件: 缺少 SOLT 标准件测量数据")
+            self._notify_warning("格式错误", "校准文件缺少必要的 SOLT 标准件数据")
+            return False
+
+        filename = os.path.basename(file_path)
+        req_id = f"req_imp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        self._pending_import_content = content_str
+        self._pending_import_filename = filename
+        self._import_pending_cal_id = self._cal_id
+        self.status_label.setText(f"正在向空中端导入校准文件 {filename}…")
+        self._send("cal_import_file", {
+            "filename": filename,
+            "content": content_str,
+            "activate": True,
+            "request_id": req_id,
+        })
+        self._import_timer.start(10000)
+        return True
+
+    def export_calibration_file(self, target_path: str | None = None) -> bool:
+        """从空中端拉取完整 OSL 校准文件并保存至地面本地。"""
+        if not isinstance(target_path, str) or not target_path:
+            target_path = None
+        if not self._connected:
+            if self._last_osl_json_content:
+                save_path = target_path
+                if not save_path:
+                    save_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                        self, "保存/导出校准文件", f"solt_calibration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "JSON 校准文件 (*.json);;所有文件 (*.*)"
+                    )
+                if save_path:
+                    try:
+                        with open(save_path, "w", encoding="utf-8") as f:
+                            f.write(self._last_osl_json_content)
+                        self.status_label.setText(f"校准文件已成功导出至本地: {os.path.basename(save_path)}")
+                        return True
+                    except Exception as exc:
+                        self.status_label.setText(f"写入本地文件失败: {exc}")
+                        self._notify_warning("导出失败", f"写入失败: {exc}")
+                        return False
+            self.status_label.setText("未连接空中端（且无本地生效校准内容）")
+            self._notify_warning("导出提示", "未连接空中端，且本地无生效校准内容可供导出。")
+            return False
+
+        self.status_label.setText("正在请求空中端导出完整校准文件…")
+        req_id = f"req_exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        self._pending_export_paths[req_id] = target_path
+        self._pending_export_path = target_path
+        self._send("cal_export_file", {
+            "cal_id": self._cal_id,
+            "format": "uav_gpr_solt_calibration_v2",
+            "request_id": req_id,
+        })
+        return True
+
+    def query_active_calibration(self) -> None:
+        """向空中端查询当前生效的 OSL 与背景校准组件及能力。"""
+        if not self._connected:
+            return
+        self.status_label.setText("正在查询空中端当前生效状态…")
+        self._send("cal_query_active", {})
+
+    def clear_active_calibration(self, target: str = "all") -> None:
+        """清除空中端当前生效的校准或背景（遵循补遗精准边界）。"""
+        if not self._connected:
+            return
+        self._send("cal_clear_active", {"target": target})
+
+    # ---- 回程消息处理（双通道：command_result + calibration_message）----
+
+    def on_command_result(self, header: dict) -> None:
+        """处理空中端 command_ack 回执（含 result/supported）。"""
+        action = str(header.get("action") or "")
+        if action == "cal_import_file":
+            self._import_timer.stop()
+            if header.get("supported") is False:
+                msg = "空中端版本较低，不支持远程文件导入/重采，请升级空中端程序"
+                self.status_label.setText(f"导入失败：{msg}")
+                self._notify_warning("不支持", msg)
+                return
+            result = header.get("result")
+            if isinstance(result, dict) and result.get("ok"):
+                self._active_calibration = dict(result)
+                self._last_osl_json_content = getattr(self, "_pending_import_content", None)
+                # 补遗明确：OSL 变更彻底失效背景
+                if self._active_background:
+                    self._active_background = None
+                    self.status_label.setText("校准文件导入并激活成功。注意：先前背景已失效，请重新采集背景。")
+                else:
+                    ports = result.get("ports") or []
+                    ports_str = "+".join(ports) if ports else "P1"
+                    pts = result.get("points") or ""
+                    band = result.get("valid_band_hz") or []
+                    band_str = f"{band[0]/1e6:.1f}-{band[1]/1e6:.1f} MHz" if isinstance(band, (list, tuple)) and len(band) == 2 else ""
+                    summary = f"{ports_str}, {pts}频点, {band_str}"
+                    self.status_label.setText(f"校准文件导入并激活成功: {summary}")
+                self._update_active_calibration_display()
+
+                import_cal_id = getattr(self, "_import_pending_cal_id", None)
+                if self._mode == "osl" and self._cal_id == import_cal_id:
+                    for step_name in self.OSL_STEPS:
+                        self._update_step_row(step_name, "已导入", "从文件加载")
+                    self._completed_steps = set(self.OSL_STEPS)
+                    self._steps_done = len(self._completed_steps)
+                    self._step_index = len(self.OSL_STEPS)
+                    self._refresh_step_highlight()
+                    self.instruction_label.setText("校准文件已导入并生效！可直接进行雷达采集或切换模式新建背景采集。")
+                if self._cal_id == import_cal_id:
+                    self._cal_id = None
+                    self._set_session_controls()
+                self._import_pending_cal_id = None
+            else:
+                err = (result.get("error") if isinstance(result, dict) else None) or "未知错误"
+                self.status_label.setText(f"导入校准文件失败: {err}")
+                self._notify_warning("导入失败", f"空中端拒绝校准文件: {err}")
+
+        elif action == "cal_export_file":
+            result = header.get("result")
+            req_id = str(
+                (result.get("request_id") if isinstance(result, dict) else None)
+                or header.get("request_id") or ""
+            )
+            # Membership distinguishes a valid chooser request (value=None)
+            # from a missing, already-consumed or foreign request.
+            if not req_id or req_id not in self._pending_export_paths:
+                return
+            save_path = self._pending_export_paths.pop(req_id)
+            if header.get("supported") is False:
+                msg = "空中端版本较低，不支持远程文件导出，请升级空中端程序"
+                self.status_label.setText(f"导出失败：{msg}")
+                self._notify_warning("不支持", msg)
+                return
+            result = header.get("result")
+            if isinstance(result, dict) and result.get("ok"):
+                content = result.get("content")
+                if isinstance(content, dict):
+                    content_str = json.dumps(content, indent=2, ensure_ascii=False)
+                else:
+                    content_str = str(content or "")
+
+                try:
+                    parsed = json.loads(content_str)
+                    if not isinstance(parsed, dict) or not content_str.strip():
+                        raise ValueError("导出的校准数据为空或非有效 JSON 对象")
+                except Exception as exc:
+                    self.status_label.setText(f"空中端导出的内容非有效 JSON: {exc}")
+                    self._notify_warning("导出失败", f"校准数据损坏: {exc}")
+                    return
+
+                default_name = str(result.get("filename") or f"solt_calibration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+                if not save_path:
+                    save_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                        self, "保存/导出校准文件", default_name, "JSON 校准文件 (*.json);;所有文件 (*.*)"
+                    )
+                    if not save_path:
+                        self.status_label.setText("导出已取消，未保存校准文件。")
+                        return
+                if save_path:
+                    try:
+                        with open(save_path, "w", encoding="utf-8") as f:
+                            f.write(content_str)
+                        self.status_label.setText(f"校准文件已完整导出至本地: {os.path.basename(save_path)}")
+                        self._last_osl_json_content = content_str
+                    except Exception as exc:
+                        self.status_label.setText(f"写入本地文件失败: {exc}")
+                        self._notify_warning("导出失败", f"无法写入文件: {exc}")
+            else:
+                err = (result.get("error") if isinstance(result, dict) else None) or "未知错误"
+                self.status_label.setText(f"导出校准文件失败: {err}")
+                self._notify_warning("导出失败", f"空中端拒绝导出: {err}")
+
+        elif action == "cal_capture":
+            if header.get("supported") is False:
+                req_id = str(header.get("request_id") or "")
+                if self._capturing and (not req_id or not self._pending_request_id or req_id != self._pending_request_id):
+                    return
+                self._stop_capture_watchdog()
+                self._cancel_legacy_fallback()
+                self._capturing = False
+                if self._pending_step:
+                    self._revert_step_row(self._pending_step, "空中端不支持重采")
+                first_uncompleted_idx = next(
+                    (i for i, s in enumerate(self._steps) if s not in self._completed_steps),
+                    len(self._steps)
+                )
+                self._step_index = first_uncompleted_idx
+                self._pending_step = None
+                self._pending_request_id = None
+                self._pending_is_recapture = False
+                msg = "空中端版本较低，不支持远程文件导入/重采，请升级空中端程序"
+                self.status_label.setText(f"采集被拒绝: {msg}")
+                self._notify_warning("不支持", msg)
+                self._refresh_step_highlight()
+                self._set_session_controls()
+                return
+            result = header.get("result")
+            if isinstance(result, dict) and result.get("ok") is False:
+                req_id = str(result.get("request_id") or header.get("request_id") or "")
+                # 当处于在途采集时，任何不携带有效且匹配 request_id 的 cal_capture 拒绝绝不得重置 _capturing 或回退步骤行 (FINDING-GND-09)
+                if self._capturing and (not req_id or not self._pending_request_id or req_id != self._pending_request_id):
+                    return
+                if req_id and req_id in self._completed_request_ids:
+                    return
+                if req_id:
+                    self._completed_request_ids.add(req_id)
+                self._stop_capture_watchdog()
+                self._cancel_legacy_fallback()
+                self._capturing = False
+                err = str(result.get("error") or "未知拒绝")
+                if self._pending_step:
+                    self._revert_step_row(self._pending_step, err)
+                self._pending_step = None
+                self._pending_request_id = None
+                self._pending_is_recapture = False
+                first_uncompleted_idx = next(
+                    (i for i, s in enumerate(self._steps) if s not in self._completed_steps),
+                    len(self._steps)
+                )
+                self._step_index = first_uncompleted_idx
+                self.status_label.setText(f"采集被拒绝: {err}")
+                self._refresh_step_highlight()
+                self._set_session_controls()
+
+        elif action == "cal_query_active":
+            result = header.get("result")
+            req_id = str(
+                (result.get("request_id") if isinstance(result, dict) else None)
+                or header.get("params", {}).get("request_id")
+                or header.get("request_id") or ""
+            )
+            is_watchdog = bool(
+                self._capturing and self._watchdog_query_pending
+                and self._watchdog_query_token and req_id
+                and req_id == self._watchdog_query_token
+                and self._watchdog_query_context == (
+                    self._cal_id, self._pending_request_id, self._pending_step
+                )
+            )
+            in_prog = result.get("in_progress_session") if isinstance(result, dict) else None
+            session_matches = bool(
+                isinstance(in_prog, dict) and self._cal_id is not None
+                and in_prog.get("cal_id") == self._cal_id
+            )
+            current_busy = bool(
+                session_matches and in_prog.get("busy")
+                and in_prog.get("active_request_id") == self._pending_request_id
+            )
+            if self._capturing and not is_watchdog and not current_busy:
+                # Do not let a retired query rewrite even the new step's row.
+                return
+            if is_watchdog:
+                self._reset_watchdog_query()
+            if header.get("supported") is False:
+                if self._capturing:
+                    # Unsupported status queries do not prove the worker idle.
+                    self.status_label.setText("空中端不支持状态查询，仍等待采集回执；请配套升级两端软件。")
+                    self._capture_watchdog_timer.start(10000)
+                else:
+                    self._air_supports_step_done = False
+                return
+            result = header.get("result")
+            if isinstance(result, dict) and result.get("ok"):
+                caps = result.get("capabilities") or {}
+                if isinstance(caps, dict) and caps.get("step_done") is not None:
+                    self._air_supports_step_done = bool(caps.get("step_done"))
+
+                in_prog = result.get("in_progress_session") or {}
+                if isinstance(in_prog, dict) and in_prog.get("busy"):
+                    self.status_label.setText(f"空中端仍在忙碌执行采集任务（步骤: {in_prog.get('current_step')}），保持等待…")
+                    self._capture_watchdog_timer.start(10000)
+                    return
+
+                # 若空中端返回步骤状态字典，同步地面步骤集合
+                steps_status = in_prog.get("steps_status") if session_matches else None
+                if isinstance(steps_status, dict) and steps_status:
+                    for s, st in steps_status.items():
+                        if st in ("done", "completed"):
+                            self._completed_steps.add(s)
+                            self._update_step_row(s, "已完成", "")
+                        elif st == "pending" and s not in self._completed_steps:
+                            self._update_step_row(s, "待采集", "")
+                    self._steps_done = len(self._completed_steps)
+                    first_uncompleted_idx = next(
+                        (i for i, s in enumerate(self._steps) if s not in self._completed_steps),
+                        len(self._steps)
+                    )
+                    self._step_index = first_uncompleted_idx
+                    self._refresh_step_highlight()
+
+                # 仅响应由 watchdog 超时显式触发的查询，陈旧普通查询绝不得强行重置 _capturing！
+                if is_watchdog and self._capturing:
+                    self._stop_capture_watchdog()
+                    self._capturing = False
+                    if self._pending_step:
+                        self._revert_step_row(self._pending_step, "超时已释放")
+                    first_uncompleted_idx = next(
+                        (i for i, s in enumerate(self._steps) if s not in self._completed_steps),
+                        len(self._steps)
+                    )
+                    self._step_index = first_uncompleted_idx
+                    self._pending_step = None
+                    self._pending_request_id = None
+                    self._pending_is_recapture = False
+                    self.status_label.setText("远程采集已结束，已恢复操作控制。")
+                    self._refresh_step_highlight()
+                    self._set_session_controls()
+
+                active_osl = result.get("active_osl")
+                if isinstance(active_osl, dict) and active_osl.get("active"):
+                    self._active_calibration = dict(active_osl)
+                else:
+                    self._active_calibration = None
+
+                active_bg = result.get("active_background")
+                if isinstance(active_bg, dict) and active_bg.get("active"):
+                    self._active_background = dict(active_bg)
+                else:
+                    self._active_background = None
+
+                self._update_active_calibration_display()
+
+        elif action == "cal_clear_active":
+            result = header.get("result")
+            if isinstance(result, dict) and result.get("ok"):
+                cleared = str(result.get("cleared") or result.get("target") or "all")
+                if cleared in ("all", "osl"):
+                    self._active_calibration = None
+                    self._last_osl_json_content = None
+                if cleared in ("all", "background"):
+                    self._active_background = None
+                self._update_active_calibration_display()
+                self.status_label.setText(f"已清除生效校准/背景（目标: {cleared}）")
 
     def on_calibration_message(self, header: dict) -> None:
         msg_type = str(header.get("type") or "")
@@ -1861,24 +3145,20 @@ class CalibrationWizard(QtWidgets.QDialog):
             step = str(header.get("step") or "")
             index = header.get("index")
             of = header.get("of")
+            self._pet_capture_watchdog()
             self._update_step_row(
                 step,
                 f"采集中 {index}/{of}" if of else "采集中…",
                 "",
             )
             if isinstance(index, int) and isinstance(of, int) and index >= of:
-                self._capturing = False
-                self._update_step_row(step, "已完成", "")
-                if step in self._steps:
-                    idx = self._steps.index(step)
-                    self._steps_done = max(self._steps_done, idx + 1)
-                    if self._step_index <= idx:
-                        self._step_index = min(idx + 1, len(self._steps))
-                self.status_label.setText(
-                    f"步骤 {step} 完成（{self._steps_done}/{len(self._steps)}）"
-                )
-                self._refresh_step_highlight()
-                self._set_session_controls()
+                if self._air_supports_step_done is False:
+                    self._complete_step(step)
+                else:
+                    # 新端或能力未知（None）：严禁在末样本到达后提前解锁，保持 _capturing 锁定，必须等待权威 step_done
+                    self._update_step_row(step, "已完成", "等待收尾…")
+                    self.status_label.setText(f"步骤 {step} 样本已收齐，等待空中端完成硬件收尾…")
+
         elif msg_type == "calibration_quality":
             step = str(header.get("step") or "")
             repeat_rms = header.get("repeat_rms")
@@ -1896,42 +3176,128 @@ class CalibrationWizard(QtWidgets.QDialog):
                 f"质量指标: {step} 重复RMS={rms_text} 最大绝对误差={max_text} 样本数={sample}"
                 f"{'（' + note + '）' if note else ''}"
             )
+            if self._air_supports_step_done is False and self._capturing:
+                self._complete_step(step)
+
         elif msg_type == "calibration_result":
             status = str(header.get("status") or "")
-            if status == "planned":
-                steps = header.get("steps")
-                if isinstance(steps, list) and steps:
-                    self._steps = [str(s) for s in steps]
+            if status == "step_done":
+                req_id = str(header.get("request_id") or "")
+                if req_id and self._pending_request_id and req_id != self._pending_request_id:
+                    return
+                if req_id and req_id in self._completed_request_ids:
+                    return
+                if req_id:
+                    self._completed_request_ids.add(req_id)
+                self._stop_capture_watchdog()
+                self._cancel_legacy_fallback()
+                self._air_supports_step_done = True
+                self._legacy_fallback_count = 0
+                step = str(header.get("step") or self._pending_step or "")
+                self._complete_step(step)
+
+            elif status == "planned":
+                self.status_label.setText(f"会话已就绪（cal_id={cal_id}，mode={header.get('mode')}）")
+                self._step_index = 0
+                self._steps_done = 0
+                self._completed_steps = set()
+                self._solved = False
+                self._capturing = False
+                steps_from_air = header.get("steps")
+                if isinstance(steps_from_air, list) and steps_from_air:
+                    self._steps = [str(s) for s in steps_from_air]
                     self.steps_table.setRowCount(0)
-                    for name in self._steps:
-                        self._append_step_row(name, "待采集", "")
+                    for s in self._steps:
+                        self._append_step_row(s, "待采集", "")
                 self._refresh_step_highlight()
-                self.status_label.setText(
-                    f"空中端已建会话（cal_id={cal_id}）：接好第 1 个标准件后点\"采集下一步\""
-                )
+                self._set_session_controls()
+
             elif status == "solved":
+                self._stop_capture_watchdog()
                 self._solved = True
-                self.result_label.setText(
-                    "解算完成："
-                    f"路径={header.get('path') or '-'} 有效频段={header.get('valid_band_hz') or '-'}"
-                )
+                self._capturing = False
+                p = header.get("path")
                 summary = str(header.get("profile_summary") or "")
-                if summary:
-                    self.result_label.setText(self.result_label.text() + f" | {summary}")
+                band = header.get("valid_band_hz") or "-"
+                self.result_label.setText(
+                    f"解算完成：路径={p or '内存'} 有效频段={band}"
+                    + (f" | {summary}" if summary else "")
+                )
+                self.status_label.setText("校准已解算成功，请点击“激活校准”使其生效。")
+                if header.get("content"):
+                    self._last_osl_json_content = str(header.get("content"))
+                self._refresh_step_highlight()
+                self._set_session_controls()
+
             elif status == "activated":
-                self.status_label.setText(f"校准已激活（cal_id={cal_id}）：后续采集立即生效")
+                self._stop_capture_watchdog()
+                self._capturing = False
+                self._solved = False
+                mode = str(header.get("mode") or self._mode)
+                if mode == "osl":
+                    self._active_calibration = dict(header)
+                    if self._active_background:
+                        self._active_background = None
+                        self.status_label.setText("OSL 校准已激活。注意：先前背景已失效，请重新采集背景。")
+                    else:
+                        self.status_label.setText(f"OSL 校准已激活（cal_id={cal_id}）：后续采集立即生效。")
+                elif mode == "background":
+                    self._active_background = dict(header)
+                    self.status_label.setText(f"背景参考已激活（cal_id={cal_id}）：后续探地采集将自动扣除背景。")
+                self._cal_id = None
+                self._update_active_calibration_display()
+                self._set_session_controls()
+
             elif status == "cancelled":
+                self._stop_capture_watchdog()
                 self.status_label.setText(f"会话已取消（cal_id={cal_id}）；已收 capture 文件保留")
                 self._cal_id = None
                 self._capturing = False
+                self._pending_step = None
+                self._pending_request_id = None
+                self._revert_all_pending_steps("会话已取消")
+                self._set_session_controls()
+
             elif status in ("rejected", "failed"):
+                req_id = str(header.get("request_id") or "")
+                # 当处于在途采集时，任何不携带有效且匹配 request_id 的拒绝绝不得重置 _capturing 或回退步骤行 (FINDING-GND-09)
+                if self._capturing and (not req_id or not self._pending_request_id or req_id != self._pending_request_id):
+                    return
+                if req_id and req_id in self._completed_request_ids:
+                    return
+                if req_id:
+                    self._completed_request_ids.add(req_id)
+                self._stop_capture_watchdog()
+                self._cancel_legacy_fallback()
                 self._capturing = False
+                reason = str(header.get("reason") or header.get("error") or "-")
                 self.status_label.setText(
-                    f"空中端拒绝/失败（{status}）：{header.get('reason') or '-'}"
+                    f"空中端拒绝/失败（{status}）：{reason}"
                 )
+                step = str(header.get("step") or self._pending_step or "")
+                if step:
+                    self._revert_step_row(step, reason)
+                else:
+                    self._revert_all_pending_steps(reason)
                 if status == "failed":
                     self._cal_id = None
-            self._set_session_controls()
+                if status == "rejected" and not step:
+                    self._cal_id = None
+                self._pending_step = None
+                self._pending_request_id = None
+                self._pending_is_recapture = False
+                first_uncompleted_idx = next(
+                    (i for i, s in enumerate(self._steps) if s not in self._completed_steps),
+                    len(self._steps)
+                )
+                self._step_index = first_uncompleted_idx
+                if self._step_index >= len(self._steps):
+                    self.instruction_label.setText("所有步骤已采集完毕！请点击“解算并生成”完成校准解算。")
+                else:
+                    next_step = self._steps[self._step_index]
+                    self.instruction_label.setText(self._get_step_instruction(next_step))
+                self._refresh_step_highlight()
+                self._set_session_controls()
 
     # ---- 步骤表工具 ----
 
@@ -2067,6 +3433,10 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             self.receiver.run_switched.connect(self._on_hello_run_switched)
         if hasattr(self.receiver, "calibration_message"):
             self.receiver.calibration_message.connect(self._on_calibration_message)
+        # 第7轮：带结果字段的 command_ack → 设备面板回执（既有 ack 通道；
+        # 测试注入的假 receiver 可能没有该信号，按 hasattr 兜底）。
+        if hasattr(self.receiver, "command_result"):
+            self.receiver.command_result.connect(self._on_command_result)
         # 生产路径：接收线程收到的 Trace 交给后台解码线程，不再在主线程解压。
         # （on_trace 保留为同步兼容/测试入口。）
         self.receiver.trace_received.connect(self._on_receiver_trace_received)
@@ -2122,6 +3492,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         # 第1轮检查点A：链路性能诊断入口（详细指标只在需要时查看）。
         self.action_show_pipeline_metrics = self.menu_view.addAction("链路性能诊断")
         self.action_show_pipeline_metrics.setObjectName("action_show_pipeline_metrics")
+        # 第7轮 D5：空中端设备面板入口（独立非模态窗口，不动主界面布局）。
+        self.action_show_device_panel = self.menu_view.addAction("空中端设备……")
+        self.action_show_device_panel.setObjectName("action_show_device_panel")
 
         self.menu_help = menubar.addMenu("帮助")
         self.action_about = self.menu_help.addAction("关于")
@@ -2138,6 +3511,8 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.action_show_details.triggered.connect(self.show_details_window)
         self.action_show_log.triggered.connect(self.show_log_window)
         self.action_show_pipeline_metrics.triggered.connect(self.show_pipeline_metrics)
+        # 第7轮：设备面板入口。
+        self.action_show_device_panel.triggered.connect(self.show_device_panel)
         # 复审修复：关于 action 在 _build_menu_bar 中只连接一次（此前错误地
         # 放在 show_pipeline_metrics 内，每打开一次诊断就多一条重复连接）。
         self.action_about.triggered.connect(self.show_about)
@@ -2336,6 +3711,18 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.calibration_dialog = CalibrationWizard(self)
         self.calibration_wizard = self.calibration_dialog
         self.calibration_dialog.set_connected(self._remote_connected)
+        # ---- 第7轮 D1+D5：空中端设备面板（黑匣子全遥控，独立非模态窗口，
+        #      默认隐藏；与运行日志/详细状态同模式，不推翻主界面布局）----
+        self.device_panel = AirDevicePanel(self)
+
+    def show_device_panel(self) -> None:
+        """打开空中端设备面板（非模态；打开时同步当前连接状态）。"""
+        panel = getattr(self, "device_panel", None)
+        if panel is None:
+            return
+        panel.set_link_connected(self._remote_connected)
+        panel.show()
+        panel.raise_()
 
     def open_calibration_dialog(self) -> None:
         """打开校准对话框（非模态；未连接时"开始校准"禁用并明确提示）。"""
@@ -2433,9 +3820,16 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     def _on_receiver_status(self, text: str) -> None:
         self.log(text)
         lowered = text.lower()
-        if text.startswith("Connected") or "remote ready" in lowered:
+        if "remote ready" in lowered:
             self.connection_status_label.setText("连接状态：已连接")
             self._set_remote_connected(True)
+        elif text.startswith("Connected"):
+            # 第7轮 t9 修复（修法 a，engB 方案）：accept 时刻 hello 握手未
+            # 完成——连接状态标签语义不变（仍显示"已连接"），但刻意不置
+            # connected：设备面板 5s 自动刷新与校准门控等 hello 回环完成后
+            # 再放行，消除窗口期 command 撞空中端 _connect 严格拒绝的竞态
+            # （第2轮 finding⑥ 现行违例，revA F1-r2）。
+            self.connection_status_label.setText("连接状态：已连接")
         elif "disconnected" in lowered or "client error" in lowered:
             self.connection_status_label.setText("连接状态：已断开")
             self._set_remote_connected(False)
@@ -2446,9 +3840,32 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     def _set_remote_connected(self, connected: bool) -> None:
         """R-C-11：连接状态变化同步到校准对话框（未连接→"开始校准"禁用）。"""
         self._remote_connected = bool(connected)
+        self.gnss_map.set_link_connected(self._remote_connected)
         dialog = getattr(self, "calibration_dialog", None)
         if dialog is not None:
             dialog.set_connected(self._remote_connected)
+        # 第7轮：同步到设备面板（未连接时面板禁发并显示断开）。
+        panel = getattr(self, "device_panel", None)
+        if panel is not None:
+            panel.set_link_connected(self._remote_connected)
+
+    def _on_command_result(self, header: dict) -> None:
+        """第7轮：把带结果字段的 command_ack 转发给设备面板（既有 ack 通道）。"""
+        if header.get("action") == "test_gnss":
+            result = header.get("result")
+            if isinstance(result, dict):
+                self.gnss_map.update_data(result)
+                if result.get("ok") is False:
+                    self.gnss_map.show_gnss_status(
+                        "测试未取得定位（连接情况以天空端回执为准）："
+                        + str(result.get("error") or result.get("detail") or "无详细信息")
+                    )
+        panel = getattr(self, "device_panel", None)
+        if panel is not None:
+            panel.on_command_result(dict(header))
+        dialog = getattr(self, "calibration_dialog", None)
+        if dialog is not None and hasattr(dialog, "on_command_result"):
+            dialog.on_command_result(dict(header))
 
     def _on_command_status(self, text: str) -> None:
         self.log(text)
@@ -3238,14 +4655,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
                 self.display_fifo.mark_failed()
                 return False
             self.acquisition_label.setText(_format_acquisition_label(acquisition, flight))
-            self.gnss_map.update_fix(
-                latitude=gnss.get("latitude"),
-                longitude=gnss.get("longitude"),
-                fix_quality=gnss.get("fix_quality", 0),
-                satellites=gnss.get("satellites", 0),
-                altitude_m=gnss.get("altitude_m"),
-                utc=gnss.get("utc", ""),
-            )
+            self.gnss_map.update_data(gnss, age_ms=acquisition.get("gnss_age_ms"))
             self.trace_status_label.setText(f"当前 Trace：{decoded.trace_index}")
             self.trace_label.setText(
                 f"Trace {decoded.trace_index} | 定位={gnss.get('fix_quality', 0)} 卫星数={gnss.get('satellites', 0)} "

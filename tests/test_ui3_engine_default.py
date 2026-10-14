@@ -219,9 +219,25 @@ class EngineDefaultContractTests(unittest.TestCase):
         self.assertIn("本任务引擎: continuous", self.window.device_log.toPlainText())
 
     def test_ground_command_params_has_no_engine_field(self) -> None:
-        """① 地面站 command_params 仍只有 count/interval_s/single：引擎由空中端默认保证。
+        """① 地面站 command_params 仍只有 count/interval_s/single：采集命令
+        本身不带引擎字段；引擎经第7轮 ``set_engine`` 专用 action 走设备面板。
 
-        这是"为什么不改地面端"的证据：三个既有键语义零变化，引擎选择不靠协议。
+        守卫口径修订（2026-09-30 captain 裁决 A，修订台账授权 engB 收窄）：
+        第3轮原口径为全文源码 grep 禁 ``"engine"``/``'engine'`` 字面量
+        （"引擎选择不靠协议"）。第7轮用户已审批的计划
+        （``docs/第7轮_计划_空中端黑匣子与计算棒部署.md`` 第五节 D5）明确
+        新增「空中端设备」面板，经既有 ``command`` 消息 + 新 action
+        ``set_engine`` 远程切换引擎，全文 grep 因此不再成立。收窄后的
+        三层守卫（仍有牙）：
+
+        a) 语义冻结原样保留：``command_params()`` 键集合严格
+           ``{count, interval_s, single}``（单次/连续两形态都查）——往采集
+           命令塞引擎字段，本断言必红；
+        b) 定向源码守卫：AST 解析 ``AcquisitionUiSettings`` 类区域
+           （command_params 构造及其直接相关区域），任何 ``"engine"``
+           字符串字面量 / ``engine=`` 关键字即判红——在该区域内引用引擎必红；
+        c) 正向锁定豁免路径：引擎经协议只允许 ``set_engine`` 这一个 action，
+           取值词表锁定 continuous|legacy（engA/t1 逐字对齐）。
         """
         from uav_gpr_ground_station import AcquisitionUiSettings
 
@@ -230,10 +246,60 @@ class EngineDefaultContractTests(unittest.TestCase):
         self.assertEqual(params["count"], 5)
         self.assertEqual(params["interval_s"], 0.25)
         self.assertFalse(params["single"])
-        # 控制器动作字典也不得新增引擎选择字段。
-        source = Path("uav_gpr_ground_station.py").read_text(encoding="utf-8")
-        self.assertNotIn('"engine"', source)
-        self.assertNotIn("'engine'", source)
+        # 单次采集形态同样不得携带引擎字段（第3轮语义覆盖两种形态）。
+        single_params = AcquisitionUiSettings(
+            count=5, interval_s=0.25
+        ).command_params(single=True)
+        self.assertEqual(set(single_params), {"count", "interval_s", "single"})
+
+        # ---- b) 定向源码守卫（替换原 234-236 全文 grep）----
+        import ast
+
+        import uav_gpr_ground_station as ground_module
+
+        source = Path(ground_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        region: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "AcquisitionUiSettings":
+                region = list(ast.walk(node))
+                break
+        self.assertTrue(region, "AcquisitionUiSettings 类必须存在（守卫区域锚点）")
+        offenders: list[str] = []
+        for node in region:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value.strip() == "engine":
+                    offenders.append(f"字符串字面量 'engine' @line {node.lineno}")
+            if isinstance(node, ast.keyword) and node.arg == "engine":
+                offenders.append(f"调用关键字 engine= @line {node.lineno}")
+            if isinstance(node, ast.arg) and node.arg == "engine":
+                offenders.append(f"形参 engine @line {node.lineno}")
+            if isinstance(node, ast.Attribute) and node.attr == "engine":
+                offenders.append(f"属性访问 .engine @line {node.lineno}")
+            if isinstance(node, ast.Name) and node.id == "engine":
+                offenders.append(f"变量名 engine @line {node.lineno}")
+        self.assertEqual(
+            offenders,
+            [],
+            "采集参数区域（AcquisitionUiSettings）不得引入 engine 字段（第3轮语义冻结）",
+        )
+
+        # ---- c) 正向锁定第7轮豁免路径：引擎只经 set_engine 走协议 ----
+        engine_actions = [
+            action
+            for action in ground_module.AIR_DEVICE_ACTIONS
+            if "engine" in action
+        ]
+        self.assertEqual(
+            engine_actions,
+            ["set_engine"],
+            "引擎相关协议 action 只允许 set_engine（第7轮 D5 唯一豁免路径）",
+        )
+        self.assertEqual(
+            ground_module.AIR_ENGINE_VALUES,
+            ("continuous", "legacy"),
+            "引擎取值词表锁定（与空中端 air_config.json 一致）",
+        )
 
 
 @unittest.skipIf(air is None, f"uav_gpr_qt dependencies unavailable: {IMPORT_ERROR}")

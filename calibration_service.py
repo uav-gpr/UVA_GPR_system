@@ -184,8 +184,132 @@ def write_calibration_file(path: Path, measurements: dict[str, CalibrationMeasur
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def read_calibration_measurements(path: Path) -> dict[str, CalibrationMeasurement]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+MAX_CALIBRATION_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def validate_calibration_content(
+    content: str | dict,
+) -> tuple[bool, str, dict[str, object]]:
+    """校验校准内容结构与数值有效性（R8-4 / R8-5 契约）。
+
+    返回 (合法?, 错误信息, 校验后的数据字典)。
+    杜绝坏文件、空文件、轴不一致、非有限值 (NaN/Inf) 破坏现有生效校准。
+    """
+    if isinstance(content, str):
+        if len(content.encode("utf-8")) > MAX_CALIBRATION_FILE_BYTES:
+            return False, f"校准内容超过最大限制 ({MAX_CALIBRATION_FILE_BYTES // (1024 * 1024)} MB)", {}
+        try:
+            data = json.loads(content)
+        except Exception as exc:
+            return False, f"JSON 解析失败: {exc}", {}
+    elif isinstance(content, dict):
+        data = content
+        # 针对 dict 结构执行序列化字节大小门控，严格受限于 10MB 契约
+        try:
+            serialized_len = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+            if serialized_len > MAX_CALIBRATION_FILE_BYTES:
+                return False, f"校准内容超过最大限制 ({MAX_CALIBRATION_FILE_BYTES // (1024 * 1024)} MB)", {}
+        except Exception as exc:
+            return False, f"校准字典序列化失败: {exc}", {}
+        try:
+            total_points = sum(
+                len(m.get("data", {}).get("points", []))
+                for m in data.get("measurements", [])
+                if isinstance(m, dict) and isinstance(m.get("data", {}).get("points"), list)
+            )
+            if "points" in data and isinstance(data["points"], list):
+                total_points += len(data["points"])
+            if total_points > 50000:
+                return False, f"校准数据点规模超限 ({total_points} > 50000 点)", {}
+        except Exception as exc:
+            return False, f"校准字典结构异常: {exc}", {}
+    else:
+        return False, f"不支持的内容类型: {type(content)}", {}
+
+    if not isinstance(data, dict):
+        return False, "校准内容根节点必须为 JSON 对象 (dict)", {}
+
+    measurements_list = data.get("measurements")
+    if not isinstance(measurements_list, list) or not measurements_list:
+        # 兼容旧式 points 直接列表
+        pts = data.get("points")
+        if isinstance(pts, list) and pts:
+            if len(pts) < 2:
+                return False, f"校准采样频点过少 ({len(pts)} 点)，至少需要 2 点以构成有效频带", {}
+            for idx, p in enumerate(pts):
+                if not isinstance(p, dict):
+                    return False, f"第 {idx} 个校准点非对象", {}
+                try:
+                    f = float(p["frequency"])
+                    d = complex(p["directivity"])
+                    t = complex(p["reflection_tracking"])
+                    s = complex(p["source_match"])
+                except Exception as exc:
+                    return False, f"第 {idx} 点数据非法: {exc}", {}
+                if not (math.isfinite(f) and f > 0):
+                    return False, f"第 {idx} 点频率非法或非正", {}
+                if not (
+                    math.isfinite(d.real)
+                    and math.isfinite(d.imag)
+                    and math.isfinite(t.real)
+                    and math.isfinite(t.imag)
+                    and math.isfinite(s.real)
+                    and math.isfinite(s.imag)
+                ):
+                    return False, f"第 {idx} 点包含非有限数值 (NaN/Inf)", {}
+            return True, "", data
+        return False, "缺少有效的 measurements 列表或 points 列表", {}
+
+    present_types: set[str] = set()
+    freq_axis: list[float] | None = None
+    for item in measurements_list:
+        if not isinstance(item, dict):
+            return False, "measurements 包含非对象元素", {}
+        mtype = item.get("type")
+        if not isinstance(mtype, str) or not mtype:
+            continue
+        present_types.add(mtype)
+        pts = item.get("data", {}).get("points", [])
+        if not isinstance(pts, list) or not pts:
+            return False, f"步骤 {mtype} 缺少采样点数据", {}
+        if len(pts) < 2:
+            return False, f"步骤 {mtype} 采样频点过少 ({len(pts)} 点)，至少需要 2 点以构成有效频带", {}
+        step_freqs: list[float] = []
+        for idx, pt in enumerate(pts):
+            if not isinstance(pt, dict):
+                return False, f"步骤 {mtype} 第 {idx} 点非对象", {}
+            try:
+                f = float(pt["frequency"])
+                r = float(pt["real"])
+                i = float(pt["imag"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return False, f"步骤 {mtype} 第 {idx} 点数值非法: {exc}", {}
+            if not (math.isfinite(f) and f > 0):
+                return False, f"步骤 {mtype} 第 {idx} 点频率非法或非正: {f}", {}
+            if not (math.isfinite(r) and math.isfinite(i)):
+                return False, f"步骤 {mtype} 第 {idx} 点包含非有限值 (NaN/Inf)", {}
+            step_freqs.append(f)
+        if any(step_freqs[k] >= step_freqs[k + 1] for k in range(len(step_freqs) - 1)):
+            return False, f"步骤 {mtype} 频率轴未严格单调递增", {}
+        if freq_axis is None:
+            freq_axis = step_freqs
+        elif step_freqs != freq_axis:
+            return False, f"步骤 {mtype} 频率轴与其他步骤不一致", {}
+
+    has_p1 = {"P1_Open", "P1_Short", "P1_Load"}.issubset(present_types) or {"Open", "Short", "Load"}.issubset(present_types)
+    if not has_p1:
+        return False, "缺少完整的一端口 P1 (Open, Short, Load) 标准件", {}
+
+    return True, "", data
+
+
+def read_calibration_measurements(path_or_dict: Path | str | dict) -> dict[str, CalibrationMeasurement]:
+    if isinstance(path_or_dict, (str, Path)):
+        data = json.loads(Path(path_or_dict).read_text(encoding="utf-8"))
+    elif isinstance(path_or_dict, dict):
+        data = path_or_dict
+    else:
+        raise ValueError(f"不支持的输入类型: {type(path_or_dict)}")
     measurements: dict[str, CalibrationMeasurement] = {}
     for measurement in data.get("measurements", []):
         name = measurement.get("type")
@@ -632,10 +756,17 @@ def build_background_plan(cal_id: str, repeats: int, config_snapshot: dict[str, 
     )
 
 
-def write_capture_npz(directory: Path, step_name: str, index: int, frequency_hz: np.ndarray, raw: np.ndarray) -> Path:
+def write_capture_npz(
+    directory: Path,
+    step_name: str,
+    index: int,
+    frequency_hz: np.ndarray,
+    raw: np.ndarray,
+    attempt: int = 1,
+) -> Path:
     """单条 capture 原始复数落盘（原子写，R-X-06/R-C-15）。
 
-    文件名 ``capture_<step>_<i>.npz``（**禁止** ``trace_`` 前缀——bench
+    文件名 ``capture_<step>_<i>.npz``（重采批次为 ``capture_<step>_r<attempt>_<i>.npz``，**禁止** ``trace_`` 前缀——bench
     ``rglob("trace_*.npz")`` 口径保护，§5.3）。key 沿用既有约定：
     ``frequency_hz`` + ``<channel>_real``/``<channel>_imag``。
     """
@@ -650,8 +781,12 @@ def write_capture_npz(directory: Path, step_name: str, index: int, frequency_hz:
         raise ValueError(f"非法步骤名: {step_name!r}")
     if index < 1:
         raise ValueError(f"capture 序号必须从 1 起，收到 {index}")
-    target = directory / f"capture_{step_name}_{index}.npz"
-    tmp = directory / f".capture_{step_name}_{index}.npz.tmp"
+    if attempt > 1:
+        target = directory / f"capture_{step_name}_r{attempt}_{index}.npz"
+        tmp = directory / f".capture_{step_name}_r{attempt}_{index}.npz.tmp"
+    else:
+        target = directory / f"capture_{step_name}_{index}.npz"
+        tmp = directory / f".capture_{step_name}_{index}.npz.tmp"
     # 用文件句柄写（np.savez 对路径入参会追加 .npz 后缀，破坏原子命名）。
     with open(tmp, "wb") as handle:
         np.savez(
@@ -681,6 +816,8 @@ class StepProgress:
     captures: list[np.ndarray] = field(default_factory=list)
     mean: np.ndarray | None = None
     capture_files: list[str] = field(default_factory=list)
+    attempt: int = 1
+    history_captures: list[list[np.ndarray]] = field(default_factory=list)
 
 
 class CalibrationSession:
@@ -864,30 +1001,74 @@ class CalibrationSession:
 
     # ---- 编排命令 ----
 
-    def capture(self, step_name: str, *, on_capture: Callable[[np.ndarray, np.ndarray, int, int], None] | None = None) -> dict[str, object]:
+    def capture(
+        self,
+        step_name: str,
+        *,
+        recapture: bool = False,
+        on_capture: Callable[[np.ndarray, np.ndarray, int, int], None] | None = None,
+    ) -> dict[str, object]:
         """执行一个步骤：采 repeats 条完整 sweep → 复数平均 → step_done。
 
-        ``on_capture(frequency_hz, raw, index, of)`` 每完成一条回调一次
-        （空中端驱动用它发 calibration_capture 回程 + 落盘进度；异常沿调用
-        方传播并判失败）。
+        支持普通按序采集与受控显式重采（recapture=True）。
+        重采允许替换已完成步骤，保留其他有效步骤，失效旧解算并保留历史采样证据。
         """
         with self._lock:
             self._guard_open(f"capture({step_name})")
             if step_name not in self._progress:
                 raise KeyError(f"计划中不存在步骤 {step_name!r}")
-            pending = self.next_pending_step()
-            if pending is None or pending.name != step_name:
-                raise RuntimeError(
-                    f"步骤顺序错误：下一待采步骤为 {pending.name if pending else '无'}，收到 {step_name!r}"
-                )
-            if self._state == self.STATE_PLANNED:
-                self._state = self.STATE_IN_PROGRESS
+
+            # 并发保护：杜绝任何步骤正在采集时拉入新任务
+            capturing_steps = [p.name for p in self._progress.values() if p.state == "capturing"]
+            if capturing_steps:
+                raise RuntimeError(f"步骤 {capturing_steps[0]} 正在采集中，拒绝并发采集请求")
+
             progress = self._progress[step_name]
-            progress.state = "capturing"
-            progress.captured = 0
-            progress.error = None
-            progress.captures = []
-            progress.capture_files = []
+            if recapture:
+                if progress.state == "done":
+                    # 允许重采已完成步骤：旧解算结果失效，状态回退到 in_progress
+                    if self._state == self.STATE_SOLVED:
+                        self._solved_result = None
+                        self._state = self.STATE_IN_PROGRESS
+                    # 归档旧采样证据，轮次递增，清空目标均值与采样数据
+                    if progress.captures:
+                        progress.history_captures.append(list(progress.captures))
+                    progress.attempt += 1
+                    progress.captures = []
+                    progress.mean = None
+                    progress.captured = 0
+                    progress.error = None
+                    progress.state = "capturing"
+                elif progress.state in ("pending", "capturing"):
+                    pending = self.next_pending_step()
+                    if pending is None or pending.name != step_name:
+                        raise RuntimeError(
+                            f"步骤 {step_name!r} 尚未进行首次采集，不可重采（下一待采步骤为 {pending.name if pending else '无'}）"
+                        )
+                    if self._state == self.STATE_PLANNED:
+                        self._state = self.STATE_IN_PROGRESS
+                    progress.state = "capturing"
+                    progress.captured = 0
+                    progress.error = None
+                    progress.captures = []
+                else:
+                    raise RuntimeError(f"步骤 {step_name!r} 处于终态 {progress.state!r}，无法重采")
+            else:
+                if progress.state == "done":
+                    raise RuntimeError(f"步骤 {step_name!r} 已完成，重采需指定 recapture=True")
+                if self._state == self.STATE_SOLVED:
+                    raise RuntimeError("所有步骤已解算，如需重新采集请指定 recapture=True")
+                pending = self.next_pending_step()
+                if pending is None or pending.name != step_name:
+                    raise RuntimeError(
+                        f"步骤顺序错误：下一待采步骤为 {pending.name if pending else '无'}，收到 {step_name!r}"
+                    )
+                if self._state == self.STATE_PLANNED:
+                    self._state = self.STATE_IN_PROGRESS
+                progress.state = "capturing"
+                progress.captured = 0
+                progress.error = None
+                progress.captures = []
         try:
             frequency_axis: np.ndarray | None = None
             for index in range(1, progress.repeats + 1):
@@ -907,7 +1088,9 @@ class CalibrationSession:
                         f"capture #{index} 频率网格与首条不一致（复数平均前提被破坏）"
                     )
                 if self.capture_dir is not None:
-                    path = write_capture_npz(self.capture_dir, step_name, index, frequency, raw)
+                    path = write_capture_npz(
+                        self.capture_dir, step_name, index, frequency, raw, attempt=progress.attempt
+                    )
                     with self._lock:
                         progress.capture_files.append(path.name)
                 if on_capture is not None:
@@ -1059,6 +1242,13 @@ class CalibrationSession:
             self._state = self.STATE_ACTIVATED
             return dict(activation)
 
+    def rollback_activation(self) -> None:
+        """激活事务未成功落盘时的回滚方法，恢复回 STATE_SOLVED 允许重试。"""
+        with self._lock:
+            if self._state == self.STATE_ACTIVATED:
+                self._state = self.STATE_SOLVED
+                self._activation = None
+
     def cancel(self, reason: str) -> str:
         """取消（终态）：已收 capture 文件保留并写 incomplete 标记（R-C-18）。"""
         with self._lock:
@@ -1087,6 +1277,7 @@ __all__ = [
     "CalibrationSession",
     "CalibrationStep",
     "LEGACY_OSL_MAP",
+    "MAX_CALIBRATION_FILE_BYTES",
     "OSL_STEP_CHANNEL",
     "OSL_STEP_NAMES",
     "OSLTerms",
@@ -1109,6 +1300,7 @@ __all__ = [
     "s11_osl_measurements",
     "solve_one_port_osl",
     "terms_to_osl_calibration",
+    "validate_calibration_content",
     "validate_repeats",
     "write_calibration_file",
     "write_capture_npz",

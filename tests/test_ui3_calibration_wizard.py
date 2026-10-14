@@ -148,10 +148,14 @@ class CalibrationWizardUiTests(unittest.TestCase):
         self.wizard.begin_calibration()
         cal_id = self.wizard._cal_id
 
-        # 点击采集当前步骤
+        # 点击采集当前步骤（第8轮协议升级：cal_capture 增加显式 recapture 标志与 request_id 令牌）
         self.wizard.capture_next_step()
         self.assertEqual(self.receiver.calls[-1][0], "cal_capture")
-        self.assertEqual(self.receiver.calls[-1][1], {"cal_id": cal_id, "step": "P1_Open"})
+        call_params = self.receiver.calls[-1][1]
+        self.assertEqual(call_params.get("cal_id"), cal_id)
+        self.assertEqual(call_params.get("step"), "P1_Open")
+        self.assertFalse(call_params.get("recapture"))
+        self.assertTrue(bool(call_params.get("request_id")))
         self.assertFalse(self.wizard.capture_button.isEnabled())
 
         # 取消会话
@@ -210,6 +214,15 @@ class CalibrationWizardUiTests(unittest.TestCase):
                 "sample_count": 4,
                 "note": "优",
             })
+            # 第8轮协议升级：单步硬件收尾完成回传 step_done
+            self.window._on_calibration_message({
+                "type": "calibration_result",
+                "cal_id": cal_id,
+                "status": "step_done",
+                "step": step_name,
+                "steps_done": idx + 1,
+                "total_steps": 6,
+            })
             self.assertEqual(self.wizard.steps_table.item(idx, 1).text(), "已完成")
             self.assertIn("重复RMS=5.000e-03", self.wizard.steps_table.item(idx, 3).text())
 
@@ -260,6 +273,14 @@ class CalibrationWizardUiTests(unittest.TestCase):
             "index": 2,
             "of": 2,
         })
+        self.window._on_calibration_message({
+            "type": "calibration_result",
+            "cal_id": cal_id,
+            "status": "step_done",
+            "step": "P1_Open",
+            "steps_done": 1,
+            "total_steps": 6,
+        })
         self.assertEqual(self.wizard.steps_table.item(0, 1).text(), "已完成")
         self.assertEqual(self.wizard._step_index, 1)
 
@@ -268,9 +289,13 @@ class CalibrationWizardUiTests(unittest.TestCase):
         self.assertTrue(self.wizard.recapture_button.isEnabled())
         self.wizard.recapture_selected_step()
 
-        # 验证发送 cal_capture(P1_Open)
+        # 验证发送 cal_capture(P1_Open)（第8轮协议升级：显式重采设置 recapture=True 与 request_id）
         self.assertEqual(self.receiver.calls[-1][0], "cal_capture")
-        self.assertEqual(self.receiver.calls[-1][1], {"cal_id": cal_id, "step": "P1_Open"})
+        recap_params = self.receiver.calls[-1][1]
+        self.assertEqual(recap_params.get("cal_id"), cal_id)
+        self.assertEqual(recap_params.get("step"), "P1_Open")
+        self.assertTrue(recap_params.get("recapture"))
+        self.assertTrue(bool(recap_params.get("request_id")))
         self.assertEqual(self.wizard._step_index, 0)
         self.assertIn("请求重采中", self.wizard.steps_table.item(0, 1).text())
 
@@ -281,6 +306,14 @@ class CalibrationWizardUiTests(unittest.TestCase):
             "step": "P1_Open",
             "index": 2,
             "of": 2,
+        })
+        self.window._on_calibration_message({
+            "type": "calibration_result",
+            "cal_id": cal_id,
+            "status": "step_done",
+            "step": "P1_Open",
+            "steps_done": 1,
+            "total_steps": 6,
         })
         self.assertEqual(self.wizard.steps_table.item(0, 1).text(), "已完成")
 
@@ -307,7 +340,11 @@ class CalibrationWizardUiTests(unittest.TestCase):
 
         # 采集单步
         self.wizard.capture_next_step()
-        self.assertEqual(self.receiver.calls[-1][1], {"cal_id": cal_id, "step": "Background"})
+        bg_params = self.receiver.calls[-1][1]
+        self.assertEqual(bg_params.get("cal_id"), cal_id)
+        self.assertEqual(bg_params.get("step"), "Background")
+        self.assertFalse(bg_params.get("recapture"))
+        self.assertTrue(bool(bg_params.get("request_id")))
 
         self.window._on_calibration_message({
             "type": "calibration_capture",
@@ -315,6 +352,14 @@ class CalibrationWizardUiTests(unittest.TestCase):
             "step": "Background",
             "index": 10,
             "of": 10,
+        })
+        self.window._on_calibration_message({
+            "type": "calibration_result",
+            "cal_id": cal_id,
+            "status": "step_done",
+            "step": "Background",
+            "steps_done": 1,
+            "total_steps": 1,
         })
         self.assertEqual(self.wizard.steps_table.item(0, 1).text(), "已完成")
         self.assertTrue(self.wizard.finish_button.isEnabled())

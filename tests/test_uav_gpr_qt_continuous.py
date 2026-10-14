@@ -733,6 +733,142 @@ class GnssReaderThreadTests(unittest.TestCase):
 
 
 @unittest.skipIf(air is None, f"uav_gpr_qt dependencies unavailable: {IMPORT_ERROR}")
+class GnssReaderWriteTimeoutTests(unittest.TestCase):
+    """GNSS open 的写保险丝（2026-09-30 现场挂死回归）。
+
+    现场：GNSS 串口 open() 内的 write() 无界阻塞 → GnssReaderThread 卡死在
+    第一次 open → stop 后无限 join → worker 永不结束 → 新任务被
+    "采集已经在运行"拒绝。修复=write_timeout=1.0 + 写失败关串口重抛。
+    """
+
+    class _WriteBlockedSer:
+        """模拟驱动 TX 永不排空：write 必抛写超时（过去会永久阻塞）。"""
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.is_open = True
+            self.closed = False
+            self.write_timeout = kwargs.get("write_timeout")
+
+        def write(self, _data: bytes) -> int:
+            raise air.serial.SerialTimeoutException("simulated: write blocked forever")
+
+        def close(self) -> None:
+            self.closed = True
+            self.is_open = False
+
+    class _RecordingSer:
+        def __init__(self, *args, **kwargs) -> None:
+            self.is_open = True
+            self.write_timeout = kwargs.get("write_timeout")
+            self.written: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.written.append(data)
+            return len(data)
+
+        def close(self) -> None:
+            self.is_open = False
+
+    def test_open_write_blocked_closes_port_and_raises(self) -> None:
+        reader = air.GnssReader("COM9", 115200)
+        created: list[GnssReaderWriteTimeoutTests._WriteBlockedSer] = []
+
+        def _factory(*args, **kwargs):
+            ser = GnssReaderWriteTimeoutTests._WriteBlockedSer(*args, **kwargs)
+            created.append(ser)
+            return ser
+
+        with unittest.mock.patch.object(air.serial, "Serial", _factory):
+            with self.assertRaises(air.serial.SerialTimeoutException):
+                reader.open()
+        self.assertIsNone(reader.ser, "写保险丝触发后必须释放串口句柄")
+        self.assertTrue(created and created[0].closed, "打开失败路径必须先 close 串口")
+
+    def test_open_sets_write_timeout_and_sends_config(self) -> None:
+        reader = air.GnssReader("COM9", 115200)
+        created: list[GnssReaderWriteTimeoutTests._RecordingSer] = []
+
+        def _factory(*args, **kwargs):
+            ser = GnssReaderWriteTimeoutTests._RecordingSer(*args, **kwargs)
+            created.append(ser)
+            return ser
+
+        with unittest.mock.patch.object(air.serial, "Serial", _factory):
+            reader.open()
+        self.assertIsNotNone(reader.ser)
+        self.assertEqual(created[0].write_timeout, 1.0, "open 必须携带 write_timeout=1.0 保险丝")
+        self.assertEqual(created[0].written, [b"log gpgga ontime 1\r\n", b"log gprmc ontime 1\r\n"])
+
+
+@unittest.skipIf(air is None, f"uav_gpr_qt dependencies unavailable: {IMPORT_ERROR}")
+class GnssPortSelectionTests(unittest.TestCase):
+    """GNSS 串口选择契约（2026-09-30 现场回归：无 GNSS 硬件）。
+
+    此前 refresh_ports 自动选中扫描到的串口（优先 COM3），无 GNSS 硬件时
+    选中的是别的设备，任务一启动就拉起 GNSS 线程并被其卡死。新契约：
+    首项"不使用 GNSS"（data=""）且**绝不自动选中**任何串口；selected_port()
+    返回空串 ⇒ worker 不启动 GNSS 线程（既有守卫）。
+    """
+
+    class _FakePort:
+        device = "COM99"
+        description = "Fake GNSS"
+
+    def _window(self):
+        from PySide6 import QtWidgets
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        del app  # 仅保证 QApplication 存在
+        return air.MainWindow()
+
+    def test_default_selection_is_none_and_never_autoselects(self) -> None:
+        window = self._window()
+        try:
+            with unittest.mock.patch.object(
+                air.list_ports, "comports", lambda: [GnssPortSelectionTests._FakePort()]
+            ):
+                window.refresh_ports()
+            self.assertEqual(
+                window.selected_port(),
+                "",
+                "默认必须=不使用 GNSS：绝不自动选中扫描到的串口（无硬件时防误触发）",
+            )
+            self.assertEqual(window.port_combo.itemText(0), "不使用 GNSS（不启动 GNSS 线程）")
+        finally:
+            window.close()
+
+    def test_refresh_keeps_previous_selection(self) -> None:
+        window = self._window()
+        try:
+            window.refresh_ports()
+            # 操作员显式选择伪串口 → 再刷新 → 选择保持（不回弹到首项）。
+            with unittest.mock.patch.object(
+                air.list_ports, "comports", lambda: [GnssPortSelectionTests._FakePort()]
+            ):
+                window.refresh_ports()
+            window.port_combo.setCurrentIndex(window.port_combo.findData("COM99"))
+            with unittest.mock.patch.object(
+                air.list_ports, "comports", lambda: [GnssPortSelectionTests._FakePort()]
+            ):
+                window.refresh_ports()
+            self.assertEqual(window.selected_port(), "COM99", "刷新后应保持操作员已选的串口")
+            # 切回"不使用 GNSS" ⇒ 空串 ⇒ 任务启动不拉 GNSS 线程。
+            window.port_combo.setCurrentIndex(0)
+            self.assertEqual(window.selected_port(), "")
+        finally:
+            window.close()
+
+    def test_worker_without_gnss_port_starts_no_gnss_thread(self) -> None:
+        """selected_port()==""（不使用 GNSS）⇒ worker.gnss_thread 为 None。"""
+        backend, _transport = _make_backend(5)
+        worker = _make_worker(backend, count=1, gnss_port="")
+        worker.start()
+        self.assertIsNone(worker.gnss_thread, "gnss_port 为空时绝不能创建 GNSS 线程")
+        self.assertTrue(worker.wait(5000))
+        self.assertFalse(worker.isRunning())
+
+
+@unittest.skipIf(air is None, f"uav_gpr_qt dependencies unavailable: {IMPORT_ERROR}")
 class FeatureFlagTests(unittest.TestCase):
     """采集引擎 feature flag 契约（第4轮：**默认改为高速连续**）。
 
@@ -1263,6 +1399,53 @@ class StubbornThreadTests(unittest.TestCase):
             self.assertFalse(gnss.isRunning())
             self.assertFalse(worker.isRunning())
             self.assertTrue(finished.is_set())
+
+    def test_stubborn_gnss_thread_abandoned_after_bounded_wait(self) -> None:
+        """收尾总闸（2026-09-30 现场回归）：GNSS 线程永不退出时，worker 在
+        有界等待后遗弃它并正常收尾——任务可结束、下一任务可启动；绝不
+        terminate，遗弃线程寄存保活防 QThread 提前析构。"""
+        backend, _transport = _make_backend(5)
+        finished = threading.Event()
+        statuses: list[str] = []
+        worker = _make_worker(backend, count=0, interval_s=0.0, gnss_port="COM9")
+        worker.finished_run.connect(finished.set, DIRECT)
+        worker.status.connect(statuses.append, DIRECT)
+        gnss = None
+        try:
+            with (
+                unittest.mock.patch.object(
+                    air.ContinuousAcquisitionWorker, "GNSS_SHUTDOWN_FIRST_WAIT_S", 0.2
+                ),
+                unittest.mock.patch.object(
+                    air.ContinuousAcquisitionWorker, "GNSS_SHUTDOWN_EXTRA_WAIT_S", 0.3
+                ),
+                unittest.mock.patch.object(air, "GnssReaderThread", _StubbornGnssThread),
+            ):
+                worker.start()
+                self.assertTrue(_wait_until(lambda: backend.is_open, 3.0))
+                worker.stop()
+                self.assertTrue(
+                    worker.wait(8000),
+                    "GNSS 顽固不退时 worker 应在总闸触发后正常结束（不得无限 join）",
+                )
+                self.assertFalse(worker.isRunning())
+                self.assertTrue(
+                    finished.is_set(),
+                    "遗弃 GNSS 后必须发 finished_run（否则下一任务被'采集已经在运行'拒绝）",
+                )
+                gnss = worker.gnss_thread
+                self.assertIsNotNone(gnss)
+                self.assertTrue(gnss.isRunning(), "遗弃≠terminate：线程仍在运行，等待自然退出")
+                self.assertIn(gnss, air._ABANDONED_GNSS_THREADS, "遗弃线程必须寄存保活")  # noqa: SLF001
+                self.assertTrue(
+                    any("放弃等待并继续收尾" in s for s in statuses),
+                    "总闸触发必须有明确日志（现场可诊断）",
+                )
+        finally:
+            if gnss is not None:
+                gnss._release.set()  # noqa: SLF001
+                gnss.wait(3000)
+        self.assertFalse(gnss.isRunning())
 
     def test_backend_close_failure_reported(self) -> None:
         backend = PersistentLibreVnaBackend(transport=_CloseFailsTransport(5))

@@ -47,6 +47,9 @@ dsh-routing-suite-tmp/
 
 # AgentTeams runtime state
 .agent-teams/
+.dsh-mineru/
+**/.obsidian/
+
 
 # Deployment build output (regenerate before field use)
 dist/

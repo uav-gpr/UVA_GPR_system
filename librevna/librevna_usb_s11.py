@@ -72,43 +72,184 @@ class OSLCalibration:
             raise ValueError("Calibration contains no points.")
 
     @classmethod
-    def from_file(cls, filename: str | Path) -> "OSLCalibration":
+    def from_file(cls, filename: str | Path, port: int = 1) -> "OSLCalibration":
         path = Path(filename)
         data = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(data, path, port=port)
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict | list,
+        filename: Path | None = None,
+        port: int = 1,
+    ) -> "OSLCalibration":
+        path = filename or Path("calibration.json")
+        if isinstance(data, list):
+            points = []
+            for p in data:
+                f = float(p["frequency"])
+                if not math.isfinite(f) or f <= 0:
+                    raise ValueError(f"校准频率非有限或非正: {f}")
+                d = complex(p["directivity"])
+                t = complex(p["reflection_tracking"])
+                s = complex(p["source_match"])
+                if not (
+                    math.isfinite(d.real)
+                    and math.isfinite(d.imag)
+                    and math.isfinite(t.real)
+                    and math.isfinite(t.imag)
+                    and math.isfinite(s.real)
+                    and math.isfinite(s.imag)
+                ):
+                    raise ValueError("校准包含非有限误差项 (NaN/Inf)")
+                points.append(OSLPoint(f, d, t, s))
+            return cls(points, path)
+
+        if not isinstance(data, dict):
+            raise ValueError(f"校准格式不支持: {type(data)}")
+
+        if "points" in data and "measurements" not in data:
+            return cls.from_dict(data["points"], path, port=port)
+
         measurements = data.get("measurements", [])
-        measured: dict[str, dict[float, complex]] = {}
+        if not measurements:
+            raise ValueError("校准文件缺少 measurements 列表")
+
+        measured_raw: dict[str, dict[float, complex]] = {}
         for measurement in measurements:
             mtype = measurement.get("type")
             points = measurement.get("data", {}).get("points", [])
-            measured[mtype] = {
-                float(p["frequency"]): complex(float(p["real"]), float(p["imag"]))
-                for p in points
+            m_dict: dict[float, complex] = {}
+            for p in points:
+                f = float(p["frequency"])
+                if not math.isfinite(f) or f <= 0:
+                    raise ValueError(f"校准频率非有限或非正: {f}")
+                if port == 2 and "channels" in p and "S22" in p["channels"]:
+                    c_pt = p["channels"]["S22"]
+                    val = complex(float(c_pt["real"]), float(c_pt["imag"]))
+                else:
+                    val = complex(float(p["real"]), float(p["imag"]))
+                if not (math.isfinite(val.real) and math.isfinite(val.imag)):
+                    raise ValueError("校准包含非有限测量数值 (NaN/Inf)")
+                m_dict[f] = val
+            measured_raw[mtype] = m_dict
+
+        if port == 1:
+            req_map = {
+                "Open": ["P1_Open", "Open"],
+                "Short": ["P1_Short", "Short"],
+                "Load": ["P1_Load", "Load"],
             }
+        elif port == 2:
+            req_map = {
+                "Open": ["P2_Open"],
+                "Short": ["P2_Short"],
+                "Load": ["P2_Load"],
+            }
+        else:
+            raise ValueError(f"只支持端口 1 或 2，收到 {port}")
 
-        missing = [name for name in ("Open", "Short", "Load") if name not in measured]
+        measured: dict[str, dict[float, complex]] = {}
+        missing: list[str] = []
+        for std_name, candidates in req_map.items():
+            found = False
+            for cand in candidates:
+                if cand in measured_raw and measured_raw[cand]:
+                    measured[std_name] = measured_raw[cand]
+                    found = True
+                    break
+            if not found:
+                missing.append(std_name)
+
         if missing:
-            raise ValueError(f"Calibration file is missing measurements: {', '.join(missing)}")
+            raise ValueError(f"P{port} 校准缺少标准件: {', '.join(missing)}")
 
-        common_freqs = sorted(set(measured["Open"]) & set(measured["Short"]) & set(measured["Load"]))
+        open_freqs = set(measured["Open"])
+        short_freqs = set(measured["Short"])
+        load_freqs = set(measured["Load"])
+        if not (open_freqs == short_freqs == load_freqs) or not open_freqs:
+            raise ValueError("标准件频率轴不一致或为空")
+
+        common_freqs = sorted(open_freqs)
         cal_points: list[OSLPoint] = []
-        # The provided calkit uses ideal standards. If non-ideal standards are
-        # needed later, this is the one place to evaluate their actual gamma(f).
         open_actual = complex(1.0, 0.0)
         short_actual = complex(-1.0, 0.0)
         load_actual = complex(0.0, 0.0)
         for freq in common_freqs:
-            cal_points.append(
-                compute_osl_point(
-                    freq,
-                    open_measured=measured["Open"][freq],
-                    short_measured=measured["Short"][freq],
-                    load_measured=measured["Load"][freq],
-                    open_actual=open_actual,
-                    short_actual=short_actual,
-                    load_actual=load_actual,
-                )
+            pt = compute_osl_point(
+                freq,
+                open_measured=measured["Open"][freq],
+                short_measured=measured["Short"][freq],
+                load_measured=measured["Load"][freq],
+                open_actual=open_actual,
+                short_actual=short_actual,
+                load_actual=load_actual,
             )
+            if not (
+                math.isfinite(pt.directivity.real)
+                and math.isfinite(pt.directivity.imag)
+                and math.isfinite(pt.reflection_tracking.real)
+                and math.isfinite(pt.reflection_tracking.imag)
+                and math.isfinite(pt.source_match.real)
+                and math.isfinite(pt.source_match.imag)
+            ):
+                raise ValueError(f"校准解算包含非有限误差项 (NaN/Inf) at {freq:g} Hz")
+            cal_points.append(pt)
         return cls(cal_points, path)
+
+    @classmethod
+    def load_components(
+        cls,
+        filename_or_dict: str | Path | dict,
+    ) -> tuple["OSLCalibration", "OSLCalibration | None", object | None]:
+        if isinstance(filename_or_dict, (str, Path)):
+            path = Path(filename_or_dict)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        elif isinstance(filename_or_dict, dict):
+            data = filename_or_dict
+            path = Path("calibration.json")
+        else:
+            raise ValueError(f"不支持的输入类型: {type(filename_or_dict)}")
+
+        p1_cal = cls.from_dict(data, path, port=1)
+        p2_cal: OSLCalibration | None = None
+        has_any_p2 = False
+        if isinstance(data, dict):
+            for m in data.get("measurements", []):
+                if m.get("type") in ("P2_Open", "P2_Short", "P2_Load"):
+                    has_any_p2 = True
+                    break
+        if has_any_p2:
+            # 数据中包含 P2 标准件，必须完整合法，绝不允许静默降级为单端口
+            p2_cal = cls.from_dict(data, path, port=2)
+        else:
+            p2_cal = None
+
+        through_meas = None
+        if isinstance(data, dict):
+            for m in data.get("measurements", []):
+                if m.get("type") == "Through":
+                    try:
+                        from calibration_service import CalibrationMeasurement
+
+                        raw_points = m.get("data", {}).get("points", [])
+                        channels: dict[str, dict[str, list[float]]] = {}
+                        for pt in raw_points:
+                            for ch, ch_val in pt.get("channels", {}).items():
+                                channels.setdefault(ch, {"real": [], "imag": []})
+                                channels[ch]["real"].append(float(ch_val["real"]))
+                                channels[ch]["imag"].append(float(ch_val["imag"]))
+                        through_meas = CalibrationMeasurement(
+                            frequency_hz=[float(pt["frequency"]) for pt in raw_points],
+                            real=[float(pt["real"]) for pt in raw_points],
+                            imag=[float(pt["imag"]) for pt in raw_points],
+                            channels=channels or None,
+                        )
+                    except Exception:
+                        through_meas = None
+                    break
+        return p1_cal, p2_cal, through_meas
 
     def interpolate(self, frequency: float) -> OSLPoint:
         if frequency <= self.points[0].frequency:

@@ -1,0 +1,15 @@
+{
+  "ground_host": "192.168.144.20",
+  "ground_port": 8765,
+  "gnss_port": "",
+  "gnss_baud": 9600,
+  "engine": "continuous",
+  "device_source": "usb",
+  "output_dir": "gpr_runs",
+  "autostart_acquisition": false,
+  "disk_min_free_gb": 20.0,
+  "disk_target_free_gb": 40.0,
+  "log_max_bytes": 20971520,
+  "log_backup_count": 10,
+  "calibration_path": "gpr_runs\\_calibration\\imports\\test.json"
+}

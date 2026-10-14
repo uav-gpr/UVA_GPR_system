@@ -97,6 +97,7 @@ from calibration_service import (  # noqa: E402
     s11_osl_measurements,
     solve_one_port_osl,
     terms_to_osl_calibration,
+    validate_calibration_content,
     validate_repeats,
     write_calibration_file,
 )
@@ -210,6 +211,9 @@ class GgaFix:
     fix_quality: int = 0
     satellites: int = 0
     altitude_m: float | None = None
+    serial_open: bool | None = None
+    nmea_received: bool = False
+    state: str = ""
 
 
 def utc_timestamp() -> str:
@@ -407,6 +411,9 @@ class GnssFixCache:
             age_s = as_of - newest.received_monotonic
             valid = age_s >= 0.0 and age_s <= self.max_age_s
             return GnssFixLookup(newest.fix, age_s * 1000.0, valid)
+
+    def telemetry_fix(self, lookup: GnssFixLookup) -> GgaFix:
+        return lookup.fix if lookup.valid and lookup.fix is not None else GgaFix()
 
     def statistics(self) -> dict[str, object]:
         with self._lock:
@@ -829,12 +836,27 @@ def nmea_coord(value: str, hemi: str) -> float | None:
     deg_len = dot - 2 if dot >= 0 else len(value) - 2
     deg = float(value[:deg_len])
     minutes = float(value[deg_len:])
+    if not math.isfinite(deg) or not 0 <= minutes < 60 or hemi not in {"N", "S", "E", "W"}:
+        raise ValueError("Invalid NMEA coordinate")
     signed = deg + minutes / 60.0
+    if not 0 <= signed <= (90 if hemi in {"N", "S"} else 180):
+        raise ValueError("NMEA coordinate out of range")
     return -signed if hemi in {"S", "W"} else signed
 
 
+def _nmea_parts(line: str) -> list[str]:
+    body, sep, checksum = line.strip().partition("*")
+    if sep:
+        actual = 0
+        for char in body[1:]:
+            actual ^= ord(char)
+        if len(checksum) != 2 or actual != int(checksum, 16):
+            raise ValueError("NMEA checksum mismatch")
+    return body.split(",")
+
+
 def parse_gga(line: str) -> GgaFix:
-    parts = line.strip().split(",")
+    parts = _nmea_parts(line)
     if len(parts) < 10 or not parts[0].endswith("GGA"):
         return GgaFix(raw=line)
     return GgaFix(
@@ -845,11 +867,13 @@ def parse_gga(line: str) -> GgaFix:
         fix_quality=int(parts[6] or 0),
         satellites=int(parts[7] or 0),
         altitude_m=float(parts[9]) if parts[9] else None,
+        serial_open=True,
+        nmea_received=True,
     )
 
 
 def parse_rmc(line: str) -> GgaFix:
-    parts = line.strip().split(",")
+    parts = _nmea_parts(line)
     if len(parts) < 10 or not parts[0].endswith("RMC"):
         return GgaFix(raw=line)
     valid = parts[2] == "A"
@@ -861,6 +885,8 @@ def parse_rmc(line: str) -> GgaFix:
         fix_quality=1 if valid else 0,
         satellites=0,
         altitude_m=None,
+        serial_open=True,
+        nmea_received=True,
     )
 
 
@@ -870,42 +896,521 @@ def parse_rmc(line: str) -> GgaFix:
 
 
 class GnssReader:
+    """M100（司南）串口读取。
+
+    现场验证来源：老师代码 ``VNA_GPS.py``（8-N-1 / 无流控，每轮发送
+    ``log gpgga`` 读取 ``$GPGGA``）。本类迁移其**串口初始化方法**与
+    **激活方式**（输出未使能或中途丢失时，下一次轮询即恢复 ``log gpgga``
+    输出），同时保留当前版本已有的 ``log gpgga ontime 1`` /
+    ``log gprmc ontime 1`` 连续输出配置、GGA/RMC 兜底解析与读/写超时保险丝。
+
+    **波特率**：默认按 9600 工作。2026-10-09 现场实测（计算棒 + PL2303GT +
+    20 针线束）：115200 下接收机"0"位大量丢失（80% 字节 >=0x80，全是
+    ``11111111`` 少一个 0），降到 9600 后坏字节 1%、``$GNGGA`` 正常可读。
+    程序仍带自适应：收不到 NMEA 时会把接收机与主机一起拉到 9600
+    （手册 4.2 ``com com1 9600``）并 ``saveconfig`` 固化，必要时再回退一次。
+    """
+
+    #: NMEA-0183 句子最短结构（"$xxGGA," 需要 7 个字符）。
+    NMEA_SENTENCE_MIN_CHARS = 7
+    #: 无 NMEA 时的输出激活轮询周期（老师版本每 0.3 s 发一次 ``log gpgga``）。
+    POLL_INTERVAL_S = 1.0
+    #: 判为"输出没在流"的空闲阈值（正常 1 Hz 报文流不会触发轮询）。
+    SILENCE_BEFORE_POLL_S = 2.0
+    #: 原始字节诊断样本长度。
+    RAW_SAMPLE_BYTES = 32
+    #: 连续无 NMEA 时诊断/指令应答日志的最小间隔（秒），避免刷屏。
+    DIAGNOSTIC_INTERVAL_S = 5.0
+    #: 每次连接最多保留多少条接收机报告行（#LOGLISTA / #COMCONFIGA / <VERSION …）。
+    MAX_RECEIVER_REPORTS = 24
+    #: 无 NMEA 时的物理口轮询周期（秒）。20 针上有 COM1(pin6/7) 与 COM3(pin17/18)
+    #: 两路 RS232，线束只接一路；"无端口写法"若把 GGA 送到另一路，我们这边就永远
+    #: 收不到。所以每 6s 换一个口（1 Hz 报文足够看清楚），换口前先 unlogall，
+    #: 绝不让两路同时输出。
+    PORT_PROBE_INTERVAL_S = 6.0
+    #: 阶段0 = 老师原写法（无端口）；阶段1 = 只 COM1；阶段2 = 只 COM3。
+    PORT_PROBE_COMMANDS: tuple[tuple[bytes, ...], ...] = (
+        (b"log gpgga\r\n", b"log gpgga ontime 1\r\n"),
+        (b"log com1 gpgga ontime 1\r\n",),
+        (b"log com3 gpgga ontime 1\r\n",),
+    )
+    #: 波特率救援：跑满这么多轮物理口轮询仍无 NMEA，就把接收机与主机一起换到
+    #: 已知可用的波特率（M100 用户手册 4.2 常用指令"com com1 9600"）。
+    #:
+    #: 现场实测（2026-10-09，计算棒 + PL2303GT + 20 针线束）：115200 下接收机的
+    #: "0"位大量丢失（80% 字节 >=0x80，全是 11111111 少一个 0），降到 9600 后
+    #: 坏字节降到 1%、`$GNGGA` 正常可读 —— 位宽放大 12 倍把电平/线束余量拉回来了。
+    #: 所以默认按 9600 工作，救援也是把两边都拉到 9600。
+    PORT_PROBE_CYCLES_BEFORE_RESCUE = 1
+    RESCUE_BAUD = 9600
+    #: 拖波特率时用来"喂命令"的接收机出厂默认速率（接收机在别的速率上时只能用它对话）。
+    FACTORY_BAUD = 115200
+
+    @staticmethod
+    def _nmea_kind(line: str) -> str:
+        """返回 NMEA 句子类型（GGA/RMC/…），不是 NMEA-0183 句子时返回空串。
+
+        与老师版本 ``data.startswith("$GPGGA")`` 等价，但按 talker+type 结构
+        判定，因此 ``$GPGGA,`` / ``$GNGGA,`` / ``$BDGGA,``（以及 GAGGA/GLGGA
+        等其它 talker）都能识别，也不会误收 OK!/Error! 之类的指令应答。
+        """
+        if (len(line) < GnssReader.NMEA_SENTENCE_MIN_CHARS
+                or line[0] != "$" or line[6] != ","):
+            return ""
+        talker = line[1:6]
+        if not talker.isalpha():
+            return ""
+        return talker.upper()[2:]
+
+    @staticmethod
+    def _split_nmea_lines(buffer: bytes) -> tuple[list[bytes], bytes]:
+        """按 CR / LF / CRLF 分帧，返回（完整行, 未完成尾巴）。
+
+        旧逻辑要求缓冲区必须以 ``\\n`` 结尾才成行：M100 手册规定 NMEA 以
+        [CR][LF] 结束，但只发 CR 的固件/配置会让旧逻辑永远拼不出行（现场表现为
+        “串口能读字节却解析不出 NMEA”）。这里三种行尾都接受，等价于老师版本
+        ``readline()`` + ``strip()`` 的容错能力。
+        """
+        lines: list[bytes] = []
+        start = 0
+        index = 0
+        while index < len(buffer):
+            byte = buffer[index]
+            if byte in (0x0A, 0x0D):
+                if index > start:
+                    lines.append(buffer[start:index])
+                if byte == 0x0D and index + 1 < len(buffer) and buffer[index + 1] == 0x0A:
+                    index += 1
+                start = index + 1
+            index += 1
+        return lines, bytes(buffer[start:])
+
     def __init__(self, port: str, baud: int = 115200) -> None:
         self.port = port
         self.baud = baud
         self.ser: serial.Serial | None = None
+        self._configured_baud = baud
+        self._rescue_state = 0  # 0=未降速 1=已降到 RESCUE_BAUD 2=已切回并放弃
+        self._probe_cycles = 0
+        self._partial = b""
+        self._last_gga_at = float("-inf")
+        self._last_sentence_at = float("-inf")
+        self._last_poll_at = float("-inf")
+        self._last_response_at = float("-inf")
+        self._last_diagnostic_at = float("-inf")
+        self._poll_count = 0
+        self._response_count = 0
+        self._probe_sent = False
+        #: 诊断日志回调（air_gnss/测试注入；None = 不记录）。
+        self.log = None
+        # ---- 诊断计数：air_gnss 据此区分无字节 / 有字节非 NMEA / 无卫星 / 无定位 ----
+        self.rx_bytes = 0
+        self.rx_lines = 0
+        self.non_nmea_bytes = 0
+        self.detected_sentences = 0
+        self.parse_errors = 0
+        self.raw_sample = b""
+        self.latest_sample = b""
+        self.last_sentence = ""
+        self.last_response = ""
+        # 字节统计（判定"恒定电平/噪声/二进制/非 NMEA 文本"用）。
+        self.printable_bytes = 0
+        self.zero_bytes = 0
+        self.high_bytes = 0
+        self.dollar_bytes = 0
+        self.crlf_bytes = 0
+        self.binary_sync_hits = 0
+        self.byte_hist = [0] * 256
+        self.receiver_reports: list[str] = []
+        self.last_report = ""
+        self._sample_tail = b""
+        self._cleanup_sent = False
+        self._probe_phase = 0
+        self._probe_phase_started_at = float("-inf")
+        self._saveconfig_done = False
 
     def open(self) -> None:
         if self.ser and self.ser.is_open:
             return
-        self.ser = serial.Serial(self.port, self.baud, timeout=0.8)
-        self.ser.write(b"log gpgga\r\n")
-        self.ser.write(b"log gprmc\r\n")
+        # 写保险丝（2026-09-30 现场挂死回归）：个别串口驱动在设备不在位/永不
+        # 收数时 write() 会无界阻塞，request_stop 永远轮不到检查。1s 写不进去
+        # 按打开失败处理：关串口、抛错，交还 GnssReaderThread.run 的退避重试
+        # 循环（每轮间隔都检查 _stop，可被及时终止）。
+        # 串口参数显式写全（老师现场验证版本：115200 / 8 / N / 1 / 无流控）。
+        # 取值与 pyserial 默认值一致，显式声明是为了诊断日志可核对。
+        self.ser = serial.Serial(
+            self.port,
+            self.baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.2,
+            write_timeout=1.0,
+        )
+        self.reset_diagnostics()
+        self._note(f"[GNSS] port opened {self.port}")
+        self._note(
+            f"[GNSS] serial parameters port={self.port} baud={self.baud} "
+            "bytesize=8 parity=N stopbits=1 flow=none timeout=0.2s"
+        )
+        try:
+            self._write(b"log gpgga ontime 1\r\n")
+            self._write(b"log gprmc ontime 1\r\n")
+        except Exception:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+            raise
 
     def close(self) -> None:
-        if self.ser:
-            self.ser.close()
+        ser = self.ser
         self.ser = None
+        self._partial = b""
+        if ser:
+            ser.close()
+
+    # ---- 诊断（区分：串口打不开 / 打开无字节 / 有字节非 NMEA / NMEA 被拒） ----
+
+    def _note(self, text: str) -> None:
+        callback = self.log
+        if callback is None:
+            return
+        try:
+            callback(text)
+        except Exception:  # noqa: BLE001 - 诊断日志绝不影响串口读取
+            pass
+
+    def reset_diagnostics(self) -> None:
+        """每次打开串口重置计数（只统计本次连接的字节/句子）。"""
+        self.rx_bytes = 0
+        self.rx_lines = 0
+        self.non_nmea_bytes = 0
+        self.detected_sentences = 0
+        self.parse_errors = 0
+        self.raw_sample = b""
+        self.latest_sample = b""
+        self.last_sentence = ""
+        self.last_response = ""
+        self.printable_bytes = 0
+        self.zero_bytes = 0
+        self.high_bytes = 0
+        self.dollar_bytes = 0
+        self.crlf_bytes = 0
+        self.binary_sync_hits = 0
+        self.byte_hist = [0] * 256
+        self.receiver_reports = []
+        self.last_report = ""
+        self._sample_tail = b""
+        self._probe_sent = False
+        self._cleanup_sent = False
+        self._probe_phase = 0
+        self._probe_phase_started_at = float("-inf")
+        self._response_count = 0
+        self._last_response_at = float("-inf")
+        self._last_diagnostic_at = float("-inf")
+
+    def diagnostics(self) -> str:
+        """一行现场诊断文本，明确区分四种状态（供 [GNSS] 日志与地面端显示）。"""
+        if self.rx_bytes <= 0:
+            return (f"串口 {self.port}@{self.baud} 已打开但收不到任何字节"
+                    "（串口本身正常；M100 未输出或未连通）")
+        if self.parse_errors > 0:
+            return (f"收到 NMEA 句子但解析被拒绝 {self.parse_errors} 次"
+                    f"（最后句子 {self.last_sentence[:40]!r}）")
+        if self.detected_sentences > 0:
+            return (f"本连接已解析 {self.detected_sentences} 条 NMEA，"
+                    f"当前 {self.silence_seconds():.1f}s 没有新句子"
+                    f"（累计收到 {self.rx_bytes} 字节）")
+        total = max(1, self.rx_bytes)
+        top_byte, top_count = max(enumerate(self.byte_hist), key=lambda item: item[1])
+        stats = (f"可打印 {100 * self.printable_bytes // total}%、"
+                 f"0x00 {100 * self.zero_bytes // total}%、"
+                 f">=0x80 {100 * self.high_bytes // total}%、"
+                 f"'$'×{self.dollar_bytes}、CR/LF×{self.crlf_bytes}、"
+                 f"AA4412×{self.binary_sync_hits}、"
+                 f"最常见 0x{top_byte:02x}×{top_count}")
+        latest = self._sample_text(self.latest_sample)
+        first = self._sample_text(self.raw_sample)
+        first_part = f"；首块 {first}" if self.raw_sample and self.raw_sample != self.latest_sample else ""
+        report_part = f"；接收机报告 {self.last_report[:60]}" if self.last_report else ""
+        return (f"收到 {self.rx_bytes} 字节 / {self.rx_lines} 行，没有一条 NMEA 句子"
+                f"（{stats}）；最新样本 {latest}{first_part}{report_part}；判定：{self._verdict()}")
+
+    @staticmethod
+    def _sample_text(sample: bytes) -> str:
+        """样本渲染：可打印字符原样、其余转 \\xNN（日志只输出 ASCII）。"""
+        text = "".join(
+            chr(byte) if 32 <= byte < 127 else f"\\x{byte:02x}" for byte in sample
+        )
+        return f"{text} [{sample.hex(' ')}]"
+
+    def _verdict(self) -> str:
+        """按字节统计给出一句判定（现场一眼区分噪声/恒定电平/二进制/非 NMEA 文本）。"""
+        total = max(1, self.rx_bytes)
+        if self.receiver_reports:
+            return "已读到接收机报告（链路与波特率正常）：按报告核对端口与报文配置"
+        if self.binary_sync_hits:
+            return "接收机在输出 ComNav 二进制格式报文（AA4412 同步头），不是 ASCII NMEA"
+        if self.zero_bytes * 10 >= total * 6:
+            return "字节几乎全是 0x00：线路恒定低电平（断开/短路/对端未发送）"
+        if self.high_bytes * 10 >= total * 6:
+            return "字节几乎都 >=0x80：线路为高电平/噪声，不是有效 NMEA"
+        if self.dollar_bytes == 0 and self.printable_bytes * 10 >= total * 8:
+            return "大量可读文本但没有 '$'、也没有 CR/LF：接收机输出不是标准 NMEA 行"
+        if self.dollar_bytes > 0 and self.crlf_bytes == 0:
+            return "有 '$' 但没有 CR/LF：接收机没有按 NMEA 行输出"
+        return "有字节但不是 NMEA 行，按样本与统计核对接收机输出配置/电平"
+
+    def silence_seconds(self) -> float:
+        """距最后一条 NMEA 句子的秒数；从未收到过返回 inf。"""
+        if self._last_sentence_at == float("-inf"):
+            return float("inf")
+        return max(0.0, time.monotonic() - self._last_sentence_at)
+
+    def _note_rx(self, chunk: bytes) -> None:
+        self.rx_bytes += len(chunk)
+        if not self.raw_sample:
+            self.raw_sample = bytes(chunk[: self.RAW_SAMPLE_BYTES])
+        if chunk:
+            self.latest_sample = bytes(chunk[-self.RAW_SAMPLE_BYTES:])
+        self.printable_bytes += sum(1 for byte in chunk if 32 <= byte < 127)
+        self.zero_bytes += chunk.count(0)
+        self.high_bytes += sum(1 for byte in chunk if byte >= 0x80)
+        self.dollar_bytes += chunk.count(0x24)
+        self.crlf_bytes += chunk.count(0x0D) + chunk.count(0x0A)
+        for byte in chunk:
+            self.byte_hist[byte] += 1
+        probe = self._sample_tail + chunk
+        self.binary_sync_hits += probe.count(b"\xaa\x44\x12")
+        self._sample_tail = probe[-2:]
+
+    def _note_response(self, line: str, raw_line: bytes) -> None:
+        """记录接收机应答与报告。
+
+        - ``OK!`` / ``Error!``：手册 2.1 的指令应答（判断命令是否被接受）；
+        - ``#LOGLISTA…`` / ``#COMCONFIGA…`` / ``<VERSION…``：接收机自己吐出的
+          报告（板卡手册 3.2.2.2 / 3.2.1.x），是判定"GGA 配在哪个物理口、
+          什么格式、波特率多少"的直接证据，现场排障就靠这几行。
+        """
+        self.non_nmea_bytes += len(raw_line)
+        self.last_response = line
+        if line.startswith(("#", "<")):
+            self.last_report = line[:80]
+            if len(self.receiver_reports) < self.MAX_RECEIVER_REPORTS:
+                self.receiver_reports.append(line[:120])
+                self._note(f"[GNSS] receiver report {line[:120]!r}")
+            return
+        self._response_count += 1
+        now = time.monotonic()
+        # 前三条应答必记（现场需要看清 Error!/版本信息），之后按节流记录。
+        if self._response_count > 3 and now - self._last_response_at < self.DIAGNOSTIC_INTERVAL_S:
+            return
+        self._last_response_at = now
+        self._note(f"[GNSS] command response {line[:80]!r}")
+
+    def _write(self, payload: bytes) -> None:
+        assert self.ser is not None
+        self.ser.write(payload)
+        self._note(f"[GNSS] TX command {payload!r}")
+
+    def _poll_output(self, now: float) -> None:
+        """老师版本原命令 + 手册清理序列 + 物理口轮询，激活/恢复 ASCII GGA 输出。"""
+        if now - self._last_poll_at < self.POLL_INTERVAL_S:
+            return
+        self._last_poll_at = now
+        self._poll_count += 1
+        if not self._cleanup_sent:
+            self._cleanup_sent = True
+            self._probe_cycles = 0
+            self._enter_probe_phase(0, first=True)
+            return
+        if now - self._probe_phase_started_at >= self.PORT_PROBE_INTERVAL_S:
+            self._probe_phase_started_at = now
+            next_phase = (self._probe_phase + 1) % len(self.PORT_PROBE_COMMANDS)
+            if next_phase == 0:
+                # 一轮（无端口 → COM1 → COM3）跑完仍无 NMEA：按手册降速再试一次。
+                self._probe_cycles += 1
+                if self._probe_cycles >= self.PORT_PROBE_CYCLES_BEFORE_RESCUE:
+                    self._probe_cycles = 0
+                    if self._try_baud_rescue():
+                        return
+            self._enter_probe_phase(next_phase)
+            return
+        # 本阶段内按老师版本的方式反复发命令，保持输出（老师每 0.3s 发一次）。
+        if self._probe_phase == 0:
+            self._write(b"log gpgga\r\n")
+            self._write(b"log gpgga ontime 1\r\n")
+        else:
+            self._write(self.PORT_PROBE_COMMANDS[self._probe_phase][0])
+
+    def _enter_probe_phase(self, phase: int, *, first: bool = False) -> None:
+        """进入某个物理口阶段：先 unlogall 清空，再只在一个口上使能 ASCII GGA。
+
+        板卡手册 2.2.38「UNLOGALL 取消所有报文输出」+ 4.1.3/4.2「log com1/com3
+        gpgga ontime <n>」：换口前先清空，保证任一时刻只有一个物理口在输出，
+        避免两条 TX 同时驱动同一条 RX 互相打架。不下发 saveconfig，不写 flash。
+        """
+        self._probe_phase = phase
+        self._write(b"unlogall\r\n")
+        for command in self.PORT_PROBE_COMMANDS[phase]:
+            self._write(command)
+        # 让接收机自己回报"现在哪个口配了什么"（板卡手册 3.2.2.2 log loglista once）。
+        self._write(b"log loglista once\r\n")
+        if first:
+            self._probe_sent = True
+            # 只读查询：固件/链路 + 各口波特率（板卡手册 3.2.1.x log comconfiga）。
+            self._write(b"log version\r\n")
+            self._write(b"log comconfiga\r\n")
+
+    def _try_baud_rescue(self) -> bool:
+        """把接收机与主机一起拉到 RESCUE_BAUD（默认 9600），并按需回退一次。
+
+        为什么"拉到 9600"能救：现场实测 115200 下接收机的"0"位在本链路上大量丢失
+        （80% 字节 >=0x80），9600 位宽放大 12 倍后坏字节降到 1%。命令取自 M100
+        用户手册 4.2 常用指令"修改串口波特率：com com1 9600"（com3 同理）。
+
+        时序：接收机可能停在出厂速率 115200（刚上电/恢复出厂），此时只能用 115200
+        跟它说话 → 先把主机切到 115200 发 ``com com1|com3 9600``，再切回 9600 读取；
+        成功后补一条 ``saveconfig``（手册 4.2，把 9600 与 GGA 输出写进接收机，
+        只写一次），这样接收机重启后不会再回到 115200。若 9600 仍收不到 NMEA，
+        再来一次把两边都切回配置波特率（最多来回一次，不会无限切换）。
+        """
+        if self._rescue_state == 2:
+            return False
+        first = self._rescue_state == 0
+        target = self.RESCUE_BAUD if first else self._configured_baud
+        self._rescue_state = 1 if first else 2
+        if first:
+            # 1) 用出厂速率与接收机对话（接收机此时可能还在 115200）。
+            if self.baud != self.FACTORY_BAUD:
+                try:
+                    self.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.baud = self.FACTORY_BAUD
+                try:
+                    self.open()
+                except Exception as exc:  # noqa: BLE001 - 重开失败交回上层重连
+                    self._note(f"[GNSS] 波特率救援重开串口失败：{exc}")
+                    return False
+            for receiver_port in ("com1", "com3"):
+                self._write(f"com {receiver_port} {target}\r\n".encode("ascii"))
+            self._note(
+                f"[GNSS] 波特率救援：接收机 com1/com3 -> {target}（手册 4.2）；"
+                f"主机读取波特率 -> {target}"
+            )
+            self._last_poll_at = time.monotonic()  # 让接收机有时间切换
+            time.sleep(0.4)
+        else:
+            # 回退：当前在 RESCUE_BAUD 上，用它把接收机切回配置波特率。
+            for receiver_port in ("com1", "com3"):
+                self._write(f"com {receiver_port} {target}\r\n".encode("ascii"))
+            self._note(f"[GNSS] 波特率救援仍未收到 NMEA：两边切回 {target}")
+            time.sleep(0.3)
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.baud = target
+        try:
+            self.open()
+        except Exception as exc:  # noqa: BLE001
+            self._note(f"[GNSS] 波特率救援后重开串口失败：{exc}")
+            return False
+        if first and not self._saveconfig_done:
+            # 手册 4.2 "保存设置：saveconfig"：只做一次，避免每次重连都写接收机 flash。
+            self._saveconfig_done = True
+            try:
+                self._write(b"saveconfig\r\n")
+                self._note("[GNSS] 已下发 saveconfig：接收机保持该波特率与 GGA 输出")
+            except Exception as exc:  # noqa: BLE001
+                self._note(f"[GNSS] saveconfig 下发失败（不影响本次运行）：{exc}")
+        self._cleanup_sent = False  # 换波特率后重新走一遍 unlogall + 阶段0
+        return True
+
+    def _note_diagnostics(self, now: float) -> None:
+        if now - self._last_sentence_at < self.SILENCE_BEFORE_POLL_S:
+            return
+        if now - self._last_diagnostic_at < self.DIAGNOSTIC_INTERVAL_S:
+            return
+        self._last_diagnostic_at = now
+        self._note(f"[GNSS] RX bytes {self.rx_bytes} | {self.diagnostics()}")
 
     def read_gga(self, timeout_s: float = 2.0) -> GgaFix:
         self.open()
         assert self.ser is not None
         deadline = time.monotonic() + timeout_s
-        last = ""
         while time.monotonic() < deadline:
-            line = self.ser.readline().decode("ascii", errors="replace").strip()
-            if not line:
-                continue
-            last = line
-            if line.startswith(("$GPGGA", "$GNGGA", "$BDGGA")):
-                fix = parse_gga(line)
-                if fix.latitude is not None and fix.longitude is not None:
+            chunk = self.ser.readline(1024)
+            if chunk:
+                self._note_rx(chunk)
+                self._partial += chunk
+            # CR / LF / CRLF 三种行尾都成行（旧实现只认 LF）。
+            lines, self._partial = self._split_nmea_lines(self._partial)
+            if len(self._partial) > 2048:
+                self._partial = b""
+            for raw_line in lines:
+                self.rx_lines += 1
+                # 前导乱码/半个报文：重同步到第一颗 '$'（现场出现过 \xff\xfd\xfb 前缀，
+                # 否则后面合法的 GGA 会被前缀带偏而整行丢弃）。
+                marker = raw_line.find(b"$")
+                if marker > 0:
+                    self.non_nmea_bytes += marker
+                    raw_line = raw_line[marker:]
+                line = raw_line.decode("ascii", errors="replace").strip()
+                if not line:
+                    continue
+                if not line.startswith("$"):
+                    # M100 指令应答（OK!/Error!/版本信息）或其它非 NMEA 数据。
+                    self._note_response(line, raw_line)
+                    continue
+                kind = self._nmea_kind(line)
+                if not kind:
+                    self.non_nmea_bytes += len(raw_line)
+                    self._note(f"[GNSS] detected sentence 不可识别 {line[:48]!r}")
+                    continue
+                self._last_sentence_at = time.monotonic()
+                self.last_sentence = line
+                if kind == "GGA":
+                    try:
+                        fix = parse_gga(line)
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        self.parse_errors += 1
+                        self._note(f"[GNSS] parse result rejected {line[:48]!r} ({exc})")
+                        continue
+                    if not fix.nmea_received:
+                        continue
+                    self.detected_sentences += 1
+                    self._last_gga_at = time.monotonic()
+                    self._note(
+                        f"[GNSS] detected sentence {line[:6]} | parse result ok | "
+                        f"satellites={fix.satellites} fix={fix.fix_quality} "
+                        f"lat={fix.latitude} lon={fix.longitude}"
+                    )
                     return fix
-            if line.startswith(("$GPRMC", "$GNRMC", "$BDRMC")):
-                fix = parse_rmc(line)
-                if fix.latitude is not None and fix.longitude is not None:
-                    return fix
-        return GgaFix(raw=last)
+                if kind == "RMC" and time.monotonic() - self._last_gga_at > 3.0:
+                    try:
+                        fix = parse_rmc(line)
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        self.parse_errors += 1
+                        self._note(f"[GNSS] parse result rejected {line[:48]!r} ({exc})")
+                        continue
+                    if fix.nmea_received:
+                        self.detected_sentences += 1
+                        self._note(
+                            f"[GNSS] detected sentence {line[:6]} | parse result ok (RMC 兜底) | "
+                            f"satellites={fix.satellites} fix={fix.fix_quality} "
+                            f"lat={fix.latitude} lon={fix.longitude}"
+                        )
+                        return fix
+        # 本轮没解析到 NMEA：按老师版本持续轮询恢复输出，并给出一条诊断。
+        now = time.monotonic()
+        if now - self._last_sentence_at >= self.SILENCE_BEFORE_POLL_S:
+            self._poll_output(now)
+        self._note_diagnostics(now)
+        return GgaFix(serial_open=True)
 
 
 def db20(values: np.ndarray) -> np.ndarray:
@@ -967,10 +1472,22 @@ def apply_reflection_and_through_calibration(
 ) -> dict[str, np.ndarray]:
     display = {name: values.copy() for name, values in raw_sparams.items()}
     if calibration_p1:
+        f_min = float(calibration_p1.points[0].frequency)
+        f_max = float(calibration_p1.points[-1].frequency)
+        if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
+            raise ValueError(f"S11 校准频率覆盖不足 [{f_min:g}, {f_max:g}] Hz，禁止带外外推")
         display["S11"] = np.array([calibration_p1.correct(f, s) for f, s in zip(frequency_hz, raw_sparams["S11"])], dtype=np.complex128)
     if calibration_p2:
+        f_min = float(calibration_p2.points[0].frequency)
+        f_max = float(calibration_p2.points[-1].frequency)
+        if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
+            raise ValueError(f"S22 校准频率覆盖不足 [{f_min:g}, {f_max:g}] Hz，禁止带外外推")
         display["S22"] = np.array([calibration_p2.correct(f, s) for f, s in zip(frequency_hz, raw_sparams["S22"])], dtype=np.complex128)
     if through:
+        f_min = float(through.frequency_hz[0])
+        f_max = float(through.frequency_hz[-1])
+        if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
+            raise ValueError(f"Through 校准频率覆盖不足 [{f_min:g}, {f_max:g}] Hz，禁止带外外推")
         for channel in ("S21", "S12"):
             if channel not in raw_sparams:
                 continue
@@ -1121,6 +1638,7 @@ def save_trace(
     channels: Sequence[str] | None = None,
     acquisition: dict[str, object] | None = None,
     flight: dict[str, object] | None = None,
+    save_csv: bool = True,
 ) -> Path:
     channel_names = tuple(channels) if channels is not None else S_PARAMETERS
     validated_traces = validate_trace_by_channel(time_ns, trace_by_channel, channels=channel_names)
@@ -1131,29 +1649,31 @@ def save_trace(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    csv_path = out_dir / f"trace_{index:05d}_{stamp}.csv"
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.writer(handle)
-        header = ["frequency_hz", "frequency_mhz"]
-        for name in channel_names:
-            header += [
-                f"{name.lower()}_real_raw",
-                f"{name.lower()}_imag_raw",
-                f"{name.lower()}_db_raw",
-                f"{name.lower()}_real_display",
-                f"{name.lower()}_imag_display",
-                f"{name.lower()}_db_display",
-            ]
-        writer.writerow(header)
-        for idx, f in enumerate(frequency_hz):
-            row: list[float] = [float(f), float(f / 1e6)]
+    base_name = f"trace_{index:05d}_{stamp}"
+    csv_path = out_dir / f"{base_name}.csv"
+    if save_csv:
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            header = ["frequency_hz", "frequency_mhz"]
             for name in channel_names:
-                raw = raw_sparams[name][idx]
-                disp = display_sparams[name][idx]
-                row += [raw.real, raw.imag, db20(np.array([raw]))[0], disp.real, disp.imag, db20(np.array([disp]))[0]]
-            writer.writerow(row)
+                header += [
+                    f"{name.lower()}_real_raw",
+                    f"{name.lower()}_imag_raw",
+                    f"{name.lower()}_db_raw",
+                    f"{name.lower()}_real_display",
+                    f"{name.lower()}_imag_display",
+                    f"{name.lower()}_db_display",
+                ]
+            writer.writerow(header)
+            for idx, f in enumerate(frequency_hz):
+                row: list[float] = [float(f), float(f / 1e6)]
+                for name in channel_names:
+                    raw = raw_sparams[name][idx]
+                    disp = display_sparams[name][idx]
+                    row += [raw.real, raw.imag, db20(np.array([raw]))[0], disp.real, disp.imag, db20(np.array([disp]))[0]]
+                writer.writerow(row)
 
-    npz_path = csv_path.with_suffix(".npz")
+    npz_path = out_dir / f"{base_name}.npz"
     first_trace = validated_traces[channel_names[0]]
     npz_payload = {
         "config": json.dumps(asdict(cfg), ensure_ascii=False),
@@ -1202,9 +1722,9 @@ def save_trace(
         with meta_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(meta, ensure_ascii=False) + "\n")
     except PermissionError:
-        sidecar_path = csv_path.with_suffix(".metadata.json")
+        sidecar_path = npz_path.with_suffix(".metadata.json")
         sidecar_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    return csv_path
+    return csv_path if (save_csv and csv_path.exists()) else csv_path
 
 
 def trace_npz_bytes(
@@ -1338,6 +1858,7 @@ class RemoteSender:
         *,
         window_size: int = 16,
         ack_timeout: float = 5.0,
+        reconnect_backoff=None,
     ) -> None:
         self.host = host
         self.port = port
@@ -1347,6 +1868,11 @@ class RemoteSender:
         # ---- 第5轮：滑动窗口流控（替换逐条停等）----
         self.window_size = max(1, int(window_size))
         self.ack_timeout = max(0.5, float(ack_timeout))
+        # ---- 第7轮 t1（共享挂钩，默认行为零变化）----
+        #: 重连等待策略注入点。None = 第1轮固定 2.0s（GUI 现状逐字不变）；
+        #: 黑匣子（uav_gpr_air_service.py）注入 5s→30s 指数退避 callable。
+        #: callable 返回等待秒数，异常/非法值一律回退 2.0s。
+        self._reconnect_backoff = reconnect_backoff
         # ---- 第2轮 t5：磁盘 outbox（R-B-01…R-B-10）----
         # outbox_dir=None ⇒ 完全禁用持久化，第1轮全部 sender 测试逐字兼容。
         #: 磁盘 outbox 实例（None=禁用）。构造本身不建目录（磁盘目录在首次
@@ -1384,6 +1910,9 @@ class RemoteSender:
         self._inflight_lock = threading.Lock()
         #: 探针观测值：运行期间同时在途未确认 trace 达到的最大值
         self.max_inflight_seen = 0
+        # GNSS latest snapshot only: no trace queue/outbox or extra socket.
+        self.gnss_snapshot = None
+        self._last_gnss_sent_at = float("-inf")
 
     def inflight_count(self) -> int:
         """当前在途（已发送、等待 ack_trace）未确认 trace 数量。"""
@@ -1749,7 +2278,21 @@ class RemoteSender:
                 "supports_commands": True,
             },
         )
-        ack, _payload = self._read_frame(sock)
+        # 第7轮 t9 修复（修法 b，仿 _switch_connection_identity 先例）：
+        # hello-ack 前到达的 command 就地分派并继续等 ack——地面端面板以
+        # "Connected" 置 connected 后，5s 自动刷新/用户点击可能把 command
+        # 发进 accept→hello-ack 窗口（F1 串行化后不再破帧，但黑匣子此前会
+        # 严格拒绝→断链重试 5-30s，违背 D3"永不放弃"）。
+        while True:
+            ack, _payload = self._read_frame(sock)
+            if ack.get("type") == "command":
+                # 陷阱（revA 标注）：_handle_command 默认经 self._sock 回执，
+                # 而 _connect 期间 self._sock 尚为 None——必须经局部 sock
+                # 回执，否则窗口期命令的 command_ack 丢失、对端 _pending 悬挂
+                # （等于把断链换成命令黑洞）。
+                self._handle_command(ack, reply_sock=sock)
+                continue
+            break
         if ack.get("type") != "ack":
             raise ConnectionError(f"unexpected hello ack: {ack}")
         self.status_callback(f"Remote connected: {self.host}:{self.port}")
@@ -1771,22 +2314,71 @@ class RemoteSender:
                 continue
         raise ConnectionError("remote sender stopped")
 
-    def _handle_command(self, header: dict[str, object]) -> None:
+    def _handle_command(
+        self, header: dict[str, object], reply_sock: socket.socket | None = None
+    ) -> None:
         action = str(header.get("action") or "")
         params = header.get("params") if isinstance(header.get("params"), dict) else {}
+        # ---- 第7轮 t1（共享挂钩）：command_ack 结果回执 + 未知 action 兜底 ----
+        # command_callback 返回 None = 第1轮行为逐字不变（GUI 信号槽路径永远
+        # 返回 None，ack 帧不带任何新字段）。返回 dict 时：
+        #   - 保留字 "supported"（bool，可选）弹出到 ack 顶层，其余键作为
+        #     ack["result"] 载荷（第7轮两端约定：黑匣子认识该 action 时带
+        #     result，不认识时只回 supported=false）；
+        #   - 回调抛异常一律兜底为 supported=false + 错误 result，绝不把异常
+        #     抛进 sender 线程（现状会把连接踢成重连，属"会崩需兜底"路径）。
+        result: dict[str, object] | None = None
+        supported: bool | None = None
         if self.command_callback is not None:
-            self.command_callback(action, params)
-        if self._sock is not None:
-            send_remote_frame(
-                self._sock,
-                {
-                    "type": "command_ack",
-                    "protocol": "uav-gpr-telemetry-v1",
-                    "run_id": self.run_id,
-                    "action": action,
-                    "timestamp": utc_timestamp(),
-                },
-            )
+            try:
+                outcome = self.command_callback(action, params)
+            except Exception as exc:  # noqa: BLE001 - 兜底回执，绝不断链
+                result = {"ok": False, "error": f"command handler failed: {exc}"}
+                supported = False
+            else:
+                if isinstance(outcome, dict):
+                    fields = dict(outcome)
+                    flag = fields.pop("supported", None)
+                    if isinstance(flag, bool):
+                        supported = flag
+                    if fields:
+                        result = fields
+        # 第7轮 t9 修复（修法 b）：回执目标 = 显式 reply_sock（_connect 握手
+        # 窗口期，self._sock 尚为 None）否则既有 self._sock；None 则不回
+        # （与既有"未连接不回执"语义一致）。
+        reply_target = reply_sock if reply_sock is not None else self._sock
+        if reply_target is not None:
+            ack: dict[str, object] = {
+                "type": "command_ack",
+                "protocol": "uav-gpr-telemetry-v1",
+                "run_id": self.run_id,
+                "action": action,
+                "timestamp": utc_timestamp(),
+            }
+            # t18 窄关联回带：有效输入 request_id/cal_id/step 放 header，并填已有 result 中缺失关联键
+            req_id = params.get("request_id")
+            cal_id = params.get("cal_id")
+            step = params.get("step")
+            if isinstance(req_id, str) and req_id:
+                ack["request_id"] = req_id
+            if isinstance(cal_id, str) and cal_id:
+                ack["cal_id"] = cal_id
+            if isinstance(step, str) and step:
+                ack["step"] = step
+
+            if result is not None:
+                if isinstance(req_id, str) and req_id and "request_id" not in result:
+                    result["request_id"] = req_id
+                if isinstance(cal_id, str) and cal_id and "cal_id" not in result:
+                    result["cal_id"] = cal_id
+                if isinstance(step, str) and step and "step" not in result:
+                    result["step"] = step
+
+            if supported is not None:
+                ack["supported"] = supported
+            if result is not None:
+                ack["result"] = result
+            send_remote_frame(reply_target, ack)
 
     def _ack_single_trace(
         self,
@@ -1946,17 +2538,50 @@ class RemoteSender:
                 pass
         return recovered
 
+    def _reconnect_delay_s(self) -> float:
+        """发送失败后的重连等待秒数（第7轮 t1 共享挂钩）。
+
+        未注入 ``reconnect_backoff`` 时返回第1轮固定 2.0s（行为逐字不变）；
+        注入 callable 时以其返回值为准（黑匣子 5s→30s 退避）。callable 抛错
+        或返回非法值一律回退 2.0s，绝不因策略故障改变重连节奏。
+        """
+        callback = self._reconnect_backoff
+        if callback is None:
+            return 2.0
+        try:
+            delay = float(callback())
+        except Exception:  # noqa: BLE001 - 策略故障不得影响重连
+            return 2.0
+        return delay if delay > 0.0 else 0.0
+
+    def _send_gnss_snapshot(self, sock) -> None:
+        if self.gnss_snapshot is None or time.monotonic() - self._last_gnss_sent_at < 1.0:
+            return
+        self._last_gnss_sent_at = time.monotonic()
+        try:
+            result = self.gnss_snapshot()
+            json.dumps(result, allow_nan=False)
+        except Exception:
+            return  # GNSS/provider errors do not affect the shared sender.
+        send_remote_frame(sock, {
+            "type": "command_ack", "protocol": "uav-gpr-telemetry-v1",
+            "action": "test_gnss", "supported": True, "result": result,
+        })
+
     def _run(self) -> None:
         pending: list[_QueuedRemoteFrame] = []
         self._pending_item = None
         # ---- 第2轮 §4.4：start() 已同步扫描出的恢复列表在本循环 pending 位串行
         # 消费：无独立恢复线程、无第二条 TCP 连接、无双份 outstanding 记账。
         recovery: list[_QueuedRemoteFrame] = self._recovery_items
+        last_activity_time = time.monotonic()
         while not self._stop.is_set():
             try:
                 if self._sock is None:
                     self._sock = self._connect()
+                    last_activity_time = time.monotonic()
                 sock = self._sock
+                self._send_gnss_snapshot(sock)
 
                 # 1. 检查并读出已到达的 ACK 与 command
                 with self._inflight_lock:
@@ -1992,6 +2617,20 @@ class RemoteSender:
                     try:
                         item = self.queue.get(timeout=q_timeout)
                     except queue.Empty:
+                        # 空闲保活心跳：若超过 12 秒没有发送任何数据且队列无活，发空闲 status 维持连接，
+                        # 防止地面端 30 秒无数据超时断开并导致 retrying 刷屏
+                        if time.monotonic() - last_activity_time > 12.0 and cur_inflight == 0:
+                            try:
+                                ping_header = {
+                                    "type": "heartbeat",
+                                    "protocol": "uav-gpr-telemetry-v1",
+                                    "run_id": self.run_id,
+                                    "timestamp": utc_timestamp(),
+                                }
+                                send_remote_frame(sock, ping_header, b"")
+                                last_activity_time = time.monotonic()
+                            except Exception:
+                                pass
                         continue
 
                 if item is None:
@@ -2062,7 +2701,9 @@ class RemoteSender:
                 self._pending_item = pending[0] if pending else None
                 self._close()
                 self.status_callback(f"Remote send retrying: {exc}")
-                self._stop.wait(2.0)
+                # 第7轮 t1：等待秒数改经 _reconnect_delay_s（默认仍 2.0s；
+                # 黑匣子注入 5s→30s 退避策略）。
+                self._stop.wait(self._reconnect_delay_s())
 
 
 class AcquisitionWorker(QtCore.QThread):
@@ -2086,10 +2727,12 @@ class AcquisitionWorker(QtCore.QThread):
         background_frequency_hz: np.ndarray | None,
         background: np.ndarray | None,
         autosave: bool,
+        gnss_cache: GnssFixCache | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self.gnss_port = gnss_port
+        self._gnss_cache = gnss_cache
         self.baud = baud
         self.out_dir = out_dir
         self.count = count
@@ -2134,10 +2777,34 @@ class AcquisitionWorker(QtCore.QThread):
                     background_frequency_hz=self.background_frequency_hz,
                     background=self.background,
                 )
-                fix = gnss.read_gga() if gnss else GgaFix()
+                if self._gnss_cache is not None:
+                    fix = self._gnss_cache.telemetry_fix(self._gnss_cache.latest())
+                else:
+                    try:
+                        fix = gnss.read_gga() if gnss else GgaFix()
+                    except Exception as exc:
+                        self.status.emit(f"GNSS unavailable (radar continues): {exc}")
+                        fix = GgaFix()
+                        try:
+                            gnss.close()
+                        except Exception:
+                            pass
                 path_text = ""
                 if self.autosave:
-                    path_text = str(save_trace(self.out_dir, index, self.cfg, freq, raw, display, time_ns, trace_by_channel, fix))
+                    path_text = str(
+                        save_trace(
+                            self.out_dir,
+                            index,
+                            self.cfg,
+                            freq,
+                            raw,
+                            display,
+                            time_ns,
+                            trace_by_channel,
+                            fix,
+                            save_csv=False,
+                        )
+                    )
                 self.trace_ready.emit(index, freq, raw, display, time_ns, trace_by_channel, fix, self.cfg, path_text)
                 if self.count > 0 and index >= self.count:
                     break
@@ -2149,7 +2816,10 @@ class AcquisitionWorker(QtCore.QThread):
             self.failed.emit(str(exc))
         finally:
             if gnss:
-                gnss.close()
+                try:
+                    gnss.close()
+                except Exception:
+                    pass
             self.finished_run.emit()
 
 
@@ -2229,6 +2899,21 @@ class GnssReaderThread(QtCore.QThread):
                 pass
 
 
+#: 收尾总闸遗弃的 GNSS 线程寄存处（模块级，进程生命周期内保活引用）。
+#:
+#: 背景：QThread 对象若在底层线程仍在运行时被 GC，Qt 会以
+#: "QThread: Destroyed while thread is still running" 直接拆除进程。
+#: :meth:`ContinuousAcquisitionWorker._shutdown` 放弃等待后必须把遗弃线程
+#: 的引用保存在这里，直到其自然退出；每次遗弃时顺手清理已退出线程，
+#: 列表不会无限增长。
+_ABANDONED_GNSS_THREADS: list["GnssReaderThread"] = []
+
+
+def _prune_abandoned_gnss_threads() -> None:
+    """清理寄存处里已自然退出的遗弃线程（保留仍在运行的引用）。"""
+    _ABANDONED_GNSS_THREADS[:] = [t for t in _ABANDONED_GNSS_THREADS if not t.isFinished()]
+
+
 class ProcessingConsumer(QtCore.QThread):
     """处理/保存/发送消费者线程（roadmap §5 PROC、§3 线程解耦）。
 
@@ -2250,6 +2935,7 @@ class ProcessingConsumer(QtCore.QThread):
         cfg: SweepConfig,
         out_dir: Path,
         autosave: bool,
+        save_csv: bool = True,
         calibration_p1: OSLCalibration | None,
         calibration_p2: OSLCalibration | None,
         through_measurement: CalibrationMeasurement | None,
@@ -2265,6 +2951,7 @@ class ProcessingConsumer(QtCore.QThread):
         self.cfg = cfg
         self.out_dir = out_dir
         self.autosave = autosave
+        self.save_csv = save_csv
         #: 第2轮任务身份制（§3.7）：本消费者产出 trace 携带的身份；
         #: None = 用连接身份（第 1 轮行为逐字兼容）。
         self.run_id = run_id
@@ -2320,7 +3007,7 @@ class ProcessingConsumer(QtCore.QThread):
         self.last_gnss_age_ms = lookup.age_ms
         # 只有 lookup.valid 时才把缓存 Fix 当作当前有效定位传给保存/UI/遥测；
         # 否则传递空 GgaFix，绝不把陈旧/无质量坐标伪装成有效数据（roadmap §10）。
-        fix = lookup.fix if (lookup.valid and lookup.fix is not None) else GgaFix()
+        fix = self._gnss_cache.telemetry_fix(lookup)
         acquisition = self._acquisition_metadata(item, lookup)
         flight = self._flight_metadata(lookup, fix)
         raw_sparams = dual_channel_raw(item.raw)
@@ -2351,6 +3038,7 @@ class ProcessingConsumer(QtCore.QThread):
                     channels=channels,
                     acquisition=acquisition,
                     flight=flight,
+                    save_csv=self.save_csv,
                 )
             )
             _record_stage("local_save_completed", time.perf_counter() - _save_t0)
@@ -2676,6 +3364,10 @@ _CALIBRATION_COMMAND_ACTIONS = (
     "cal_activate",
     "cal_cancel",
     "cal_status",
+    "cal_import_file",
+    "cal_export_file",
+    "cal_query_active",
+    "cal_clear_active",
 )
 
 
@@ -2761,6 +3453,7 @@ class AcquisitionTaskSpec:
     background_frequency_hz: np.ndarray | None
     background: np.ndarray | None
     autosave: bool
+    save_csv: bool = True
     remote_sender: RemoteSender | None = None
     run_id: str = ""
     task_seq: int = 0
@@ -3430,6 +4123,12 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
     resumed = QtCore.Signal()
     statistics_updated = QtCore.Signal(dict)
 
+    #: GNSS 收尾有界等待（收尾总闸，2026-09-30 现场挂死回归）：首轮 wait +
+    #: 追加 wait（默认共 10s）。追加耗尽仍不退出 → 遗弃（绝不 terminate）
+    #: 并继续收尾，落实"GNSS 失败绝不影响 USB 数据流"。测试可调小加速。
+    GNSS_SHUTDOWN_FIRST_WAIT_S = 3.0
+    GNSS_SHUTDOWN_EXTRA_WAIT_S = 7.0
+
     def __init__(
         self,
         cfg: SweepConfig,
@@ -3445,6 +4144,7 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
         background_frequency_hz: np.ndarray | None,
         background: np.ndarray | None,
         autosave: bool,
+        save_csv: bool = True,
         remote_sender: RemoteSender | None = None,
         *,
         backend: PersistentLibreVnaBackend | None = None,
@@ -3472,6 +4172,7 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
         self.background_frequency_hz = background_frequency_hz
         self.background = background
         self.autosave = autosave
+        self.save_csv = save_csv
         self.remote_sender = remote_sender
         self._backend = backend
         self._scheduler = scheduler if scheduler is not None else FixedIntervalSweepSelector(interval_s)
@@ -3948,6 +4649,7 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
             cfg=self.cfg,
             out_dir=self.out_dir,
             autosave=self.autosave,
+            save_csv=self.save_csv,
             calibration_p1=calibration_p1,
             calibration_p2=self.session_calibration_p2,
             through_measurement=self.through_measurement,
@@ -4087,17 +4789,29 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
            操作，不等、不阻塞，也不延迟 USB 释放；
         2. 随即 :meth:`_release_backend` 重试 ``backend.close()`` 直到
            ``backend.is_open=False``（fail-closed：资源仍被持有绝不结束）；
-        3. USB 已释放后再完成子线程 join（有界，超时明确报告哪个线程尚未退出
-           并继续等待其退出）。
+        3. USB 已释放后再完成子线程 join：处理线程先有界 3s，超时明确报告后
+           继续无限等待（数据完整性优先：排空失败宁可挂起也不丢账不丢
+           trace）；GNSS 线程改为**总计 GNSS_SHUTDOWN_FIRST_WAIT_S +
+           GNSS_SHUTDOWN_EXTRA_WAIT_S（默认 10s）有界等待**——追加等待耗尽
+           仍不退出（典型：卡在无界的串口 open/write 驱动调用里，
+           request_stop 永远轮不到检查）则遗弃（绝不 terminate，寄存到
+           :data:`_ABANDONED_GNSS_THREADS` 保活到自然退出）并继续收尾，
+           落实 :class:`GnssReaderThread` 类文档既定原则"GNSS 失败绝不影响
+           USB 数据流"：串口挂起不得拖死任务状态机、不得阻止下一次启动
+           （2026-09-30 现场回归：GNSS open 卡死 → 无限 join → worker 永不
+           结束 → 新任务被"采集已经在运行"拒绝）。
 
         任何情况下都不发 finished_run，除非 backend 已释放（不存在或 is_open
-        明确为 False）**且**全部子线程已退出；绝不 terminate 活线程；MainWindow
-        在 worker 未安全释放前不会把 worker 清为 None、也不会解锁手动 USB 控件。
+        明确为 False）**且**全部子线程已退出（唯一例外：GNSS 线程被收尾总闸
+        遗弃时等同放弃收编，任务照常结束）；绝不 terminate 活线程；
+        MainWindow 在 worker 未安全释放前不会把 worker 清为 None、也不会解锁
+        手动 USB 控件。
 
         ``keep_backend_open=True``（第2轮常驻服务模式）：本方法**不**释放 USB
         ——SET_IDLE 停流已在停止边界完成，"排空后是待命还是释放"由调用方在
         综合终态判定后交 :meth:`AcquisitionService.finish_task` 决定（R-A-01/
-        R-A-06/R-A-09）；子线程 join 语义与绝不 terminate 完全不变。
+        R-A-06/R-A-09）；子线程 join 语义（GNSS 有界总闸）与绝不 terminate
+        完全不变。
         """
         if consumer is not None:
             consumer.request_stop()
@@ -4110,9 +4824,23 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
                 self.status.emit("处理线程未在 3s 内退出，正在等待其结束...")
                 consumer.wait()
         if gnss_thread is not None:
-            if not gnss_thread.wait(3000):
-                self.status.emit("GNSS 线程未在 3s 内退出，正在等待其结束...")
-                gnss_thread.wait()
+            first_wait_ms = int(self.GNSS_SHUTDOWN_FIRST_WAIT_S * 1000)
+            extra_wait_ms = int(self.GNSS_SHUTDOWN_EXTRA_WAIT_S * 1000)
+            if not gnss_thread.wait(first_wait_ms):
+                self.status.emit(
+                    f"GNSS 线程未在 {self.GNSS_SHUTDOWN_FIRST_WAIT_S:g}s 内退出，正在等待其结束..."
+                )
+                if not gnss_thread.wait(extra_wait_ms):
+                    # 收尾总闸（有界放弃）：继续无限等待会让 worker 永不结束、
+                    # 状态机永久卡在"运行中"、所有新任务被拒。GNSS 不是数据链
+                    # 的一环，放弃它换回整条采集流水线。
+                    _ABANDONED_GNSS_THREADS.append(gnss_thread)
+                    _prune_abandoned_gnss_threads()
+                    self.status.emit(
+                        "GNSS 线程收尾总闸触发（有界等待耗尽，串口驱动疑似挂起）："
+                        "放弃等待并继续收尾，任务正常结束；遗留线程绝不 terminate，"
+                        "自然退出后自动消亡，其串口由下一任务的新线程重试接管"
+                    )
 
 
 def _apply_trace_to_ui(window, index, freq, display, time_ns, trace_by_channel, fix, cfg) -> str:
@@ -4199,6 +4927,7 @@ class AirSettingsDialog(QtWidgets.QDialog):
         output.addWidget(self._window.output_dir, 0, 1)
         output.addWidget(self._window.browse_out, 0, 2)
         output.addWidget(self._window.autosave, 1, 0, 1, 3)
+        output.addWidget(self._window.save_csv_box, 2, 0, 1, 3)
         output.setColumnStretch(1, 1)
         diag_group = QtWidgets.QGroupBox("诊断")
         diag_group.setObjectName("settings_diagnostics_group")
@@ -4449,9 +5178,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.browse_out = QtWidgets.QPushButton("输出目录")
         self.browse_out.setObjectName("browse_output_button")
         self.browse_out.clicked.connect(self.choose_output)
-        self.autosave = QtWidgets.QCheckBox("自动保存 CSV/NPZ")
+        self.autosave = QtWidgets.QCheckBox("自动保存数据 (NPZ+JSON)")
         self.autosave.setObjectName("autosave_input")
         self.autosave.setChecked(True)
+        self.save_csv_box = QtWidgets.QCheckBox("生成 CSV 明文表格")
+        self.save_csv_box.setObjectName("save_csv_input")
+        self.save_csv_box.setChecked(False)
+        self.save_csv_box.setToolTip("默认关闭：关闭可显著提高计算棒采集流畅度（数据仍完整保存至 NPZ 和 JSON）")
         # ---- 任务命令与节奏（保留清单）----
         # 第1轮检查点C：默认"无采集时间间隔"（interval_s=0 = 每个完整Sweep）[冻结]。
         self.interval = self._spin(0.0, 0.0, 3600.0, 2)
@@ -4523,7 +5256,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.remote_port.setMaximumWidth(90)
         self.remote_connect = QtWidgets.QPushButton("Connect")
         self.remote_connect.setObjectName("remote_connect_button")
-        self.remote_connect.clicked.connect(self.connect_remote_sender)
+        self.remote_connect.clicked.connect(self.toggle_remote_sender)
         self.air_settings_button = QtWidgets.QPushButton("设置…")
         self.air_settings_button.setObjectName("air_settings_button")
         self.air_settings_button.setMinimumHeight(32)
@@ -4823,21 +5556,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(text)
 
     def refresh_ports(self) -> None:
+        # 首项"不使用 GNSS"（data=""，2026-09-30 现场回归）：无 GNSS 硬件时
+        # 默认不启动 GNSS 线程。此前实现会自动选中扫描到的串口（优先 COM3），
+        # 无硬件时选中的是别的设备，任务一启动就拉起 GNSS 线程并被其卡死。
+        # 现在**绝不自动选中**：要用 GNSS 必须由操作员显式选择串口；刷新时
+        # 若先前选择的串口仍在扫描结果中则保持。
+        previous = self.port_combo.currentData() or ""
         self.port_combo.clear()
+        self.port_combo.addItem("不使用 GNSS（不启动 GNSS 线程）", "")
         ports = list(list_ports.comports())
         for port in ports:
             self.port_combo.addItem(f"{port.device} - {port.description}", port.device)
-        com3 = self.port_combo.findData("COM3")
-        if com3 >= 0:
-            self.port_combo.setCurrentIndex(com3)
+        if previous:
+            kept = self.port_combo.findData(previous)
+            if kept >= 0:
+                self.port_combo.setCurrentIndex(kept)
+                self.log(f"GNSS 串口保持: {previous}")
         self.log(f"发现 {len(ports)} 个串口")
 
     def selected_port(self) -> str:
         return self.port_combo.currentData() or ""
 
     def test_gnss(self) -> None:
+        port = self.selected_port()
+        if not port:
+            self.log("GNSS 测试跳过：未选择 GNSS 串口（当前=不使用 GNSS）")
+            return
         try:
-            reader = GnssReader(self.selected_port(), int(self.baud_combo.currentText()))
+            reader = GnssReader(port, int(self.baud_combo.currentText()))
             fix = reader.read_gga()
             reader.close()
             self.log(f"GNSS: {fix.raw}")
@@ -5070,9 +5816,20 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> tuple[OSLCalibration | None, OSLCalibration | None, CalibrationMeasurement | None]:
         calibration_p1 = self.session_calibration
         calibration_p2 = self.session_calibration_p2
+        through = self.through_measurement
         if calibration_p1 is None and self.cal_path.text().strip():
-            calibration_p1 = OSLCalibration.from_file(self.cal_path.text().strip())
-        return calibration_p1, calibration_p2, self.through_measurement
+            cal_file = self.cal_path.text().strip()
+            if os.path.exists(cal_file):
+                try:
+                    p1, p2, th = OSLCalibration.load_components(cal_file)
+                    calibration_p1 = p1
+                    if calibration_p2 is None:
+                        calibration_p2 = p2
+                    if through is None:
+                        through = th
+                except Exception as exc:
+                    self.log(f"加载生效校准文件失败: {cal_file}: {exc}")
+        return calibration_p1, calibration_p2, through
 
     def apply_active_calibration(self, frequency_hz: np.ndarray, raw_sparams: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         calibration_p1, calibration_p2, through_measurement = self.active_calibration_components()
@@ -5163,7 +5920,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for widget in (
             self.start_mhz, self.stop_mhz, self.points, self.ifbw, self.power,
             self.dwell, self.ifft_points, self.time_window, self.dewow_window,
-            self.dewow_enabled, self.interval, self.count, self.autosave,
+            self.dewow_enabled, self.interval, self.count, self.autosave, self.save_csv_box,
             self.continuous_enabled, self.cal_path, self.cal_mode,
             self.test_gnss_btn, self.test_vna_btn, self.test_sweep_btn,
             self.device_source_combo,
@@ -5178,14 +5935,21 @@ class MainWindow(QtWidgets.QMainWindow):
             button.setEnabled(not locked)
 
     def start_acquisition(self, single: bool = False) -> None:
-        # 只要 self.worker 存在（无论是否仍在运行）就不启动另一个任务，避免旧
-        # worker 的 finished_run queued slot 尚未处理时清除新 worker。
+        # 防呆自愈加固：如果上次的 worker 还在
         if self.worker is not None:
             if self.worker.isRunning():
-                self.log("采集已经在运行")
-            else:
-                self.log("上一任务正在完成清理，请稍候")
-            return
+                # 如果旧 worker 正在进行最后的排空/退出收尾，有界等待最多 500ms
+                if not self.worker.wait(500):
+                    self.log("采集已经在运行")
+                    return
+            # 如果真实 QThread 已经结束运行，立即主动执行收尾，避免等待 Qt 消息循环队列延迟
+            if not self.worker.isRunning():
+                # 区分生产环境真实 QThread 与单元测试注入的 _FakeWorker（非 QThread 且未启动线程）：
+                if isinstance(self.worker, QtCore.QThread):
+                    self.on_worker_finished()
+                else:
+                    self.log("上一任务正在完成清理，请稍候")
+                    return
         # 第2轮 R-C-14：校准会话与采集互斥（同一判据、同一函数；服务 start_task
         # 的自有拒绝互为纵深）。
         conflict = self._calibration_acquisition_conflict("启动采集")
@@ -5243,6 +6007,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_continuous_acquisition(self, cfg: SweepConfig, single: bool) -> None:
         self.log(f"连续采集启动: 设备来源 {DEVICE_SOURCE_LABELS[self._device_source]}")
+        # 2026-09-30：GNSS 启用状态显式入日志——下拉框"不使用 GNSS"（空串）
+        # 时 worker.run 的 `if self.gnss_port:` 守卫不启动 GNSS 线程。
+        gnss_port = self.selected_port()
+        if gnss_port:
+            self.log(f"GNSS 串口: {gnss_port}")
+        else:
+            self.log("GNSS: 未启用（未选择 GNSS 串口，不启动 GNSS 线程）")
         # 第2轮常驻服务：任务经 service.start_task 统一入口创建（R-A-05）。
         # UI 侧仍以工厂构造 worker，保留 ContinuousAcquisitionWorker 的类级
         # patch 语义（既有测试用 unittest.mock.patch.object(air, ...) 替换）。
@@ -5251,7 +6022,7 @@ class MainWindow(QtWidgets.QMainWindow):
             interval_s=self.interval.value(),
             out_dir=Path(self.output_dir.text()),
             count=1 if single else self.count.value(),
-            gnss_port=self.selected_port(),
+            gnss_port=gnss_port,
             baud=int(self.baud_combo.currentText()),
             calibration_path=self.cal_path.text().strip(),
             session_calibration=self.session_calibration,
@@ -5260,6 +6031,7 @@ class MainWindow(QtWidgets.QMainWindow):
             background_frequency_hz=self.background_frequency_hz,
             background=self.background,
             autosave=self.autosave.isChecked(),
+            save_csv=self.save_csv_box.isChecked(),
             remote_sender=self.remote_sender,
             **(
                 # R-C-16：激活校准后任务 spec 携带 calibration_id（经 engA 类域
@@ -5287,6 +6059,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 background_frequency_hz=task_spec.background_frequency_hz,
                 background=task_spec.background,
                 autosave=task_spec.autosave,
+                save_csv=task_spec.save_csv,
                 remote_sender=task_spec.remote_sender,
                 service=self.acquisition_service,
                 task_spec=task_spec,
@@ -5379,16 +6152,24 @@ class MainWindow(QtWidgets.QMainWindow):
             f"gnss age={age_text}"
         )
 
+    def toggle_remote_sender(self) -> None:
+        """UI 按钮专用的连接/断开切换逻辑：
+        未连接时调用 connect_remote_sender()；
+        已连接时点击触发 disconnect_remote_sender()。
+        """
+        if self.remote_sender is not None:
+            self.disconnect_remote_sender()
+        else:
+            self.connect_remote_sender()
+
     def connect_remote_sender(self) -> None:
         if self._closing:
             return
         if not hasattr(self, "remote_enable") or not self.remote_enable.isChecked():
             return
         if self.remote_sender is not None:
-            # 第5轮修复（真机反馈）：Connect 按钮为连接/断开切换——已连接时
-            # 点击=断开，用户才能修改 IP 后重连（旧实现只会提示已运行，
-            # IP 一旦创建发送器就被钉死到重启）。
-            self.disconnect_remote_sender()
+            # 内部调用保护（如 start_acquisition 或定时器触发）：
+            # 若已经连接，绝对不可断开，直接保持并返回！
             return
         host = self.remote_host.text().strip()
         if not host:
@@ -5641,7 +6422,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if action == "cal_begin":
             self._begin_calibration_session(params)
         elif action == "cal_capture":
-            self._command_calibration_capture(cal_id, str(params.get("step") or ""))
+            step = str(params.get("step") or "")
+            recapture = bool(params.get("recapture", False))
+            request_id = str(params.get("request_id") or "")
+            self._command_calibration_capture(cal_id, step, recapture=recapture, request_id=request_id)
         elif action == "cal_finish":
             self._command_calibration_finish(cal_id)
         elif action == "cal_activate":
@@ -5650,6 +6434,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._command_calibration_cancel(cal_id, str(params.get("reason") or "地面请求取消"))
         elif action == "cal_status":
             self._command_calibration_status(cal_id)
+        elif action == "cal_import_file":
+            self._command_calibration_import_file(params)
+        elif action == "cal_export_file":
+            self._command_calibration_export_file(params)
+        elif action == "cal_query_active":
+            self._command_calibration_query_active(params)
+        elif action == "cal_clear_active":
+            self._command_calibration_clear_active(params)
 
     def _calibration_config_from_snapshot(self, snapshot: dict[str, object]) -> SweepConfig:
         """由地面 cal_begin 的 SweepConfig 快照构建扫频配置（缺省回退当前 UI 值）。"""
@@ -5740,46 +6532,90 @@ class MainWindow(QtWidgets.QMainWindow):
             repeats=repeats,
         )
 
-    def _command_calibration_capture(self, cal_id: str, step_name: str) -> None:
+    def _command_calibration_capture(
+        self, cal_id: str, step_name: str, recapture: bool = False, request_id: str = ""
+    ) -> None:
         with self._calibration_lock:
             session = self._calibration_session
             if session is None or session.cal_id != cal_id:
                 self._send_calibration_message(
-                    "calibration_result", cal_id, status="rejected",
+                    "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
                     reason="无进行中的校准会话或 cal_id 不匹配（防跨会话错配）",
                 )
                 return
-            if session.state not in (CalibrationSession.STATE_PLANNED, CalibrationSession.STATE_IN_PROGRESS):
+            if session.state in (CalibrationSession.STATE_ACTIVATED, CalibrationSession.STATE_FAILED, CalibrationSession.STATE_CANCELLED):
                 self._send_calibration_message(
-                    "calibration_result", cal_id, status="rejected",
+                    "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
                     reason=f"会话状态 {session.state} 不允许采集",
                 )
                 return
-            pending = session.next_pending_step()
-            if pending is None or pending.name != step_name:
-                self._send_calibration_message(
-                    "calibration_result", cal_id, status="rejected",
-                    reason=f"下一待采步骤为 {pending.name if pending else '无'}，收到 {step_name!r}",
-                )
-                return
+            if recapture:
+                progress = session._progress.get(step_name)
+                if progress is None:
+                    self._send_calibration_message(
+                        "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
+                        reason=f"计划中不存在步骤 {step_name!r}",
+                    )
+                    return
+                if progress.state == "done":
+                    pass
+                elif progress.state in ("pending", "capturing"):
+                    pending = session.next_pending_step()
+                    if pending is None or pending.name != step_name:
+                        self._send_calibration_message(
+                            "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
+                            reason=f"步骤 {step_name!r} 尚未进行首次采集，不可重采（下一待采步骤为 {pending.name if pending else '无'}）",
+                        )
+                        return
+                else:
+                    self._send_calibration_message(
+                        "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
+                        reason=f"步骤 {step_name!r} 处于终态，无法重采",
+                    )
+                    return
+            else:
+                progress = session._progress.get(step_name)
+                if progress and progress.state == "done":
+                    self._send_calibration_message(
+                        "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
+                        reason=f"步骤 {step_name!r} 已完成，重采需指定 recapture=True",
+                    )
+                    return
+                if session.state == CalibrationSession.STATE_SOLVED:
+                    self._send_calibration_message(
+                        "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
+                        reason="所有步骤已解算，如需重新采集请指定 recapture=True",
+                    )
+                    return
+                pending = session.next_pending_step()
+                if pending is None or pending.name != step_name:
+                    self._send_calibration_message(
+                        "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
+                        reason=f"下一待采步骤为 {pending.name if pending else '无'}，收到 {step_name!r}",
+                    )
+                    return
             if self._calibration_thread is not None and self._calibration_thread.is_alive():
                 self._send_calibration_message(
-                    "calibration_result", cal_id, status="rejected",
+                    "calibration_result", cal_id, status="rejected", step=step_name, request_id=request_id,
                     reason="上一步骤采集仍在进行",
                 )
                 return
             thread = threading.Thread(
                 target=self._calibration_capture_driver,
                 args=(session, step_name),
+                kwargs={"recapture": recapture, "request_id": request_id},
                 name=f"uav-gpr-cal-capture-{step_name}",
                 daemon=True,
             )
             self._calibration_thread = thread
-        self.log(f"校准步骤开始采集: cal_id={cal_id} step={step_name}")
+        self.log(f"校准步骤开始采集: cal_id={cal_id} step={step_name} (recapture={recapture})")
         thread.start()
 
-    def _calibration_capture_driver(self, session: CalibrationSession, step_name: str) -> None:
+    def _calibration_capture_driver(
+        self, session: CalibrationSession, step_name: str, recapture: bool = False, request_id: str = ""
+    ) -> None:
         """校准采集驱动线程：执行一个步骤的 repeats 条采集（会话状态机内）。"""
+        success = False
         try:
             step = session.plan.step(step_name)
 
@@ -5796,10 +6632,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     channel=step.channel,
                     points=int(frequency.size),
                     payload_format="npz",
+                    request_id=request_id,
                 )
 
-            session.capture(step_name, on_capture=_on_capture)
+            session.capture(step_name, recapture=recapture, on_capture=_on_capture)
             self.log(f"校准步骤采集完成: cal_id={session.cal_id} step={step_name}")
+            success = True
         except Exception as exc:  # noqa: BLE001 - 步骤失败：会话已判 failed
             self.log(f"校准步骤采集失败: cal_id={session.cal_id} step={step_name}: {exc}")
             self._send_calibration_message(
@@ -5807,6 +6645,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 session.cal_id,
                 status="failed",
                 step=step_name,
+                request_id=request_id,
                 reason=str(exc),
             )
         finally:
@@ -5815,9 +6654,92 @@ class MainWindow(QtWidgets.QMainWindow):
             proxy = session.capturer
             close = getattr(proxy, "close_current", None)
             if callable(close):
-                close(step_name)
+                try:
+                    close(step_name)
+                except Exception:
+                    pass
             with self._calibration_lock:
                 self._calibration_thread = None
+
+            if success:
+                steps_done = sum(1 for p in session._progress.values() if p.state == "done")
+                next_step = session.next_pending_step().name if session.next_pending_step() else None
+                self._send_calibration_message(
+                    "calibration_result",
+                    session.cal_id,
+                    status="step_done",
+                    step=step_name,
+                    request_id=request_id,
+                    next_step=next_step,
+                    steps_done=steps_done,
+                    total_steps=len(session.plan.steps),
+                )
+
+    def _command_calibration_import_file(self, params: dict[str, object]) -> None:
+        filename = str(params.get("filename") or "").strip()
+        content = params.get("content")
+        activate = bool(params.get("activate", True))
+        request_id = str(params.get("request_id") or "").strip()
+        if not filename or not content:
+            self.log("cal_import_file 缺少 filename 或 content")
+            return
+        valid, error_msg, parsed_data = validate_calibration_content(content)
+        if not valid:
+            self.log(f"cal_import_file 校验失败: {error_msg}")
+            return
+        try:
+            p1_cal, p2_cal, through_meas = OSLCalibration.load_components(parsed_data)
+        except Exception as exc:
+            self.log(f"cal_import_file 加载失败: {exc}")
+            return
+        imports_dir = Path(self.output_dir.text()) / "_calibration" / "imports"
+        try:
+            imports_dir.mkdir(parents=True, exist_ok=True)
+            target = imports_dir / filename
+            tmp = imports_dir / f".{filename}.tmp"
+            content_str = json.dumps(parsed_data, ensure_ascii=False, indent=2) if isinstance(content, dict) else str(content)
+            tmp.write_text(content_str, encoding="utf-8")
+            os.replace(tmp, target)
+        except OSError as exc:
+            self.log(f"cal_import_file 写盘失败: {exc}")
+            return
+        if activate:
+            with self._calibration_lock:
+                self.session_calibration = p1_cal
+                self.session_calibration_p2 = p2_cal
+                self.through_measurement = through_meas
+                self.cal_path.setText(str(target))
+                if self.background is not None:
+                    self.background = None
+                    self.background_frequency_hz = None
+                    self.bg_label.setText("未采集背景（OSL已更新）")
+                    self.log("新 OSL 校准已导入生效：先前的背景校准已显式失效")
+                self.update_calibration_status(f"校准文件已导入并生效: {filename}")
+
+    def _command_calibration_export_file(self, params: dict[str, object]) -> None:
+        # Qt GUI 下主要供协议对齐
+        pass
+
+    def _command_calibration_query_active(self, params: dict[str, object]) -> None:
+        # Qt GUI 下主要供协议对齐
+        pass
+
+    def _command_calibration_clear_active(self, params: dict[str, object]) -> None:
+        target = str(params.get("target") or "all").lower()
+        with self._calibration_lock:
+            if target in ("all", "osl"):
+                self.session_calibration = None
+                self.session_calibration_p2 = None
+                self.through_measurement = None
+                self.cal_path.setText("")
+                self.background = None
+                self.background_frequency_hz = None
+                self.bg_label.setText("未采集背景")
+                self.update_calibration_status("未校准")
+            elif target == "background":
+                self.background = None
+                self.background_frequency_hz = None
+                self.bg_label.setText("未采集背景")
 
     def _command_calibration_finish(self, cal_id: str) -> None:
         with self._calibration_lock:
@@ -6023,12 +6945,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def stop_acquisition(self) -> None:
         # 第2轮 R-A-05：操作员停止与地面端 stop 命令、队列硬上限受控停止共用
         # 服务统一入口（同一 reason 记录、同一状态迁移、同一状态消息序列）。
-        if self.acquisition_service.request_stop("操作员停止按钮（空中端）"):
+        service_stopped = self.acquisition_service.request_stop("操作员停止按钮（空中端）")
+        if self.worker is not None:
+            # 双重保护：无论服务层是否处理，明确对当前 worker 发出停止信号，避免 worker 遗漏停止
+            try:
+                self.worker.stop()
+            except Exception:
+                pass
+        if service_stopped or self.worker is not None:
             self.log("正在停止采集...")
             return
-        if self.worker:
-            self.worker.stop()
-            self.log("正在停止采集...")
 
     def on_worker_finished(self) -> None:
         # 只接受当前 self.worker 的 finished_run；旧 worker / stale sender 的完成

@@ -403,9 +403,9 @@ class RemoteConnectToggleTests(unittest.TestCase):
                 self.stop = MagicMock(return_value=True)
 
         with unittest.mock.patch.object(air, "RemoteSender", FakeSender):
-            # 1. 填入第一版地址并连接：IP/端口锁定、按钮变"断开"
+            # 1. 填入第一版地址并点击连接按钮：IP/端口锁定、按钮变"断开"
             self.window.remote_host.setText("192.168.144.99")
-            self.window.connect_remote_sender()
+            self.window.remote_connect.click()
             self.assertIsNotNone(self.window.remote_sender)
             first_sender = self.window.remote_sender
             self.assertFalse(self.window.remote_host.isEnabled(), "连接中必须锁定 IP 输入")
@@ -413,16 +413,22 @@ class RemoteConnectToggleTests(unittest.TestCase):
             self.assertIn("断开", self.window.remote_connect.text())
             self.assertEqual(constructed_hosts, ["192.168.144.99"])
 
-            # 2. 再点一次 = 断开：stop(drain=False) 被调、sender 置空、输入解锁
+            # 2. 内部再次调用 connect_remote_sender（模拟 start_acquisition 时的调用）：
+            # 必须保持连接，绝对不可误断开！
             self.window.connect_remote_sender()
+            self.assertIs(self.window.remote_sender, first_sender, "内部再次调用 connect_remote_sender 绝不可断开已有连接")
+            first_sender.stop.assert_not_called()
+
+            # 3. 再次点击 UI 按钮 = 主动断开：stop(drain=False) 被调、sender 置空、输入解锁
+            self.window.remote_connect.click()
             self.assertIsNone(self.window.remote_sender)
             first_sender.stop.assert_called_with(timeout_ms=2000, drain=False)
             self.assertTrue(self.window.remote_host.isEnabled(), "断开后必须可编辑 IP")
             self.assertEqual(self.window.remote_connect.text(), "Connect")
 
-            # 3. 改成新地址重连：新地址真实生效（旧实现被钉死无法做到）
+            # 4. 改成新地址重连：新地址真实生效（旧实现被钉死无法做到）
             self.window.remote_host.setText("10.0.0.5")
-            self.window.connect_remote_sender()
+            self.window.remote_connect.click()
             self.assertEqual(constructed_hosts[-1], "10.0.0.5", "断开后必须能连到新 IP")
 
 

@@ -17,8 +17,8 @@ Validated HM30 IP plan:
 ```text
 HM30 air unit:       192.168.144.11
 HM30 ground unit:    192.168.144.12
-Air-side PC:         192.168.144.100
-Ground-side PC:      192.168.144.111
+Air-side PC:         192.168.144.21
+Ground-side PC:      192.168.144.20
 Subnet mask:         255.255.255.0
 Telemetry TCP port:  8765
 ```

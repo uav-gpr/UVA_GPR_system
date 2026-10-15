@@ -107,7 +107,7 @@ from librevna.librevna_protocol import (
 )
 from librevna.librevna_transport import LibreVnaUsbTransport
 
-import uav_gpr_qt as U  # production pipeline functions (imports PyQt5, headless-safe)
+import air_core as U  # production pipeline functions (imports PyQt5, headless-safe)
 
 DEFAULT_POINTS = 201
 DEFAULT_START_MHZ = 400.0

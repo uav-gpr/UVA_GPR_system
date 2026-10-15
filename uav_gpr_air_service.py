@@ -3,7 +3,7 @@
 
 设计要点（与计划/契约逐条对应）：
 
-- **复用而非第二套**：采集/发送/补传核心全部直接 import ``uav_gpr_qt.py``
+- **复用而非第二套**：采集/发送/补传核心全部直接 import ``air_core.py``（2026-10-15 前名为 ``uav_gpr_qt.py``）
   既有零件（AcquisitionService、ContinuousAcquisitionWorker、AcquisitionWorker、
   RemoteSender、GnssReader 等），本文件只做无界面接线（QCoreApplication +
   offscreen），绝不复制采集/发送/补传逻辑；
@@ -57,7 +57,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import uav_gpr_qt as air  # noqa: E402  （既有核心零件唯一来源，禁止复制第二套）
+import air_core as air  # noqa: E402  （既有核心零件唯一来源，禁止复制第二套）
 from air_gnss import AirGnssMonitor
 from disk_outbox import (  # noqa: E402
     AIR_TASK_RUN_ID_RE,

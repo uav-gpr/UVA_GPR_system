@@ -36,7 +36,7 @@ else:
     GROUND_IMPORT_ERROR = None
 
 try:
-    import uav_gpr_qt as air
+    import air_core as air
 except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
     air = None
     AIR_IMPORT_ERROR = exc
@@ -716,9 +716,15 @@ class GroundWindowStatusGuardTests(unittest.TestCase):
         self.assertIn("采集中", self.window.acquisition_status_label.text())
 
 
-@unittest.skipIf(air is None or ground is None, f"deps unavailable: {AIR_IMPORT_ERROR} / {GROUND_IMPORT_ERROR}")
-class AirCalibrationCommandTests(unittest.TestCase):
-    """R-C-11/12/14/16/18：空中端 cal_* 命令链（fake capturer，offscreen）。"""
+class GroundCalibrationDialogTests(unittest.TestCase):
+    """R-C-11：地面站校准对话框（纯地面端）。
+
+    2026-10-15 重构：原 AirCalibrationCommandTests 以空中端旧 GUI MainWindow 驱动
+    cal_* 命令链；旧 GUI 已退役，空中端 cal_* 命令链改由黑匣子服务测试覆盖
+    （test_round7_air_service / test_round8_calibration_core /
+    test_round8_calibration_end_to_end）。这里只保留与空中端 GUI 无关的两条
+    地面对话框用例。
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -726,243 +732,9 @@ class AirCalibrationCommandTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.window = air.MainWindow()
-        self.window.remote_enable.setChecked(False)
-        self.window.output_dir.setText(self.tmp.name)
-        self.sent: list[tuple[str, bytes]] = []
-
-        class _FakeSender:
-            def __init__(self):
-                self.headers: list[dict] = []
-                self.payloads: list[bytes] = []
-                #: 消费者→发送边界的 acquisition metadata（联调断言用，t12 R-C-16）。
-                self.trace_acquisitions: list[dict | None] = []
-
-            def enqueue_calibration(self, header, payload=b""):
-                self.headers.append(dict(header))
-                self.payloads.append(payload)
-
-            def enqueue_trace(self, *args, **kwargs):
-                self.trace_acquisitions.append(kwargs.get("acquisition"))
-
-            def enqueue_status(self, *args, **kwargs):
-                pass
-
-            def stop(self, timeout_ms: int = 3000, *, drain: bool = True) -> bool:
-                return True
-
-            def outstanding_count(self) -> int:
-                return 0
-
-        sender = _FakeSender()
-        self.sender = sender
-        self.window.remote_sender = sender  # type: ignore[assignment]
-        # fake capturer：按步骤返回确定性正演测量（patch 掉真实服务短任务）。
-        self.capturer, self.frequency, self.terms_p1, self.terms_p2 = _fake_capturer_for_session(9)
-
-        class _FakeStepCapturer:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                self.closed = False
-
-            def capture_one(self, step, index):
-                return self.capturer.capture_one(step, index)
-
-            def close(self):
-                self.closed = True
-
-        self._fake_step_capturer = _FakeStepCapturer
-        _FakeStepCapturer.capturer = self.capturer
-        self._patcher = unittest.mock.patch.object(air, "ServiceStepCapturer", _FakeStepCapturer)
-        self._patcher.start()
 
     def tearDown(self) -> None:
-        self._patcher.stop()
-        worker = self.window.worker
-        if worker is not None and getattr(worker, "isRunning", lambda: False)():
-            worker.stop()
-            worker.wait(5000)
-        self.window.close()
-        self.window.deleteLater()
-        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
-        self.app.processEvents()
         self.tmp.cleanup()
-
-    def _results(self, status: str | None = None) -> list[dict]:
-        headers = self.sender.headers
-        if status is not None:
-            headers = [h for h in headers if h.get("status") == status]
-        return headers
-
-    def _begin(self, cal_id: str = "cal_20260904_120000", mode: str = "osl") -> None:
-        self.window.handle_remote_command("cal_begin", {
-            "cal_id": cal_id, "mode": mode, "repeats": 2,
-            "config": {"start_mhz": 400.0, "stop_mhz": 4000.0, "points": 9,
-                       "ifbw_hz": 10000, "power_dbm": -20.0, "dwell_us": 0},
-        })
-
-    def _capture_all_steps(self, cal_id: str) -> None:
-        for step in cal.OSL_STEP_NAMES:
-            self.window.handle_remote_command("cal_capture", {"cal_id": cal_id, "step": step})
-            self.assertTrue(_wait_until(lambda: self.window._calibration_thread is None, 10.0))
-
-    def test_cal_begin_rejected_while_acquiring(self) -> None:
-        """R-C-14：采集任务运行中 cal_* 一律拒绝并回传可读原因。"""
-        worker = unittest.mock.Mock()
-        worker.isRunning.return_value = True
-        self.window.worker = worker
-        self._begin("cal_rejected")
-        results = self._results("rejected")
-        self.assertEqual(len(results), 1)
-        self.assertIn("采集任务运行中", str(results[0].get("reason")))
-        self.assertIsNone(self.window._calibration_session)
-
-    def test_full_osl_calibration_flow_via_commands(self) -> None:
-        """R-C-05/12/15/16：cal_begin→capture×6→finish→activate 全链（fake capturer）。"""
-        cal_id = "cal_20260904_120000"
-        self._begin(cal_id)
-        self.assertIsNotNone(self.window._calibration_session)
-        planned = self._results("planned")
-        self.assertEqual(len(planned), 1)
-        self.assertEqual(planned[0].get("mode"), "osl")
-        self.assertEqual(len(planned[0].get("steps")), 6)
-        self._capture_all_steps(cal_id)
-        # 逐 sweep 回程（calibration_capture）：6 步 × 2 条。
-        self.assertEqual(
-            len([h for h in self.sender.headers if h.get("type") == "calibration_capture"]), 12
-        )
-        self.window.handle_remote_command("cal_finish", {"cal_id": cal_id})
-        self.assertEqual(self.window._calibration_session.state, "solved")
-        # 质量回程逐步真实（R-C-08）+ 结果摘要（R-C-11）。
-        quality = [h for h in self.sender.headers if h.get("type") == "calibration_quality"]
-        self.assertEqual(len(quality), 6)
-        for header in quality:
-            self.assertIsNotNone(header.get("sample_count"))
-        solved = self._results("solved")
-        self.assertEqual(len(solved), 1)
-        self.assertEqual(solved[0].get("format"), "uav_gpr_solt_calibration_v2")
-        # 落盘：capture_*.npz + 校准 JSON；无 trace_ 前缀（R-C-15）。
-        cal_dir = Path(self.tmp.name) / "_calibration" / cal_id
-        npz_files = list(cal_dir.glob("*.npz"))
-        self.assertEqual(len(npz_files), 12)
-        self.assertTrue(all(p.name.startswith("capture_") for p in npz_files))
-        self.assertEqual(list(cal_dir.glob("trace_*")), [])
-        self.assertTrue((cal_dir / f"{cal_id}.json").exists())
-        # 激活：生效组件写回 MainWindow（R-C-16）。
-        self.window.handle_remote_command("cal_activate", {"cal_id": cal_id})
-        self.assertEqual(self.window.active_calibration_id, cal_id)
-        self.assertIsNotNone(self.window.session_calibration)
-        self.assertIsNotNone(self.window.session_calibration_p2)
-        self.assertEqual(len(self.window.session_calibration.points), 9)
-        activated = self._results("activated")
-        self.assertEqual(len(activated), 1)
-        # 激活后 trace 级证据：开路标准件被校正到理想值（校正链路真实生效）。
-        calibration_p1, _p2, _through = self.window.active_calibration_components()
-        corrected_open = calibration_p1.correct(float(self.frequency[0]), complex(self.capturer.calls and 0) or 0)
-        # 直接用正演开路测量验证校正结果 ≈ 1：
-        open_mean = self.window._calibration_session.step_means()["P1_Open"][0]
-        corrected = np.array([
-            calibration_p1.correct(float(f), complex(v)) for f, v in zip(self.frequency, open_mean)
-        ])
-        np.testing.assert_allclose(corrected, np.ones(len(self.frequency)), rtol=1e-7)
-        _ = corrected_open
-        # 地面可查询当前生效校准摘要（R-C-16）。
-        self.sender.headers.clear()
-        self.window.handle_remote_command("cal_status", {"cal_id": "query"})
-        status_results = self._results("active")
-        self.assertEqual(len(status_results), 1)
-        self.assertEqual(status_results[0].get("calibration_id"), cal_id)
-
-    def test_activated_calibration_id_flows_into_new_trace_metadata(self) -> None:
-        """R-C-16 联调（t12）：激活校准后新任务的 trace 携带 acquisition.calibration_id。
-
-        双断言：①消费者→发送边界的 acquisition dict；
-        ②autosave 存盘 NPZ 的 acquisition JSON。
-        engA 四行透传（spec→SelectedSweep→_acquisition_metadata，条件写法与
-        task_seq 同款）落地后，t7 的 ``__dataclass_fields__`` 探测分支恒真，
-        spec 真实携带 ``active_calibration_id`` —— 本测试不需要任何额外生产
-        代码。空串不写字段（第 1 轮 acquisition 键集合逐字不变，R-X-02）。
-        """
-        from librevna.librevna_continuous import PersistentLibreVnaBackend
-        from tests.test_round2_air_ui_compact import _FlowTransport
-
-        cal_id = "cal_meta"
-        self._begin(cal_id)
-        self._capture_all_steps(cal_id)
-        self.window.handle_remote_command("cal_finish", {"cal_id": cal_id})
-        self.window.handle_remote_command("cal_activate", {"cal_id": cal_id})
-        self.assertEqual(self.window.active_calibration_id, cal_id)
-
-        # 激活会话已是 ACTIVATED（终态）：采集互斥解除，可启动新采集任务。
-        transport = _FlowTransport(5)
-        self.window.acquisition_service = air.AcquisitionService(
-            backend_factory=lambda: PersistentLibreVnaBackend(transport=transport)
-        )
-        self.window.continuous_enabled.setChecked(True)
-        self.window.count.setValue(1)
-        self.window.points.setValue(5)
-        self.window.start_mhz.setValue(400.0)
-        self.window.stop_mhz.setValue(440.0)
-        self.assertTrue(self.window.autosave.isChecked())  # NPZ 断言前提
-        self.window.start_acquisition()
-        self.assertTrue(_wait_until(
-            lambda: len(self.sender.trace_acquisitions) >= 1, 15.0
-        ), f"新任务 trace 未在时限内到达发送边界；日志尾={self.window.device_log.toPlainText()[-200:]!r}")
-        acquisition = self.sender.trace_acquisitions[0]
-        self.assertIsNotNone(acquisition)
-        # ① 发送边界：acquisition 嵌套 dict 携带激活校准身份。
-        self.assertEqual(acquisition.get("calibration_id"), cal_id)
-        # 有界收尾：等待任务排空（避免 teardown 与 USB 释放竞态）。
-        self.window.stop_acquisition()
-        self.assertTrue(_wait_until(
-            lambda: self.window.acquisition_service.state
-            in ("idle_waiting", "closed", "faulted"),
-            15.0,
-        ))
-        # ② 存盘 NPZ：acquisition JSON 同样携带 calibration_id（不进 framing 顶层）。
-        npz_files = sorted(Path(self.tmp.name).glob("trace_00001_*.npz"))
-        self.assertEqual(len(npz_files), 1)
-        with np.load(npz_files[0]) as data:
-            stored = json.loads(str(data["acquisition"]))
-        self.assertEqual(stored.get("calibration_id"), cal_id)
-
-    def test_cal_capture_wrong_step_rejected(self) -> None:
-        cal_id = "cal_order"
-        self._begin(cal_id)
-        self.window.handle_remote_command("cal_capture", {"cal_id": cal_id, "step": "P1_Short"})
-        rejected = self._results("rejected")
-        self.assertTrue(any("下一待采步骤" in str(h.get("reason")) for h in rejected))
-
-    def test_cal_cancel_invalidates_session(self) -> None:
-        """R-C-18：取消 → 会话作废；旧 cal_id 的后续命令被拒绝并记日志。"""
-        cal_id = "cal_cancel"
-        self._begin(cal_id)
-        self.window.handle_remote_command("cal_capture", {"cal_id": cal_id, "step": "P1_Open"})
-        self.assertTrue(_wait_until(lambda: self.window._calibration_thread is None, 10.0))
-        self.window.handle_remote_command("cal_cancel", {"cal_id": cal_id, "reason": "操作员取消"})
-        self.assertEqual(self._results("cancelled")[0].get("cal_id"), cal_id)
-        # capture 文件保留 + incomplete 标记。
-        cal_dir = Path(self.tmp.name) / "_calibration" / cal_id
-        self.assertEqual(len(list(cal_dir.glob("capture_*.npz"))), 2)
-        self.assertTrue((cal_dir / "incomplete.json").exists())
-        # 旧 cal_id 的 capture 被拒绝（防跨会话错配）。
-        self.sender.headers.clear()
-        self.window.handle_remote_command("cal_capture", {"cal_id": cal_id, "step": "P1_Short"})
-        rejected = self._results("rejected")
-        self.assertTrue(any("无匹配" in str(h.get("reason")) or "不匹配" in str(h.get("reason")) for h in rejected))
-
-    def test_remote_background_flow(self) -> None:
-        """§5.2/R-C-19：空采参考模式经同一命令链激活背景。"""
-        cal_id = "cal_bg"
-        self._begin(cal_id, mode="background")
-        self.window.handle_remote_command("cal_capture", {"cal_id": cal_id, "step": cal.BACKGROUND_STEP_NAME})
-        self.assertTrue(_wait_until(lambda: self.window._calibration_thread is None, 10.0))
-        self.window.handle_remote_command("cal_finish", {"cal_id": cal_id})
-        self.window.handle_remote_command("cal_activate", {"cal_id": cal_id})
-        self.assertIsNotNone(self.window.background)
-        self.assertIsNotNone(self.window.background_frequency_hz)
-        self.assertEqual(self.window.background.shape, (9,))
-        self.assertIn("空采背景已激活", self.window.device_log.toPlainText())
 
     def test_ground_dialog_disabled_when_not_connected(self) -> None:
         """R-C-11：未连接时"开始校准"禁用并明确显示未连接。"""

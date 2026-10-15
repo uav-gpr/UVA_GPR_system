@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 
 try:
-    import uav_gpr_qt as air
+    import air_core as air
 except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - environment dependent
     air = None
     IMPORT_ERROR = exc
@@ -231,9 +231,9 @@ class UavGprPipelineTests(unittest.TestCase):
 
         self.assertEqual(air.UI_CHANNELS, ("S11", "S22"))
         self.assertEqual(air.SweepConfig().dewow_window_ns, 4.0)
+        # 2026-10-15：空中端旧 GUI 已退役，源码检查只剩采集 worker 一处入口。
         source = inspect.getsource(air.AcquisitionWorker.run)
-        source += inspect.getsource(air.MainWindow.test_sweep_settings)
-        self.assertGreaterEqual(source.count("process_trace_pipeline"), 2)
+        self.assertGreaterEqual(source.count("process_trace_pipeline"), 1)
         self.assertIn("trace_by_channel, fix", source)
 
     def test_save_trace_rejects_missing_or_mismatched_channels(self) -> None:
@@ -252,61 +252,6 @@ class UavGprPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "trace_S22 length"):
                 air.save_trace(Path(directory), 2, self.cfg, self.frequency_hz, self.raw, display, time_ns, wrong_length, fix)
 
-    def test_telemetry_uses_trace_processing_config_after_ui_changes(self) -> None:
-        actual_cfg = air.SweepConfig(ifft_points=8, time_window_ns=8.0, dewow_window_ns=4.0)
-        changed_cfg = air.SweepConfig(ifft_points=16, time_window_ns=12.0, dewow_window_ns=8.0, bpf_rule="changed")
-        display = {name: values.copy() for name, values in self.raw.items()}
-        traces = {name: np.arange(3, dtype=float) for name in air.S_PARAMETERS}
-        fix = air.GgaFix(fix_quality=1)
-
-        class Curve:
-            def setData(self, *_args):
-                pass
-
-        class Label:
-            def setText(self, *_args):
-                pass
-
-        window = SimpleNamespace(
-            sparam_curves={name: Curve() for name in air.UI_CHANNELS},
-            ascan_curves={name: Curve() for name in air.UI_CHANNELS},
-            bscan={name: [] for name in air.UI_CHANNELS},
-            bscan_window_start=1,
-            bscan_follow_latest=True,
-            bscan_trace_count=lambda: max(len(values) for values in window.bscan.values()),
-            _append_bscan_trace=lambda *_args: True,
-            update_sparam_ranges=lambda *_args: None,
-            update_ascan_range=lambda *_args: None,
-            refresh_bscan_views=lambda: None,
-            last_info=Label(),
-            gnss_map=SimpleNamespace(update_fix=lambda **_kwargs: None),
-            remote_sender=air.RemoteSender("127.0.0.1", 1, "run-test", lambda _message: None),
-            config=lambda: changed_cfg,
-            log=lambda *_args: None,
-        )
-
-        air.MainWindow.on_trace(
-            window,
-            1,
-            self.frequency_hz,
-            self.raw,
-            display,
-            np.arange(3, dtype=float),
-            traces,
-            fix,
-            actual_cfg,
-            "",
-        )
-        header, payload = window.remote_sender.queue.get_nowait()
-        self.assertEqual(header["config"], air.asdict(actual_cfg))
-        self.assertEqual(header["processing"], air.processing_metadata(self.frequency_hz, actual_cfg))
-        self.assertEqual(header["protocol"], "uav-gpr-telemetry-v1")
-        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
-            self.assertEqual(json.loads(str(archive["config"].item())), air.asdict(actual_cfg))
-            self.assertEqual(
-                json.loads(str(archive["processing"].item())),
-                air.processing_metadata(self.frequency_hz, actual_cfg),
-            )
 
     def test_dewow_window_is_checked_against_available_ifft_time(self) -> None:
         cfg = air.SweepConfig(

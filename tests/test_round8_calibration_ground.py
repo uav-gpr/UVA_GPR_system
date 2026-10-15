@@ -30,7 +30,7 @@ os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
 from PySide6 import QtCore, QtWidgets, QtTest
 
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 
 
 class DummyReceiver(QtCore.QObject):

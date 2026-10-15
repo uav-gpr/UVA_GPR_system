@@ -56,7 +56,7 @@ import numpy as np
 import calibration_service as cal
 import uav_gpr_air_service as svc
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 from librevna.librevna_continuous import PersistentBackendSettings, PersistentLibreVnaBackend
 from librevna.simulated_transport import (
     SimulatedLibreVnaTransport,

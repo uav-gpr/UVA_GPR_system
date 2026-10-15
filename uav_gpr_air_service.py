@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import air_core as air  # noqa: E402  （既有核心零件唯一来源，禁止复制第二套）
 from air_gnss import AirGnssMonitor
+import calibration_guard  # noqa: E402  （校准与扫频参数是否对得上）
 from disk_outbox import (  # noqa: E402
     AIR_TASK_RUN_ID_RE,
     CALIBRATION_RUN_ID_RE,
@@ -619,6 +620,16 @@ class _BlackboxCalibrationCapturerProxy:
 # =========================================================================
 
 
+def _sweep_config_from_calibration_file(path: Path) -> dict[str, object] | None:
+    """读校准文件里记下的扫频参数（v2 文件的 ``sweep_config``；没有就返回 None）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    sweep = data.get("sweep_config") if isinstance(data, dict) else None
+    return dict(sweep) if isinstance(sweep, dict) else None
+
+
 class AirBlackboxService:
     """无界面黑匣子：自动连接 + 远程命令 + 采集编排 + 磁盘水位。"""
 
@@ -663,6 +674,10 @@ class AirBlackboxService:
         self.active_calibration_id: str | None = None
         self._active_osl_id: str | None = None
         self._active_calibration_path: Path | None = None
+        #: 生效校准"当时"的扫频参数（功率/带宽提醒用；可为 None）。
+        self._calibration_sweep_ref: dict[str, object] | None = None
+        #: 上次记录过的校准匹配状态（只在变化时写日志）。
+        self._last_calibration_fit_level = "ok"
         self._session_calibration = None
         self._session_calibration_p2 = None
         self._active_through = None
@@ -694,6 +709,7 @@ class AirBlackboxService:
                     self._active_calibration_path = cal_p
                     self.active_calibration_id = cal_p.stem
                     self._active_osl_id = cal_p.stem
+                    self._calibration_sweep_ref = _sweep_config_from_calibration_file(cal_p)
                     self._log(f"自启动恢复生效校准: {cal_p.name}")
                 except Exception as exc:
                     self._log(f"自启动加载生效校准失败（已回退未校准）: {cal_p}: {exc}")
@@ -869,6 +885,7 @@ class AirBlackboxService:
             "config": self._active_config_dict(),
             "active_config": self._active_config_dict(),
             "sweep": asdict(self._sweep),
+            "calibration_fit": self._calibration_fit().to_dict(),
             "service_state": self.acquisition.state,
             "engine": self.config.engine,
             "device_source": air.get_default_device_source(),
@@ -1013,6 +1030,7 @@ class AirBlackboxService:
             "state": self.acquisition.state,
             "run_id": self._active_run_id,
             "reason": None if started else "服务拒绝启动（详见空中端日志）",
+            "calibration_fit": self._calibration_fit().to_dict(),
         }
 
     def _cmd_single(self, params: dict) -> dict[str, object]:
@@ -1033,6 +1051,9 @@ class AirBlackboxService:
     def _cmd_set_params(self, params: dict) -> dict[str, object]:
         if self._is_acquiring():
             return {"ok": False, "error": "采集运行中不可修改配置"}
+        if self._calibration_session_open():
+            # 校准进行中改参数会让后续采集与这次校准对不上：直接拒绝。
+            return {"ok": False, "error": "校准进行中不可修改扫频参数（请先完成或取消校准）"}
         sweep = self._sweep
         try:
             start = float(params.get("start_mhz", sweep.start_mhz))
@@ -1088,7 +1109,14 @@ class AirBlackboxService:
             f"远程参数更新成功: {start:g}-{stop:g} MHz, {points} 点, IFBW={ifbw} Hz, "
             f"功率={power:g} dBm, interval={interval}s, count={count}"
         )
-        return {"ok": True, "sweep": asdict(self._sweep), "interval_s": interval, "count": count}
+        fit = self._calibration_fit(log_changes=True)
+        return {
+            "ok": True,
+            "sweep": asdict(self._sweep),
+            "interval_s": interval,
+            "count": count,
+            "calibration_fit": fit.to_dict(),
+        }
 
     # ---- 远程校准编排（cal_*：MainWindow 会话编排的无界面等价实现）----
     #
@@ -1176,6 +1204,76 @@ class AirBlackboxService:
         if isinstance(accepted, dict):
             return accepted
         return {"ok": bool(accepted)}
+
+    # ---- 校准与扫频参数匹配（改参数后提醒/停用校准）----
+
+    def _calibration_session_open(self) -> bool:
+        session = self._calibration_session
+        return session is not None and session.state in (
+            air.CalibrationSession.STATE_PLANNED,
+            air.CalibrationSession.STATE_IN_PROGRESS,
+            air.CalibrationSession.STATE_SOLVED,
+        )
+
+    def _calibration_fit(self, *, log_changes: bool = False) -> calibration_guard.CalibrationFit:
+        """当前扫频参数与生效校准是否对得上（见 calibration_guard）。"""
+        with self._calibration_lock:
+            osl_grids = [
+                calibration_guard.grid_from_osl(self._session_calibration),
+                calibration_guard.grid_from_osl(self._session_calibration_p2),
+                calibration_guard.grid_from_frequencies(
+                    getattr(self._active_through, "frequency_hz", None)
+                    if self._active_through is not None
+                    else None
+                ),
+            ]
+            background_grid = (
+                calibration_guard.grid_from_frequencies(self._background_frequency_hz)
+                if self._background is not None
+                else None
+            )
+            fit = calibration_guard.evaluate_calibration_fit(
+                self._sweep,
+                osl_grids=osl_grids,
+                background_grid=background_grid,
+                reference_sweep=self._calibration_sweep_ref,
+            )
+        if log_changes and fit.level != self._last_calibration_fit_level:
+            if fit.level == "ok":
+                self._log("扫频参数与生效校准重新一致：校准恢复使用")
+            else:
+                self._log(fit.message())
+        self._last_calibration_fit_level = fit.level
+        return fit
+
+    def _effective_calibration_components(self) -> dict[str, object]:
+        """采集任务实际使用的校准组件：失效的部分替换为"未校准"。"""
+        fit = self._calibration_fit(log_changes=True)
+        with self._calibration_lock:
+            components: dict[str, object] = {
+                "calibration_path": self._calibration_path,
+                "session_calibration": self._session_calibration,
+                "session_calibration_p2": self._session_calibration_p2,
+                "through_measurement": self._active_through,
+                "background_frequency_hz": self._background_frequency_hz,
+                "background": self._background,
+                "calibration_id": self.active_calibration_id or "",
+            }
+            if fit.osl_stale:
+                components.update(
+                    calibration_path="",
+                    session_calibration=None,
+                    session_calibration_p2=None,
+                    through_measurement=None,
+                    calibration_id="",
+                )
+            if fit.background_stale:
+                components.update(background_frequency_hz=None, background=None)
+                if fit.osl_stale or self._session_calibration is None:
+                    components["calibration_id"] = ""
+        if fit.stale:
+            self._log(f"{fit.message()}。本次采集中失效部分按未校准处理")
+        return components
 
     def _calibration_acquisition_conflict(self, action: str, cal_id: str = "") -> str | None:
         """校准/采集互斥判据（R-C-14：与 MainWindow 同规则无界面版）。"""
@@ -1393,6 +1491,8 @@ class AirBlackboxService:
                 cal_id_str = str(parsed_data.get("cal_id") or target_path.stem)
                 self.active_calibration_id = cal_id_str
                 self._active_osl_id = cal_id_str
+                sweep_ref = parsed_data.get("sweep_config") if isinstance(parsed_data, dict) else None
+                self._calibration_sweep_ref = dict(sweep_ref) if isinstance(sweep_ref, dict) else None
 
                 if self._background is not None:
                     self._background = None
@@ -1584,6 +1684,7 @@ class AirBlackboxService:
                 self._active_calibration_path = None
                 self.active_calibration_id = None
                 self._active_osl_id = None
+                self._calibration_sweep_ref = None
                 with self._config_lock:
                     self.config.calibration_path = ""
                     self.save_config()
@@ -1996,6 +2097,7 @@ class AirBlackboxService:
                 self._session_calibration_p2 = air.terms_to_osl_calibration(p2_terms, cal_path)
                 self.active_calibration_id = cal_id
                 self._active_osl_id = cal_id
+                self._calibration_sweep_ref = dict(getattr(session, "config_snapshot", {}) or {}) or None
 
                 if self._background is not None:
                     self._background = None
@@ -2025,6 +2127,7 @@ class AirBlackboxService:
                 self._background_cal_id = cal_id
                 if self._session_calibration is None:
                     self.active_calibration_id = cal_id
+                    self._calibration_sweep_ref = dict(getattr(session, "config_snapshot", {}) or {}) or None
                 self._log(f"远程空采背景已激活: {len(background)} 点（cal_id={cal_id}）")
             summary = json.dumps(
                 (session.solved_result() or {}).get("profile_summary", {}), ensure_ascii=False
@@ -2121,6 +2224,7 @@ class AirBlackboxService:
 
     def _start_continuous(self, cfg: air.SweepConfig, single: bool) -> bool:
         self._log(f"启动采集: 引擎 continuous，设备来源 {air.get_default_device_source()}")
+        effective = self._effective_calibration_components()
         spec = air.AcquisitionTaskSpec(
             cfg=cfg,
             interval_s=self._interval_s,
@@ -2128,16 +2232,16 @@ class AirBlackboxService:
             count=1 if single else self._count,
             gnss_port=self.config.gnss_port,
             baud=self.config.gnss_baud,
-            calibration_path=self._calibration_path,
-            session_calibration=self._session_calibration,
-            session_calibration_p2=self._session_calibration_p2,
-            through_measurement=self._active_through,
-            background_frequency_hz=self._background_frequency_hz,
-            background=self._background,
+            calibration_path=effective["calibration_path"],
+            session_calibration=effective["session_calibration"],
+            session_calibration_p2=effective["session_calibration_p2"],
+            through_measurement=effective["through_measurement"],
+            background_frequency_hz=effective["background_frequency_hz"],
+            background=effective["background"],
             autosave=self._autosave,
             save_csv=self._save_csv,
             remote_sender=self.sender,
-            calibration_id=self.active_calibration_id or "",
+            calibration_id=effective["calibration_id"],
         )
 
         def _factory(task_spec: air.AcquisitionTaskSpec) -> air.ContinuousAcquisitionWorker:
@@ -2184,6 +2288,7 @@ class AirBlackboxService:
 
     def _start_legacy(self, cfg: air.SweepConfig, single: bool) -> bool:
         self._log("启动采集: 引擎 legacy（逐帧开关 USB，慢；调试退路）")
+        effective = self._effective_calibration_components()
         run_id = self.acquisition.new_run_id(air.RUN_ID_KIND_TASK)
         run_dir = self.output_root / sanitize_run_dir_name(run_id)
         worker = air.AcquisitionWorker(
@@ -2193,12 +2298,12 @@ class AirBlackboxService:
             out_dir=run_dir,
             count=1 if single else self._count,
             interval_s=self._interval_s,
-            calibration_path=self._calibration_path,
-            session_calibration=self._session_calibration,
-            session_calibration_p2=self._session_calibration_p2,
-            through_measurement=self._active_through,
-            background_frequency_hz=self._background_frequency_hz,
-            background=self._background,
+            calibration_path=effective["calibration_path"],
+            session_calibration=effective["session_calibration"],
+            session_calibration_p2=effective["session_calibration_p2"],
+            through_measurement=effective["through_measurement"],
+            background_frequency_hz=effective["background_frequency_hz"],
+            background=effective["background"],
             autosave=self._autosave,
             gnss_cache=self.gnss,
         )

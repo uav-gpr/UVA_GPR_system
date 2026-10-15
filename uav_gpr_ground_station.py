@@ -3567,6 +3567,13 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         row.addWidget(self.resume_button)
         row.addWidget(self.stop_button)
         row.addStretch(1)
+        # 校准失效/提醒横条（改扫频参数后与生效校准对不上时显示；平时隐藏）。
+        # 放在操作栏右侧而非状态栏：状态栏冻结为 3 个业务标签。
+        self.calibration_fit_label = QtWidgets.QLabel("")
+        self.calibration_fit_label.setObjectName("calibration_fit_label")
+        self.calibration_fit_label.setVisible(False)
+        self._calibration_fit_level = "ok"
+        row.addWidget(self.calibration_fit_label)
         return bar
 
     def _build_main_content(self) -> QtWidgets.QWidget:
@@ -3727,8 +3734,28 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     def open_calibration_dialog(self) -> None:
         """打开校准对话框（非模态；未连接时"开始校准"禁用并明确提示）。"""
         self.calibration_dialog.set_connected(self._remote_connected)
+        self._sync_calibration_plan_to_acquisition()
         self.calibration_dialog.show()
         self.calibration_dialog.raise_()
+
+    def _sync_calibration_plan_to_acquisition(self) -> None:
+        """打开校准对话框时，把校准的频率范围/频点数预填成当前采集设置。
+
+        校准必须和采集用同一套频率轴才有效（否则空中端会判"校准已失效"）。
+        校准会话进行中不动输入框；用户仍可手动改。
+        """
+        dialog = self.calibration_dialog
+        if getattr(dialog, "_cal_id", None) is not None:
+            return
+        settings = getattr(self, "acq_settings", None)
+        if settings is None:
+            return
+        try:
+            dialog.cal_start.setValue(float(settings.start_mhz))
+            dialog.cal_stop.setValue(float(settings.stop_mhz))
+            dialog.cal_points.setValue(int(settings.points))
+        except (AttributeError, TypeError, ValueError):
+            pass
 
     def open_calibration_wizard(self) -> None:
         """打开校准向导（open_calibration_dialog 的别名）。"""
@@ -3849,8 +3876,53 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         if panel is not None:
             panel.set_link_connected(self._remote_connected)
 
+    def apply_calibration_fit(self, fit: object) -> None:
+        """显示空中端回报的"校准与当前扫频参数是否对得上"。
+
+        ``level``：ok（隐藏）/ warning（橙色提醒，校准仍在用）/
+        stale（红色"校准已失效，请重新校准"，空中端已停用该校准）。
+        """
+        if not isinstance(fit, dict):
+            return
+        level = str(fit.get("level") or "ok")
+        message = str(fit.get("message") or "")
+        label = getattr(self, "calibration_fit_label", None)
+        if label is None:
+            return
+        if level == "stale":
+            label.setText("⚠ " + (message or "校准已失效，请重新校准"))
+            label.setStyleSheet("color: #ffffff; background: #c0392b; padding: 1px 6px; font-weight: bold;")
+            label.setToolTip(message)
+            label.setVisible(True)
+        elif level == "warning":
+            label.setText("⚠ " + (message or "校准提醒"))
+            label.setStyleSheet("color: #000000; background: #f5b041; padding: 1px 6px;")
+            label.setToolTip(message)
+            label.setVisible(True)
+        else:
+            label.setText("")
+            label.setToolTip("")
+            label.setVisible(False)
+        if level != getattr(self, "_calibration_fit_level", "ok"):
+            if level == "ok":
+                self.log("扫频参数与生效校准重新一致：空中端恢复使用校准")
+            else:
+                self.log(message)
+        self._calibration_fit_level = level
+
     def _on_command_result(self, header: dict) -> None:
         """第7轮：把带结果字段的 command_ack 转发给设备面板（既有 ack 通道）。"""
+        result_for_fit = header.get("result")
+        if isinstance(result_for_fit, dict) and isinstance(result_for_fit.get("calibration_fit"), dict):
+            self.apply_calibration_fit(result_for_fit["calibration_fit"])
+        if (
+            header.get("action") == "set_params"
+            and isinstance(result_for_fit, dict)
+            and result_for_fit.get("ok") is False
+        ):
+            reason = str(result_for_fit.get("error") or "未知原因")
+            self.log(f"空中端拒绝参数修改: {reason}")
+            self.acquisition_status_label.setText(f"采集状态：参数被空中端拒绝（{reason}）")
         if header.get("action") == "test_gnss":
             result = header.get("result")
             if isinstance(result, dict):

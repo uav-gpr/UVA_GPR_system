@@ -52,9 +52,18 @@
 
 - [x] 2026-10-15 架构技术债第 1 步（分支 `refactor/air-core-retire-air-gui`）：空中端旧 GUI（MainWindow、BScanWidget、AirSettingsDialog、`_apply_trace_to_ui`、`_ServiceCalibrationCapturerProxy`、`main`）删除；核心原样改名 `air_core.py`（7207 → 约 4700 行，逻辑零改动）；黑匣子服务/air_gnss/field_test 改 import `air_core`；黑匣子 import 时不再加载 QtWidgets/QtGui/WebEngine/pyqtgraph。
   - 测试迁移规则：依赖空中端窗口的用例删除（其行为由黑匣子服务测试 round7/round8 覆盖）；混在其中的核心或地面端断言已拆出保留。
-  - 已发现的既有差异（未改，待决定）：旧 GUI 在“校准会话进行中”会拒绝 `set_params`，黑匣子服务 `_cmd_set_params` 只检查“采集运行中”。
+  - 已发现的既有差异：旧 GUI 在“校准会话进行中”会拒绝 `set_params`，黑匣子服务 `_cmd_set_params` 只检查“采集运行中”。→ 已在下一条（校准失效机制）补上。
   - `tools/build_round8_portable.py` 是第 8 轮冻结哈希的历史打包脚本，未改；下一次发版的打包脚本需把 `air_core.py` 和 `uav_gpr_qt.py`（别名）一起放进两个包，并更新地面包说明里“run_air_station.bat 启动带画图界面的空中程序”那段。
   - Linux 沙箱上 `test_round1_third_fixes.test_concurrent_stop_and_put_race` 在 main 上也会偶发失败（计时竞争），非本次引入。
+- [x] 2026-10-15 校准失效机制（分支 `feature/calibration-stale-on-param-change`，叠在上一条分支之上）：用户确认规则——校准完成后改扫频参数要提醒重新校准。
+  - 新模块 `calibration_guard.py`（纯 Python）：比较当前扫频与生效校准自身的频率轴（OSL P1/P2、Through、背景各自频点）。
+  - **频率范围或频点数不一致 → 失效**：黑匣子采集时停用这份校准（数据 `calibration_id` 为空 = 未校准），日志写明原因；OSL 失效时背景一并失效；背景单独不一致只停用背景。生效校准本身不删除，参数改回原样自动恢复。
+  - **只改发射功率/中频带宽 → 只提醒**，校准照常使用（参照校准当时记下的扫频参数：会话快照 `config_snapshot`、导入/重启恢复读文件 `sweep_config`，没有就不提醒）。
+  - 校准会话进行中（planned/in_progress/solved）黑匣子拒绝 `set_params`。
+  - 回执与状态：`set_params`、`start/single`、`get_status` 结果带 `calibration_fit`（level=ok/warning/stale、message、reasons、warnings）。没有新增消息 type。
+  - 地面站：操作栏右侧新增 `calibration_fit_label`（失效红底“校准已失效，请重新校准”，提醒橙底；正常隐藏），**不进状态栏**（状态栏冻结 3 个标签）；`set_params` 被拒时采集状态标签显示原因；打开校准对话框时把校准频率范围/频点数预填为当前采集设置。
+  - 注意：导入的校准文件若频率轴与当前扫频不同，导入后会立刻显示“失效”并停用（以前是插值后静默使用）。
+  - 测试：`tests/test_calibration_guard.py`（23 项）。
 
 ---
 

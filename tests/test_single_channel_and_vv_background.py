@@ -1,9 +1,8 @@
 """单通道采集（只采 HH/S11 或只采 VV/S22）+ VV 背景扣除（2026-10-15）。
 
-第一阶段做法：雷达仍按已在硬件上验证过的双反射扫法（0x1241）扫，黑匣子只保留
-用户选中的通道去处理、保存、发送；地面站没采的那幅 B-scan 补零并在标题注明
-“本次未采集”。真正只扫一个端口（提速）需要新的扫频 stages 组合，必须先在真机
-验证，本轮不做。
+只采 HH 时雷达改用只让端口 1 发射的扫法 0x1240（真机验证过，约快一倍）；只采 VV
+在实验开关打开时用 0x1208（未经真机验证），否则仍双通道扫再丢掉 HH。黑匣子只
+处理、保存、发送所选通道；地面站没采的那幅 B-scan 补零并在标题注明“本次未采集”。
 """
 
 from __future__ import annotations
@@ -314,8 +313,18 @@ class AirServiceChannelTests(unittest.TestCase):
         self.assertEqual(result["calibration_fit"]["level"], "warning")
         self.assertIn("VV", result["calibration_fit"]["message"])
 
+    def test_simulated_s11_run_uses_fast_sweep(self) -> None:
+        self._run_and_check("S11", experimental=False, expected_bitmap="0x1240")
+
+    def test_simulated_s22_run_without_flag_uses_dual_sweep(self) -> None:
+        self._run_and_check("S22", experimental=False, expected_bitmap="0x1241")
+
     def test_simulated_single_channel_run_saves_only_selected_channel(self) -> None:
-        self.service.handle_command("set_params", {"channels": "S22", "points": 51, "count": 1})
+        self._run_and_check("S22", experimental=True, expected_bitmap="0x1208")
+
+    def _run_and_check(self, channel: str, *, experimental: bool, expected_bitmap: str) -> None:
+        self.service.config.experimental_s22_fast_sweep = experimental
+        self.service.handle_command("set_params", {"channels": channel, "points": 51, "count": 1})
         started = self.service.start_acquisition(single=True)
         if not started:
             self.skipTest("模拟采集在此环境无法启动")
@@ -328,10 +337,15 @@ class AirServiceChannelTests(unittest.TestCase):
                 break
             time.sleep(0.1)
         self.assertTrue(npz_files, "应有落盘 trace")
+        other = "S11" if channel == "S22" else "S22"
         with np.load(npz_files[0], allow_pickle=False) as data:
-            self.assertEqual(json.loads(str(data["channels"])), ["S22"])
-            self.assertIn("trace_S22", data.files)
-            self.assertNotIn("trace_S11", data.files)
+            self.assertEqual(json.loads(str(data["channels"])), [channel])
+            self.assertIn(f"trace_{channel}", data.files)
+            self.assertNotIn(f"trace_{other}", data.files)
+            raw = data[f"raw_{channel}_real"] if f"raw_{channel}_real" in data.files else None
+            if raw is not None:
+                self.assertTrue(np.any(raw != 0), "所选通道必须是真实测量值，不是占位 0")
+        self.assertTrue(any(expected_bitmap in line for line in self.logs), self.logs[-5:])
 
 
 @unittest.skipIf(svc is None, SKIP)
@@ -396,6 +410,78 @@ class GroundSingleChannelTests(unittest.TestCase):
         self.assertEqual(sent[0][1]["ports"], "P2")
         self.assertEqual(dialog._steps, ["P2_Open", "P2_Short", "P2_Load"])
         dialog.hide()
+
+
+class SweepModeTests(unittest.TestCase):
+    def test_s22_bitmap_needs_explicit_opt_in(self) -> None:
+        from librevna import librevna_protocol as proto
+
+        with self.assertRaises(ValueError):
+            proto.SweepSettings(400_000_000, 4_000_000_000, 51, 10_000, stages_bitmap=proto.S22_STAGES_BITMAP)
+        settings = proto.SweepSettings(
+            400_000_000, 4_000_000_000, 51, 10_000,
+            stages_bitmap=proto.S22_STAGES_BITMAP, allow_experimental=True,
+        )
+        import struct
+
+        self.assertEqual(struct.unpack_from("<H", settings.encode(), 25)[0], 0x1208)
+        self.assertNotIn(proto.S22_STAGES_BITMAP, proto.ALLOWED_STAGES_BITMAPS)
+
+    def test_parse_s22_point(self) -> None:
+        from librevna import librevna_protocol as proto
+        from librevna.simulated_transport import _vna_point_packet
+
+        packet = _vna_point_packet(1_000_000_000, 3, 0.5 + 0j, 0.25 - 0.5j, stages_bitmap=0x1208)
+        payload = proto.PacketStream().feed(packet)[0].payload
+        point, freq, s22 = proto.parse_s22_point(payload)
+        self.assertEqual(point, 3)
+        self.assertAlmostEqual(freq, 1e9)
+        self.assertAlmostEqual(s22, 0.25 - 0.5j, places=6)
+        # 双反射包里 stage0 Port-2 是 S21 不是 S22：所以后端必须按当前扫法选解析器，
+        # 绝不能把 0x1241 的包当单端口 S22 解析。
+        _p, _f, wrong = proto.parse_s22_point(proto.PacketStream().feed(
+            _vna_point_packet(1_000_000_000, 3, 0.5 + 0j, 0.25 - 0.5j)
+        )[0].payload)
+        self.assertAlmostEqual(wrong, 9.0 + 9.0j, places=5)
+
+    def _acquire_with(self, bitmap: int):
+        from librevna import librevna_protocol as proto
+        from librevna.librevna_continuous import PersistentLibreVnaBackend
+        from librevna.simulated_transport import SimulatedLibreVnaTransport
+
+        backend = PersistentLibreVnaBackend(transport=SimulatedLibreVnaTransport(pace=False))
+        backend.open()
+        try:
+            backend.configure(proto.SweepSettings(
+                400_000_000, 4_000_000_000, 21, 10_000,
+                stages_bitmap=bitmap, allow_experimental=bitmap == proto.S22_STAGES_BITMAP,
+            ))
+            return backend.acquire_one()
+        finally:
+            backend.close()
+
+    def test_backend_s11_only_sweep(self) -> None:
+        sweep = self._acquire_with(0x1240)
+        raw = np.asarray(sweep.raw)
+        self.assertEqual(raw.shape[-1], 21)
+        self.assertTrue(np.any(raw[0] != 0))
+        self.assertFalse(np.any(raw[1]), "没测的 S22 只是占位 0")
+
+    def test_backend_s22_only_sweep(self) -> None:
+        sweep = self._acquire_with(0x1208)
+        raw = np.asarray(sweep.raw)
+        self.assertFalse(np.any(raw[0]))
+        self.assertTrue(np.any(raw[1] != 0))
+
+    @unittest.skipIf(air is None, SKIP)
+    def test_stages_bitmap_for_channels(self) -> None:
+        self.assertEqual(air.stages_bitmap_for_channels(("S11", "S22")), 0x1241)
+        self.assertEqual(air.stages_bitmap_for_channels(("S11",)), 0x1240)
+        self.assertEqual(air.stages_bitmap_for_channels(("S22",)), 0x1241)
+        self.assertEqual(air.stages_bitmap_for_channels(("S22",), experimental_s22_fast_sweep=True), 0x1208)
+        self.assertEqual(
+            air.stages_bitmap_for_channels(("S11", "S22"), experimental_s22_fast_sweep=True), 0x1241
+        )
 
 
 if __name__ == "__main__":

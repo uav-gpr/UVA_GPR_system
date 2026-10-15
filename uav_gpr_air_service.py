@@ -113,6 +113,9 @@ class AirConfig:
     log_max_bytes: int = LOG_MAX_BYTES_DEFAULT
     log_backup_count: int = LOG_BACKUP_COUNT_DEFAULT
     calibration_path: str = ""
+    #: 只采 VV 时用单端口快速扫法 0x1208（**未经真机验证**，默认关）。关闭时
+    #: 只采 VV 仍按双通道扫、丢掉 HH（速度不变）。真机验证通过后再默认打开。
+    experimental_s22_fast_sweep: bool = False
 
 
 def _field_names() -> tuple[str, ...]:
@@ -139,7 +142,7 @@ def _validate_field(name: str, value: object) -> tuple[bool, object]:
         return value in DEVICE_SOURCE_CHOICES, value
     if name == "output_dir":
         return isinstance(value, str) and bool(value.strip()), value
-    if name == "autostart_acquisition":
+    if name in ("autostart_acquisition", "experimental_s22_fast_sweep"):
         return isinstance(value, bool), value
     if name in ("disk_min_free_gb", "disk_target_free_gb"):
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0, value
@@ -2321,6 +2324,14 @@ class AirBlackboxService:
             remote_sender=self.sender,
             calibration_id=effective["calibration_id"],
             channels=air.CHANNEL_MODES[self._channel_mode],
+            experimental_s22_fast_sweep=bool(self.config.experimental_s22_fast_sweep),
+        )
+        sweep_bitmap = air.stages_bitmap_for_channels(
+            spec.channels, experimental_s22_fast_sweep=spec.experimental_s22_fast_sweep
+        )
+        self._log(
+            f"采集通道: {air.CHANNEL_MODE_LABELS[self._channel_mode]}，雷达扫法 {sweep_bitmap:#06x}"
+            + ("（实验，未经真机验证）" if sweep_bitmap == 0x1208 else "")
         )
 
         def _factory(task_spec: air.AcquisitionTaskSpec) -> air.ContinuousAcquisitionWorker:
@@ -2329,6 +2340,7 @@ class AirBlackboxService:
             self._last_run_id = self._active_run_id
             worker = air.ContinuousAcquisitionWorker(
                 channels=task_spec.channels,
+                experimental_s22_fast_sweep=task_spec.experimental_s22_fast_sweep,
                 cfg=task_spec.cfg,
                 interval_s=task_spec.interval_s,
                 out_dir=run_dir,

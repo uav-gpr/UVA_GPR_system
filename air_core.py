@@ -136,6 +136,8 @@ from librevna.librevna_continuous import (  # noqa: E402
 from librevna.librevna_errors import LibreVnaSweepError  # noqa: E402
 from librevna.librevna_protocol import (  # noqa: E402
     S11_S22_STAGES_BITMAP,
+    S11_STAGES_BITMAP,
+    S22_STAGES_BITMAP,
     SweepSettings,
 )
 from librevna.simulated_transport import (  # noqa: E402
@@ -759,6 +761,22 @@ def normalize_channel_mode(value: object) -> str:
     if lowered in ("s22", "vv"):
         return "S22"
     raise ValueError(f"channels 非法: {value!r}（可选 dual / S11 / S22）")
+
+
+def stages_bitmap_for_channels(channels: Sequence[str], *, experimental_s22_fast_sweep: bool = False) -> int:
+    """按所选通道选雷达扫法（这才是真正提速的地方）。
+
+    - 双通道 → 0x1241（两个端口轮流发射，真机验证过）；
+    - 只采 HH → 0x1240（只让端口 1 发射，真机验证过，约快一倍）；
+    - 只采 VV → 打开实验开关时 0x1208（只让端口 2 发射，**未经真机验证**），
+      否则仍用 0x1241 扫两路再丢掉 HH（速度不变，但稳妥）。
+    """
+    names = tuple(channels)
+    if names == ("S11",):
+        return S11_STAGES_BITMAP
+    if names == ("S22",) and experimental_s22_fast_sweep:
+        return S22_STAGES_BITMAP
+    return S11_S22_STAGES_BITMAP
 
 
 def select_channels(raw_sparams: dict[str, np.ndarray], channels: Sequence[str]) -> dict[str, np.ndarray]:
@@ -3379,6 +3397,8 @@ class AcquisitionTaskSpec:
     calibration_id: str = ""
     #: 采集通道（单通道采集：只保留选中的通道处理/保存/发送）。
     channels: tuple[str, ...] = ("S11", "S22")
+    #: 只采 VV 时是否用未验证的单端口快速扫法 0x1208。
+    experimental_s22_fast_sweep: bool = False
 
 
 class AcquisitionService:
@@ -3507,7 +3527,7 @@ class AcquisitionService:
 
     # ---- 会话生命周期（由 worker 线程调用/服务命令入口调用）----
 
-    def _settings_of(self, cfg: SweepConfig) -> SweepSettings:
+    def _settings_of(self, cfg: SweepConfig, stages_bitmap: int = S11_S22_STAGES_BITMAP) -> SweepSettings:
         return SweepSettings(
             start_hz=int(cfg.start_mhz * 1e6),
             stop_hz=int(cfg.stop_mhz * 1e6),
@@ -3515,7 +3535,8 @@ class AcquisitionService:
             ifbw_hz=cfg.ifbw_hz,
             power_dbm=cfg.power_dbm,
             dwell_us=cfg.dwell_us,
-            stages_bitmap=S11_S22_STAGES_BITMAP,
+            stages_bitmap=stages_bitmap,
+            allow_experimental=stages_bitmap == S22_STAGES_BITMAP,
         )
 
     def _ensure_backend(self) -> PersistentLibreVnaBackend:
@@ -3541,7 +3562,7 @@ class AcquisitionService:
         return backend
 
     def open_and_start(
-        self, cfg: SweepConfig
+        self, cfg: SweepConfig, stages_bitmap: int = S11_S22_STAGES_BITMAP
     ) -> tuple[PersistentLibreVnaBackend, str]:
         """worker 线程启动会话入口。
 
@@ -3551,7 +3572,7 @@ class AcquisitionService:
         - 待命 + 配置字节相同：resume（不 reopen、不重 configure）
         - 待命 + 配置字节不同：reconfigure（configure_count+1，open_count 不变）
         """
-        settings = self._settings_of(cfg)
+        settings = self._settings_of(cfg, stages_bitmap)
         with self._lock:
             if self._state in (SERVICE_STATE_SHUTTING_DOWN, SERVICE_STATE_STOPPING):
                 raise RuntimeError(f"服务状态 {self._state} 不允许启动新任务")
@@ -4073,10 +4094,15 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
         service: AcquisitionService | None = None,
         task_spec: AcquisitionTaskSpec | None = None,
         channels: Sequence[str] = ("S11", "S22"),
+        experimental_s22_fast_sweep: bool = False,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self.channels = tuple(channels)
+        #: 实际下发给雷达的扫法（单通道时真正只让一个端口发射）。
+        self.stages_bitmap = stages_bitmap_for_channels(
+            self.channels, experimental_s22_fast_sweep=experimental_s22_fast_sweep
+        )
         self.interval_s = float(interval_s)
         self.out_dir = out_dir
         self.count = count
@@ -4281,7 +4307,9 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
                 # idle_waiting 且配置字节相同→resume（冻结配置，不重新 open）；
                 # 配置字节不同→reconfigure（configure_count+1、open_count 不变）。
                 phase = "启动常驻采集会话"
-                backend, session_path = self._service.open_and_start(self.cfg)
+                backend, session_path = self._service.open_and_start(
+                    self.cfg, getattr(self, "stages_bitmap", S11_S22_STAGES_BITMAP)
+                )
                 self._backend = backend
                 self.status.emit(
                     {
@@ -4587,7 +4615,8 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
             ifbw_hz=cfg.ifbw_hz,
             power_dbm=cfg.power_dbm,
             dwell_us=cfg.dwell_us,
-            stages_bitmap=S11_S22_STAGES_BITMAP,
+            stages_bitmap=getattr(self, "stages_bitmap", S11_S22_STAGES_BITMAP),
+            allow_experimental=getattr(self, "stages_bitmap", None) == S22_STAGES_BITMAP,
         )
 
     def _pause_wait_for_wakeup(self, backend: PersistentLibreVnaBackend) -> bool:

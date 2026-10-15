@@ -93,6 +93,7 @@ from calibration_service import (  # noqa: E402
     REPEATS_MIN,
     build_background_plan,
     build_osl_plan,
+    normalize_osl_ports,
     build_reference_background,
     calibration_from_measurements,
     calibration_points_payload,
@@ -729,6 +730,43 @@ def dual_channel_raw(raw: np.ndarray) -> dict[str, np.ndarray]:
 # re-export，``air.CalibrationMeasurement`` 等引用不变）。
 S_PARAMETERS = ("S11", "S21", "S12", "S22")
 UI_CHANNELS = ("S11", "S22")
+#: 采集通道选择（用户可选只采一个通道）。值 → 实际保留的通道。
+CHANNEL_MODES: dict[str, tuple[str, ...]] = {
+    "dual": ("S11", "S22"),
+    "S11": ("S11",),
+    "S22": ("S22",),
+}
+CHANNEL_MODE_LABELS = {"dual": "双通道 HH+VV", "S11": "只采 HH (S11)", "S22": "只采 VV (S22)"}
+
+
+def normalize_channel_mode(value: object) -> str:
+    """把 ``channels`` 参数规范成 ``dual`` / ``S11`` / ``S22``（非法抛 ValueError）。
+
+    接受字符串（dual/both/S11/S22，大小写不敏感）或通道列表。
+    """
+    if isinstance(value, (list, tuple)):
+        names = tuple(str(v).strip().upper() for v in value)
+        for mode, channels in CHANNEL_MODES.items():
+            if names == channels:
+                return mode
+        raise ValueError(f"channels 非法: {list(value)!r}（可选 [S11,S22] / [S11] / [S22]）")
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if lowered in ("dual", "both", "s11+s22", "hh+vv"):
+        return "dual"
+    if lowered in ("s11", "hh"):
+        return "S11"
+    if lowered in ("s22", "vv"):
+        return "S22"
+    raise ValueError(f"channels 非法: {value!r}（可选 dual / S11 / S22）")
+
+
+def select_channels(raw_sparams: dict[str, np.ndarray], channels: Sequence[str]) -> dict[str, np.ndarray]:
+    """只保留选中的通道（单通道采集）。"""
+    missing = [name for name in channels if name not in raw_sparams]
+    if missing:
+        raise ValueError(f"原始数据缺少所选通道: {', '.join(missing)}")
+    return {name: raw_sparams[name] for name in channels}
 CHANNEL_LABELS = {"S11": "HH (S11)", "S22": "VV (S22)"}
 CHANNEL_COLORS = {"S11": "#0077b6", "S22": "#6d597a"}
 
@@ -1378,13 +1416,13 @@ def apply_reflection_and_through_calibration(
     through: CalibrationMeasurement | None,
 ) -> dict[str, np.ndarray]:
     display = {name: values.copy() for name, values in raw_sparams.items()}
-    if calibration_p1:
+    if calibration_p1 and "S11" in raw_sparams:
         f_min = float(calibration_p1.points[0].frequency)
         f_max = float(calibration_p1.points[-1].frequency)
         if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
             raise ValueError(f"S11 校准频率覆盖不足 [{f_min:g}, {f_max:g}] Hz，禁止带外外推")
         display["S11"] = np.array([calibration_p1.correct(f, s) for f, s in zip(frequency_hz, raw_sparams["S11"])], dtype=np.complex128)
-    if calibration_p2:
+    if calibration_p2 and "S22" in raw_sparams:
         f_min = float(calibration_p2.points[0].frequency)
         f_max = float(calibration_p2.points[-1].frequency)
         if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
@@ -1471,7 +1509,8 @@ def process_trace_pipeline(
         if not np.array_equal(scan_frequency, background_frequency):
             raise ValueError("background frequency axis does not match the current scan frequency axis")
         background_values = np.asarray(background, dtype=np.complex128)
-        if background_values.shape != scan_frequency.shape:
+        # 背景可以是 (F,)（只有 HH/S11，旧语义）或 (2, F)（第 0 行 S11、第 1 行 S22）。
+        if background_values.shape != scan_frequency.shape and background_values.shape != (2,) + scan_frequency.shape:
             raise ValueError("background trace length does not match the current scan frequency axis")
         if not np.all(np.isfinite(background_values.real)) or not np.all(np.isfinite(background_values.imag)):
             raise ValueError("background trace must contain only finite values")
@@ -1486,7 +1525,14 @@ def process_trace_pipeline(
         through_measurement,
     )
     if background_values is not None:
-        display["S11"] = display["S11"] - background_values
+        if background_values.ndim == 1:
+            background_by_channel = {"S11": background_values}
+        else:
+            background_by_channel = {"S11": background_values[0], "S22": background_values[1]}
+        # 各通道只减自己的背景，绝不把一个通道的背景套到另一个通道（R-C-19）。
+        for name, values in background_by_channel.items():
+            if name in display:
+                display[name] = display[name] - values
 
     # 处理 raw_sparams 中真实存在的通道（legacy 四通道 / continuous 双通道）。
     channels = tuple(name for name in S_PARAMETERS if name in raw_sparams)
@@ -2851,9 +2897,11 @@ class ProcessingConsumer(QtCore.QThread):
         remote_sender: RemoteSender | None = None,
         drain_after_stop_s: float = 2.0,
         run_id: str | None = None,
+        channels: Sequence[str] = ("S11", "S22"),
     ) -> None:
         super().__init__()
         self._queue = queue
+        self.channels = tuple(channels)
         self._gnss_cache = gnss_cache
         self.cfg = cfg
         self.out_dir = out_dir
@@ -2908,8 +2956,9 @@ class ProcessingConsumer(QtCore.QThread):
         if enqueued_at > 0.0:
             _record_stage("processing_started", time.perf_counter() - enqueued_at)
         _processing_t0 = time.perf_counter()
-        # 连续采集为 S11/S22 双通道 schema（决策门 B）：只处理真实存在的通道。
-        channels = ("S11", "S22")
+        # 连续采集为 S11/S22 双通道 schema（决策门 B）：只处理真实存在的通道；
+        # 单通道采集时只保留用户选中的通道（处理/保存/发送都只有这一路）。
+        channels = tuple(getattr(self, "channels", ("S11", "S22")))
         lookup = self._gnss_cache.latest(item.midpoint_monotonic)
         self.last_gnss_age_ms = lookup.age_ms
         # 只有 lookup.valid 时才把缓存 Fix 当作当前有效定位传给保存/UI/遥测；
@@ -2918,6 +2967,8 @@ class ProcessingConsumer(QtCore.QThread):
         acquisition = self._acquisition_metadata(item, lookup)
         flight = self._flight_metadata(lookup, fix)
         raw_sparams = dual_channel_raw(item.raw)
+        if channels != ("S11", "S22"):
+            raw_sparams = select_channels(raw_sparams, channels)
         display, time_ns, trace_by_channel = process_trace_pipeline(
             item.frequency_hz,
             raw_sparams,
@@ -3326,6 +3377,8 @@ class AcquisitionTaskSpec:
     #: 在 cal_activate 之后填充；经 SelectedSweep 透传进每条 trace 的**嵌套**
     #: acquisition metadata（不进 telemetry framing 顶层，R-X-02）。
     calibration_id: str = ""
+    #: 采集通道（单通道采集：只保留选中的通道处理/保存/发送）。
+    channels: tuple[str, ...] = ("S11", "S22")
 
 
 class AcquisitionService:
@@ -4019,9 +4072,11 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
         statistics_interval_s: float = 0.5,
         service: AcquisitionService | None = None,
         task_spec: AcquisitionTaskSpec | None = None,
+        channels: Sequence[str] = ("S11", "S22"),
     ) -> None:
         super().__init__()
         self.cfg = cfg
+        self.channels = tuple(channels)
         self.interval_s = float(interval_s)
         self.out_dir = out_dir
         self.count = count
@@ -4520,6 +4575,7 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
             remote_sender=self.remote_sender,
             # 第2轮 §3.7：任务身份由 spec 下发；独立 worker 为 None（连接身份）。
             run_id=self._message_run_id(),
+            channels=self.channels,
         )
 
     def _sweep_settings(self) -> SweepSettings:

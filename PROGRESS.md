@@ -63,7 +63,15 @@
   - 回执与状态：`set_params`、`start/single`、`get_status` 结果带 `calibration_fit`（level=ok/warning/stale、message、reasons、warnings）。没有新增消息 type。
   - 地面站：操作栏右侧新增 `calibration_fit_label`（失效红底“校准已失效，请重新校准”，提醒橙底；正常隐藏），**不进状态栏**（状态栏冻结 3 个标签）；`set_params` 被拒时采集状态标签显示原因；打开校准对话框时把校准频率范围/频点数预填为当前采集设置。
   - 注意：导入的校准文件若频率轴与当前扫频不同，导入后会立刻显示“失效”并停用（以前是插值后静默使用）。
-  - 测试：`tests/test_calibration_guard.py`（23 项）。
+  - 测试：`tests/test_calibration_guard.py`（22 项）。
+- [x] 2026-10-15 单通道采集 + VV 背景扣除（分支 `feature/single-channel-vv-background`，叠在校准失效分支之上）。
+  - **通道选择**：`set_params` 新增 `channels`（`dual` / `S11` / `S22`），地面设置中心“采集控制”页新增“采集通道”下拉（`acquisition_channels_input`）。黑匣子把所选通道经 `AcquisitionTaskSpec.channels` → `ContinuousAcquisitionWorker` → `ProcessingConsumer`，只处理/保存/发送所选通道（NPZ 与遥测 `channels` 声明只含该通道）。legacy 引擎选单通道时拒绝启动。
+  - **第一阶段限制（重要）**：雷达仍用已在真机验证的双反射扫法 `0x1241`，只是丢弃没选的那一路，所以**扫描速度不变**，省的是处理、存储和链路带宽。真正只扫一个端口（提速）需要只采 S11 用 `0x1240`（已验证但连续采集后端未支持）、只采 S22 需新组合（推算为 `0x1208`，**未验证**，`ALLOWED_STAGES_BITMAPS` 禁止擅自扩展），必须先真机验证。
+  - **地面显示**：解码接受显式声明的单通道 payload；没采的那幅 B-scan 补零列（两幅道数保持同步），标题注明“（本次未采集）”，清空 B-scan 后恢复。HH/VV 两幅图与布局冻结约定不变。
+  - **单端口校准**：`build_osl_plan(..., ports=P1|P2|both)`，`cal_begin` 带 `ports`；校准对话框新增“OSL（只校 P1 / HH，三步）”“OSL（只校 P2 / VV，三步）”，打开对话框时按采集通道自动选。解算/激活/质量回报/文件导入（允许只有 P2 的文件）都支持缺一个端口。
+  - **VV 背景扣除**：空采解算同时保留 S22 行（`background_s22`），激活时用 P2 校正；采集时背景合成 `(2, F)`，`process_trace_pipeline` 各通道只减自己的背景（仍遵守 R-C-19 不交叉套用）。旧的单行背景语义（只扣 HH）保留兼容。背景导出新增 `background_s22_real/imag`。
+  - 校准匹配回报新增通道覆盖提醒：已有校准但所选通道缺对应端口校准或缺 VV 背景时给橙色提醒。
+  - 测试：`tests/test_single_channel_and_vv_background.py`（21 项，含模拟器真跑一次只采 S22 落盘）。
 
 ---
 

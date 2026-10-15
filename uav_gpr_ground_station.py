@@ -1098,6 +1098,8 @@ class AcquisitionUiSettings:
     time_window_ns: float = 40.0
     dewow_enabled: bool = False
     dewow_window_ns: float = 4.0
+    #: 采集通道：dual（HH+VV）/ S11（只 HH）/ S22（只 VV）。
+    channels: str = "dual"
 
     def command_params(self, single: bool = False) -> dict[str, object]:
         return {
@@ -1118,10 +1120,18 @@ class AcquisitionUiSettings:
             "time_window_ns": float(self.time_window_ns),
             "dewow_enabled": bool(self.dewow_enabled),
             "dewow_window_ns": float(self.dewow_window_ns),
+            "channels": str(self.channels),
         }
 
 
 GroundSettings = AcquisitionUiSettings
+#: 采集通道选项（与空中端 CHANNEL_MODES 一致）。
+CHANNEL_MODE_CHOICES = (
+    ("dual", "双通道 HH (S11) + VV (S22)"),
+    ("S11", "只采 HH (S11)"),
+    ("S22", "只采 VV (S22)"),
+)
+CHANNEL_MODE_CHANNELS = {"dual": ("S11", "S22"), "S11": ("S11",), "S22": ("S22",)}
 
 
 @dataclass(frozen=True)
@@ -1172,10 +1182,18 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
         self.count.setValue(0)
         self.count_hint = QtWidgets.QLabel("0 表示持续采集")
         self.count_hint.setObjectName("acquisition_count_hint")
+        self.channels_input = QtWidgets.QComboBox()
+        self.channels_input.setObjectName("acquisition_channels_input")
+        for mode_key, mode_label in CHANNEL_MODE_CHOICES:
+            self.channels_input.addItem(mode_label, userData=mode_key)
+        self.channels_hint = QtWidgets.QLabel("只采一个通道时，另一幅 B-scan 显示“本次未采集”")
+        self.channels_hint.setObjectName("acquisition_channels_hint")
         form.addRow("采集模式", self.mode)
         form.addRow("采集间隔 (s)", self.interval)
         form.addRow("采集数量", self.count)
         form.addRow("", self.count_hint)
+        form.addRow("采集通道", self.channels_input)
+        form.addRow("", self.channels_hint)
         self.tab_widget.addTab(self.acq_page, "采集控制")
 
         # ---- Tab 2: 扫描参数 (SweepConfig 对齐) ----
@@ -1333,6 +1351,8 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
         self.dewow_enabled.setChecked(bool(settings.dewow_enabled))
         self.dewow_window.setValue(float(settings.dewow_window_ns))
         self.dewow_window.setEnabled(bool(settings.dewow_enabled))
+        channel_index = self.channels_input.findData(str(getattr(settings, "channels", "dual")))
+        self.channels_input.setCurrentIndex(channel_index if channel_index >= 0 else 0)
         self._sync_interval_enabled()
 
     def draft_settings(self) -> AcquisitionUiSettings:
@@ -1355,6 +1375,7 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
             time_window_ns=float(self.time_window.value()),
             dewow_enabled=bool(self.dewow_enabled.isChecked()),
             dewow_window_ns=float(self.dewow_window.value()),
+            channels=str(self.channels_input.currentData() or "dual"),
         )
 
     def send_params_to_air(self) -> bool:
@@ -2159,6 +2180,9 @@ class CalibrationWizard(QtWidgets.QDialog):
         self.mode_combo.setObjectName("calibration_mode_input")
         self.mode_combo.addItem("OSL（六步双反射）", userData="osl")
         self.mode_combo.addItem("空采参考（背景）", userData="background")
+        # 单通道采集用：只校一个端口（3 步），另一端口不用接标准件。
+        self.mode_combo.addItem("OSL（只校 P1 / HH，三步）", userData="osl_p1")
+        self.mode_combo.addItem("OSL（只校 P2 / VV，三步）", userData="osl_p2")
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         self.repeats = QtWidgets.QSpinBox()
@@ -2391,6 +2415,9 @@ class CalibrationWizard(QtWidgets.QDialog):
         mode = str(self.mode_combo.currentData() or "osl")
         if mode == "background":
             self.instruction_label.setText("空采背景参考模式：请将天线对准净空后点击“开始校准”。")
+        elif mode in ("osl_p1", "osl_p2"):
+            port = "P1（HH）" if mode == "osl_p1" else "P2（VV）"
+            self.instruction_label.setText(f"单端口 OSL 模式：只校 {port}，共三步，请配置计划后点击“开始校准”。")
         else:
             self.instruction_label.setText("六步双反射 OSL 模式：请配置计划后点击“开始校准”。")
 
@@ -2629,6 +2656,10 @@ class CalibrationWizard(QtWidgets.QDialog):
         if self._active_background:
             pts = self._active_background.get("points")
             pts_str = f"{pts}点" if pts else "已生效"
+            bg_channels = self._active_background.get("channels")
+            if isinstance(bg_channels, (list, tuple)) and bg_channels:
+                names = {"S11": "HH", "S22": "VV"}
+                pts_str += ", " + "+".join(names.get(str(c), str(c)) for c in bg_channels)
             bg_info = f"{pts_str}"
 
         text = f"当前生效: OSL[{osl_info}] | 背景[{bg_info}]"
@@ -2648,8 +2679,18 @@ class CalibrationWizard(QtWidgets.QDialog):
         self._stop_capture_watchdog()
         self._cancel_legacy_fallback()
         cal_id = f"cal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}" 
-        mode = str(self.mode_combo.currentData() or "osl")
-        steps = list(self.OSL_STEPS) if mode == "osl" else ["Background"]
+        choice = str(self.mode_combo.currentData() or "osl")
+        ports: str | None = None
+        if choice == "osl_p1":
+            mode, ports = "osl", "P1"
+        elif choice == "osl_p2":
+            mode, ports = "osl", "P2"
+        else:
+            mode = choice
+        if mode == "osl":
+            steps = [s for s in self.OSL_STEPS if ports is None or s.startswith(ports + "_")]
+        else:
+            steps = ["Background"]
         params: dict[str, object] = {
             "cal_id": cal_id,
             "mode": mode,
@@ -2663,6 +2704,8 @@ class CalibrationWizard(QtWidgets.QDialog):
                 "dwell_us": int(self.cal_dwell.value()),
             },
         }
+        if ports is not None:
+            params["ports"] = ports
         self._cal_id = cal_id
         self._mode = mode
         self._steps = steps
@@ -3756,6 +3799,13 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             dialog.cal_points.setValue(int(settings.points))
         except (AttributeError, TypeError, ValueError):
             pass
+        # 校准端口跟着采集通道走（只在 OSL 几种之间切换，不动“空采背景”选择）。
+        combo = getattr(dialog, "mode_combo", None)
+        if combo is not None and str(combo.currentData() or "") in ("osl", "osl_p1", "osl_p2"):
+            wanted = {"S11": "osl_p1", "S22": "osl_p2"}.get(str(getattr(settings, "channels", "dual")), "osl")
+            index = combo.findData(wanted)
+            if index >= 0:
+                combo.setCurrentIndex(index)
 
     def open_calibration_wizard(self) -> None:
         """打开校准向导（open_calibration_dialog 的别名）。"""
@@ -4323,6 +4373,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     def clear_bscan(self) -> None:
         self.bscan_rows = {name: [] for name in UI_CHANNELS}
         self.bscan_rows_complex = {name: [] for name in UI_CHANNELS}
+        self._set_bscan_missing_channels(())
         self.bscan_time_ns = None
         self.bscan_processing_signature = None
         self.bscan_filter_status_override = None
@@ -4354,8 +4405,12 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             name: (np.asarray(trace).real if np.iscomplexobj(trace) else trace)
             for name, trace in trace_by_channel.items()
         }
+        # 单通道采集：只有一个通道有数据，另一幅 B-scan 补零列保持两幅道数同步。
+        present_channels = tuple(name for name in UI_CHANNELS if name in traces_real) or UI_CHANNELS
         try:
-            candidate_time, candidate_traces = validate_bscan_trace(time_ns, traces_real)
+            candidate_time, candidate_traces = validate_bscan_trace(
+                time_ns, traces_real, channels=present_channels
+            )
         except (TypeError, ValueError) as exc:
             self.bscan_filter_status_override = f"B-scan已拒绝：{exc}；请清空B-scan后重新开始"
             return False
@@ -4382,9 +4437,15 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             self.bscan_processing_signature = processing_signature
         if not hasattr(self, "bscan_rows_complex"):
             self.bscan_rows_complex = {name: [] for name in UI_CHANNELS}
+        missing_channels = tuple(name for name in UI_CHANNELS if name not in candidate_traces)
         for name in UI_CHANNELS:
-            self.bscan_rows[name].append(candidate_traces[name])
-            self.bscan_rows_complex[name].append(np.asarray(trace_by_channel[name], dtype=np.complex128))
+            if name in candidate_traces:
+                self.bscan_rows[name].append(candidate_traces[name])
+                self.bscan_rows_complex[name].append(np.asarray(trace_by_channel[name], dtype=np.complex128))
+            else:
+                self.bscan_rows[name].append(np.zeros_like(candidate_time))
+                self.bscan_rows_complex[name].append(np.zeros(candidate_time.shape, dtype=np.complex128))
+        self._set_bscan_missing_channels(missing_channels)
         total_after = self.bscan_trace_count()
         self.bscan_window_start = bscan_start_after_append(
             self.bscan_window_start,
@@ -4493,6 +4554,18 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         if not np.isfinite(max_abs) or max_abs <= 0.0:
             max_abs = 1.0
         return matrix, (-max_abs, max_abs)
+
+    def _set_bscan_missing_channels(self, missing: tuple[str, ...]) -> None:
+        """单通道采集时在没采的那幅 B-scan 标题上注明“本次未采集”。"""
+        if tuple(missing) == getattr(self, "_bscan_missing_channels", ()):
+            return
+        self._bscan_missing_channels = tuple(missing)
+        for name in UI_CHANNELS:
+            plot = getattr(self, "bscan_plots", {}).get(name)
+            if plot is None:
+                continue
+            suffix = "（本次未采集）" if name in missing else ""
+            plot.setTitle(f"{CHANNEL_LABELS[name]} B-scan{suffix}")
 
     def refresh_bscan_views(self) -> None:
         self._update_bscan_window_controls()
@@ -4686,10 +4759,14 @@ class GroundStationWindow(QtWidgets.QMainWindow):
                 self.legacy_status.setText("旧格式NPZ仅包含S11；没有S22，未加入双通道B-scan")
                 self.dewow_status.setText("Dewow：旧格式默认启用")
             else:
-                trace_candidates = {"S11": decoded.trace_s11, "S22": decoded.trace_s22}
+                trace_candidates = {
+                    name: trace
+                    for name, trace in (("S11", decoded.trace_s11), ("S22", decoded.trace_s22))
+                    if trace is not None
+                }
                 try:
                     validated_time, validated_traces = validate_bscan_trace(
-                        decoded.time_ns, trace_candidates
+                        decoded.time_ns, trace_candidates, channels=tuple(trace_candidates) or UI_CHANNELS
                     )
                 except (TypeError, ValueError) as exc:
                     self.log(f"Trace {decoded.trace_index} 已拒绝：{exc}")

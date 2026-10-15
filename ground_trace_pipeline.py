@@ -148,6 +148,17 @@ def decode_ground_trace_payload(
             )
             legacy_trace = None
         elif (
+            declared_channels is not None
+            and list(declared_channels) in (["S11"], ["S22"])
+            and trace_keys == set(declared_channels)
+        ):
+            # 单通道采集（只采 HH 或只采 VV）：必须显式声明 channels，且只含该通道。
+            _validate_optional_display_fields(data, files, freq)
+            only = declared_channels[0]
+            trace_s11 = np.asarray(data["trace_S11"], dtype=float) if only == "S11" else None
+            trace_s22 = np.asarray(data["trace_S22"], dtype=float) if only == "S22" else None
+            legacy_trace = None
+        elif (
             npz_channels is None
             and header_channels is None
             and not trace_keys

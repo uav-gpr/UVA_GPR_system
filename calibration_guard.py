@@ -69,7 +69,7 @@ class CalibrationFit:
         if self.stale:
             return f"{STALE_HINT}：" + "；".join(self.reasons)
         if self.warnings:
-            return "校准提醒：" + "；".join(self.warnings) + "（校准仍在使用，建议重新校准）"
+            return "校准提醒：" + "；".join(self.warnings)
         return ""
 
     def to_dict(self) -> dict[str, object]:
@@ -168,11 +168,13 @@ def evaluate_calibration_fit(
             if ref_power is not None and abs(float(ref_power) - float(getattr(sweep, "power_dbm"))) > POWER_TOLERANCE_DBM:
                 fit.warnings.append(
                     f"发射功率由校准时的 {float(ref_power):g} dBm 改为 {float(getattr(sweep, 'power_dbm')):g} dBm"
+                    "（校准仍在使用，建议重新校准）"
                 )
             ref_ifbw = reference_sweep.get("ifbw_hz")
             if ref_ifbw is not None and int(float(ref_ifbw)) != int(getattr(sweep, "ifbw_hz")):
                 fit.warnings.append(
                     f"中频带宽由校准时的 {int(float(ref_ifbw))} Hz 改为 {int(getattr(sweep, 'ifbw_hz'))} Hz"
+                    "（校准仍在使用，建议重新校准）"
                 )
         except (TypeError, ValueError):
             pass

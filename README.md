@@ -139,11 +139,13 @@ py -3.12 -m venv .venv312
   "disk_target_free_gb": 40.0,
   "log_max_bytes": 20971520,
   "log_backup_count": 10,
-  "calibration_path": ""
+  "calibration_path": "",
+  "experimental_s22_fast_sweep": false
 }
 ```
 
 - `gnss_port` 为空表示自动识别，`off` 表示禁用。
+- 采集通道在地面站“设置中心 → 采集控制 → 采集通道”里选。只采 HH 时雷达只让端口 1 发射（扫法 `0x1240`，真机验证过），速度约快一倍；只采 VV 默认仍两路一起扫再丢掉 HH（速度不变）。把 `experimental_s22_fast_sweep` 设为 `true` 后，只采 VV 改用只让端口 2 发射的扫法 `0x1208`——**这个扫法还没在真机上验证**，第一次用请对照双通道结果检查 VV 数据是否一致。
 - 磁盘剩余低于 `disk_min_free_gb` 时从最老的 run 开始清理到 `disk_target_free_gb`，优先删已送达数据；动到未送达数据会显式告警（DISK-ALARM）。
 - 命令行可覆盖配置：`--config` `--server HOST:PORT` `--gnss-port` `--gnss-baud` `--engine` `--autostart {true,false}`。
 

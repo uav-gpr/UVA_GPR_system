@@ -63,7 +63,23 @@
   - 回执与状态：`set_params`、`start/single`、`get_status` 结果带 `calibration_fit`（level=ok/warning/stale、message、reasons、warnings）。没有新增消息 type。
   - 地面站：操作栏右侧新增 `calibration_fit_label`（失效红底“校准已失效，请重新校准”，提醒橙底；正常隐藏），**不进状态栏**（状态栏冻结 3 个标签）；`set_params` 被拒时采集状态标签显示原因；打开校准对话框时把校准频率范围/频点数预填为当前采集设置。
   - 注意：导入的校准文件若频率轴与当前扫频不同，导入后会立刻显示“失效”并停用（以前是插值后静默使用）。
-  - 测试：`tests/test_calibration_guard.py`（23 项）。
+  - 测试：`tests/test_calibration_guard.py`（22 项）。
+- [x] 2026-10-15 单通道采集 + VV 背景扣除（分支 `feature/single-channel-vv-background`，叠在校准失效分支之上）。
+  - **通道选择**：`set_params` 新增 `channels`（`dual` / `S11` / `S22`），地面设置中心“采集控制”页新增“采集通道”下拉（`acquisition_channels_input`）。黑匣子把所选通道经 `AcquisitionTaskSpec.channels` → `ContinuousAcquisitionWorker` → `ProcessingConsumer`，只处理/保存/发送所选通道（NPZ 与遥测 `channels` 声明只含该通道）。legacy 引擎选单通道时拒绝启动。
+  - **第一阶段限制（重要）**：雷达仍用已在真机验证的双反射扫法 `0x1241`，只是丢弃没选的那一路，所以**扫描速度不变**，省的是处理、存储和链路带宽。真正只扫一个端口（提速）需要只采 S11 用 `0x1240`（已验证但连续采集后端未支持）、只采 S22 需新组合（推算为 `0x1208`，**未验证**，`ALLOWED_STAGES_BITMAPS` 禁止擅自扩展），必须先真机验证。
+  - **地面显示**：解码接受显式声明的单通道 payload；没采的那幅 B-scan 补零列（两幅道数保持同步），标题注明“（本次未采集）”，清空 B-scan 后恢复。HH/VV 两幅图与布局冻结约定不变。
+  - **单端口校准**：`build_osl_plan(..., ports=P1|P2|both)`，`cal_begin` 带 `ports`；校准对话框新增“OSL（只校 P1 / HH，三步）”“OSL（只校 P2 / VV，三步）”，打开对话框时按采集通道自动选。解算/激活/质量回报/文件导入（允许只有 P2 的文件）都支持缺一个端口。
+  - **VV 背景扣除**：空采解算同时保留 S22 行（`background_s22`），激活时用 P2 校正；采集时背景合成 `(2, F)`，`process_trace_pipeline` 各通道只减自己的背景（仍遵守 R-C-19 不交叉套用）。旧的单行背景语义（只扣 HH）保留兼容。背景导出新增 `background_s22_real/imag`。
+  - 校准匹配回报新增通道覆盖提醒：已有校准但所选通道缺对应端口校准或缺 VV 背景时给橙色提醒。
+  - 测试：`tests/test_single_channel_and_vv_background.py`（21 项，含模拟器真跑一次只采 S22 落盘）。
+- [x] 2026-10-15 单通道真正提速（同一分支 `feature/single-channel-vv-background` 第二个提交）。
+  - 只采 HH：雷达改用只让端口 1 发射的扫法 `0x1240`（真机 ACK 验证过），连续采集后端 `PersistentLibreVnaBackend` 现接受 `0x1240`，按扫法选数据点解析器（`parse_s11_point`），没测的 S22 填 0 占位，上层按所选通道丢弃。
+  - 只采 VV：新增 `S22_STAGES_BITMAP = 0x1208`（Stages=1 阶段，端口 2 在 stage0 发射，端口 1 指到不存在的 stage1；与 0x1240 对称推导），**未经真机验证**，不进 `ALLOWED_STAGES_BITMAPS`，只有 `SweepSettings(allow_experimental=True)` 才接受；解析 `parse_s22_point`（stage0 Port-2 / stage0 参考）。由 `air_config.json` 的 `experimental_s22_fast_sweep`（默认 false）控制；关闭时只采 VV 仍用 `0x1241` 再丢掉 HH。
+  - `air_core.stages_bitmap_for_channels()` 统一决定扫法；`AcquisitionService.open_and_start(cfg, stages_bitmap)`，扫法变化会触发 reconfigure（冻结配置字节含 bitmap）。启动日志打印“采集通道 / 雷达扫法”。
+  - 校准（OSL / 空采）仍用双通道 `0x1241` 采；端口 1 的接收路径在两种扫法下相同，按理误差项一致，但需真机对比确认。
+  - 模拟器按 SWEEP_SETTINGS 里的 bitmap 出三接收机单端口包，单阶段节奏减半。
+  - 删除旧用例 `test_librevna_backend.test_single_channel_0x1240_rejected`（行为已改）。新增测试 7 项（共 28 项）。
+  - **真机验证清单**：①只采 HH 实测速度≈双通道一半耗时、HH 数据与双通道 HH 一致；②打开开关后只采 VV：确认设备 ACK `0x1208`、每点 3 个接收机、VV 数据与双通道 VV 一致。
 
 ---
 

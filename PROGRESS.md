@@ -82,6 +82,11 @@
   - 删除旧用例 `test_librevna_backend.test_single_channel_0x1240_rejected`（行为已改）。新增测试 7 项（共 28 项）。
   - **真机验证清单**：①只采 HH 实测速度≈双通道一半耗时、HH 数据与双通道 HH 一致；②打开开关后只采 VV：确认设备 ACK `0x1208`、每点 3 个接收机、VV 数据与双通道 VV 一致。
 
+- [x] 2026-10-16 Windows 实测反馈修复（分支 `fix/hide-uncollected-channel`）。
+  - 单通道采集时主界面**隐藏**没采的那幅 B-scan（设置中心选了单通道即隐藏；收到的单通道数据也会触发），留下的那幅占满原来两幅的高度（该容器宽高比上限临时减半，隐藏行 row stretch=0）；容器仍在 `bscan_area` 布局里，只是 `setVisible(False)`，切回双通道或清空 B-scan 恢复。没采通道仍在内存里补零以保持道数同步，但不再显示。
+  - 色阶滑块面板加最小宽度 44 px、固定宽度策略，防止被 B-scan 挤没。用户反馈“看不到滑块”的主要原因是测的是 PR #4 分支（不含 PR #1），main 上已有滑块。
+  - 新增测试 3 项（`test_single_channel_and_vv_background.py` 共 31 项）。
+
 ---
 
 ## 4. 下一步任务建议

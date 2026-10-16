@@ -1217,7 +1217,7 @@ class AcquisitionSettingsDialog(QtWidgets.QDialog):
         self.channels_input.setObjectName("acquisition_channels_input")
         for mode_key, mode_label in CHANNEL_MODE_CHOICES:
             self.channels_input.addItem(mode_label, userData=mode_key)
-        self.channels_hint = QtWidgets.QLabel("只采一个通道时，另一幅 B-scan 显示“本次未采集”")
+        self.channels_hint = QtWidgets.QLabel("只采一个通道时，主界面只显示采集的那幅 B-scan")
         self.channels_hint.setObjectName("acquisition_channels_hint")
         form.addRow("采集模式", self.mode)
         form.addRow("采集间隔 (s)", self.interval)
@@ -3663,6 +3663,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         # 网格布局：第 0 列 = HH / VV / 历史滑块（行序与原 QVBoxLayout 一致），
         # 第 1 列 = 竖向色阶滑块（跨 HH、VV 两行）。
         left_layout = QtWidgets.QGridLayout(left)
+        self._bscan_grid = left_layout
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setHorizontalSpacing(4)
         left_layout.setVerticalSpacing(8)
@@ -3732,6 +3733,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         """B-scan 右侧竖向色阶滑块：调整 colorbar 显示范围（颜色深浅）。"""
         panel = QtWidgets.QWidget()
         panel.setObjectName("bscan_contrast_panel")
+        # 防止窄窗口/高 DPI 下被 B-scan 挤成 0 宽而看不见。
+        panel.setMinimumWidth(44)
+        panel.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred)
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -3965,7 +3969,46 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
     def apply_acquisition_settings(self, settings: AcquisitionUiSettings) -> None:
         self.acq_settings = settings
+        self._update_bscan_channel_visibility()
         self.log("采集设置已应用")
+
+    def _selected_ui_channels(self) -> tuple[str, ...]:
+        """设置中心“采集通道”对应要显示的 B-scan（dual = 两幅都显示）。"""
+        mode = str(getattr(getattr(self, "acq_settings", None), "channels", "dual") or "dual")
+        if mode in UI_CHANNELS:
+            return (mode,)
+        return tuple(UI_CHANNELS)
+
+    def _update_bscan_channel_visibility(self) -> None:
+        """单通道采集时隐藏没采的那幅 B-scan，让采集的那幅占满。
+
+        要显示：设置里选了这个通道，且最新一道数据没有缺它。
+        容器仍留在 bscan_area 布局里（冻结约定），只是 setVisible(False)。
+        """
+        containers = getattr(self, "bscan_containers", {})
+        if not containers:
+            return
+        selected = set(self._selected_ui_channels())
+        missing = set(getattr(self, "_bscan_missing_channels", ()))
+        wanted = {name for name in UI_CHANNELS if name in selected and name not in missing}
+        if not wanted:  # 兜底：绝不两幅都藏
+            wanted = set(UI_CHANNELS) - missing or set(UI_CHANNELS)
+        grid = getattr(self, "_bscan_grid", None)
+        ratio = getattr(self, "_bscan_aspect_value", None)
+        if ratio is None:
+            ratio = float(getattr(getattr(self, "bscan_settings", None), "aspect_ratio", 2.0))
+        single = len(wanted) == 1
+        for index, name in enumerate(UI_CHANNELS):
+            container = containers.get(name)
+            if container is None:
+                continue
+            visible = name in wanted
+            container.setVisible(visible)
+            if grid is not None:
+                # 藏起来的那一行不再占高度，留下的那幅占满两行的位置。
+                grid.setRowStretch(index, 1 if visible else 0)
+            # 只剩一幅时高度上限放宽一倍（原来两幅叠放的总高），否则下面会留大片空白。
+            container.set_aspect_ratio(ratio / 2.0 if (single and visible) else ratio)
 
     def sweep_params(self) -> dict[str, object]:
         return self.acq_settings.sweep_params()
@@ -4575,8 +4618,10 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.refresh_bscan_views()
 
     def update_bscan_aspect_ratio(self, value: float) -> None:
+        self._bscan_aspect_value = float(value)
         for container in getattr(self, "bscan_containers", {}).values():
             container.set_aspect_ratio(value)
+        self._update_bscan_channel_visibility()
 
     def flat_filter_window(self) -> int:
         value = max(3, int(self.bscan_settings.flat_window_traces))
@@ -4658,6 +4703,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         if tuple(missing) == getattr(self, "_bscan_missing_channels", ()):
             return
         self._bscan_missing_channels = tuple(missing)
+        self._update_bscan_channel_visibility()
         for name in UI_CHANNELS:
             plot = getattr(self, "bscan_plots", {}).get(name)
             if plot is None:

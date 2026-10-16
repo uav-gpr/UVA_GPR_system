@@ -39,7 +39,7 @@
 - **核心测试避坑指南（必须遵守）**：
   1. **严禁**使用单进程 `python -m unittest discover` 跑全量：Qt 6.11.2 下 WebEngine 在单进程连续运行第 72 个用例左右会抛出 `CalledOnValidBrowserThread` 崩溃，这是 Qt 引擎机制，必须走 `run_tests_batched.py` 的独立子进程分批执行。
   2. **判绿依据**：测试通过与否以子进程输出的 `^OK` 为准。部分 Qt 进程在 teardown 时可能以 0xC0000005 退出，但只要测试输出全 OK 即代表通过，切勿仅凭进程退出码误报回归。
-  3. **测试规模基线**：重构前 42 模块 1191 项；2026-10-15 退役空中端旧 GUI 后删除约 84 项纯旧窗口用例、新增 `tests/test_air_core_headless.py` 7 项守卫，现为 41 模块约 1100 项（以 Windows 实跑为准）。
+  3. **测试规模基线**：重构前 42 模块 1191 项；2026-10-15 退役空中端旧 GUI 后删除约 84 项纯旧窗口用例、新增 `tests/test_air_core_headless.py` 7 项守卫，再加校准失效、单通道、色阶滑块等新测试，以 Windows 实跑为准；另有 30 项独立黑匣子端到端 E2E 测试。
 
 ---
 
@@ -49,6 +49,7 @@
 - [x] Round 6：B-scan 显存与显示窗口扩展（64 -> 256）及空中端远程连接体验优化。
 - [x] Round 7：空中端黑匣子无头服务（headless service）与计算棒远程部署。
 - [x] Round 8：标定校准与背景采集修复（OSL 激活会话状态隔离、v2 校准文件传输适配、P1 重采状态机重置，42 模块 1191 项全绿）。
+- [x] 2026-10-15 小功能：地面站 B-scan 右侧新增竖向「色阶」滑块（`bscan_contrast_slider`，1–100%，默认 100% = 原自动色阶行为），按百分比收窄 colorbar 显示范围以调整颜色深浅；S11/S22 各按自身 max|x| 缩放；拖动只调 `ImageItem.setLevels`，不重算矩阵；「重置」为 QToolButton（主窗口 QPushButton 仍只有开始/停止/暂停/继续）。`bscan_area` 改为 QGridLayout（第 0 列 HH/VV/历史滑块，第 1 列色阶滑块），行序与原契约一致。新增 `tests/test_bscan_contrast_slider.py`（4 项），测试基线变为 43 模块 1195 项。
 
 - [x] 2026-10-15 架构技术债第 1 步（分支 `refactor/air-core-retire-air-gui`）：空中端旧 GUI（MainWindow、BScanWidget、AirSettingsDialog、`_apply_trace_to_ui`、`_ServiceCalibrationCapturerProxy`、`main`）删除；核心原样改名 `air_core.py`（7207 → 约 4700 行，逻辑零改动）；黑匣子服务/air_gnss/field_test 改 import `air_core`；黑匣子 import 时不再加载 QtWidgets/QtGui/WebEngine/pyqtgraph。
   - 测试迁移规则：依赖空中端窗口的用例删除（其行为由黑匣子服务测试 round7/round8 覆盖）；混在其中的核心或地面端断言已拆出保留。

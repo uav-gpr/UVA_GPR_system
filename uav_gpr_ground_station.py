@@ -1147,6 +1147,37 @@ class BscanUiSettings:
     flat_window_traces: int = 31
 
 
+# 色阶（colorbar）显示范围滑块：百分比 = 显示范围占当前窗口 max|x| 的比例。
+# 100% 与改动前行为完全一致（[-max_abs, +max_abs]）；调小则范围收窄、
+# 弱反射颜色更深、强反射饱和。S11/S22 各自按自身 max_abs 缩放。
+BSCAN_CONTRAST_MIN_PERCENT = 1
+BSCAN_CONTRAST_MAX_PERCENT = 100
+BSCAN_CONTRAST_DEFAULT_PERCENT = 100
+
+
+def bscan_contrast_levels(max_abs: float, percent: float) -> tuple[float, float]:
+    """按色阶百分比计算对称显示范围 ``(-v, +v)``，``v = max_abs * percent / 100``。
+
+    ``percent`` 裁剪到 [BSCAN_CONTRAST_MIN_PERCENT, BSCAN_CONTRAST_MAX_PERCENT]；
+    ``max_abs`` 非有限或非正时按 1.0 处理，结果恒为有限非零范围。
+    """
+    try:
+        base = float(max_abs)
+    except (TypeError, ValueError):
+        base = 1.0
+    if not math.isfinite(base) or base <= 0.0:
+        base = 1.0
+    try:
+        pct = float(percent)
+    except (TypeError, ValueError):
+        pct = float(BSCAN_CONTRAST_DEFAULT_PERCENT)
+    if not math.isfinite(pct):
+        pct = float(BSCAN_CONTRAST_DEFAULT_PERCENT)
+    pct = min(max(pct, float(BSCAN_CONTRAST_MIN_PERCENT)), float(BSCAN_CONTRAST_MAX_PERCENT))
+    value = base * pct / 100.0
+    return -value, value
+
+
 class AcquisitionSettingsDialog(QtWidgets.QDialog):
     """地面端设置中心对话框：包含采集任务控制、VNA 扫描参数与信号处理参数页。"""
 
@@ -3427,6 +3458,8 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.bscan_filter_status_override: str | None = None
         self.bscan_window_start = 1
         self.bscan_follow_latest = True
+        self.bscan_contrast_percent = BSCAN_CONTRAST_DEFAULT_PERCENT
+        self._bscan_max_abs: dict[str, float] = {}
         # ---- 第1轮检查点B：显示 FIFO + 后台解码线程 + 性能统计 ----
         # 显示队列是显式 FIFO：按到达顺序逐条提交，每条 Trace 恰好提交一次；
         # 一次定时回调最多提交一条，然后把控制权还给 Qt 事件循环（25Hz 下每条
@@ -3627,9 +3660,14 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
         left = QtWidgets.QWidget()
         left.setObjectName("bscan_area")
-        left_layout = QtWidgets.QVBoxLayout(left)
+        # 网格布局：第 0 列 = HH / VV / 历史滑块（行序与原 QVBoxLayout 一致），
+        # 第 1 列 = 竖向色阶滑块（跨 HH、VV 两行）。
+        left_layout = QtWidgets.QGridLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
+        left_layout.setHorizontalSpacing(4)
+        left_layout.setVerticalSpacing(8)
+        left_layout.setColumnStretch(0, 1)
+        left_layout.setColumnStretch(1, 0)
 
         # B-scan 是地面站主要产品：上下排列，HH 在上、VV 在下。
         self.bscan_plots: dict[str, pg.PlotWidget] = {}
@@ -3656,7 +3694,11 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             self.bscan_plots[name] = plot
             self.bscan_images[name] = image
             self.bscan_containers[name] = container
-            left_layout.addWidget(container, 1)
+            left_layout.addWidget(container, index, 0)
+            left_layout.setRowStretch(index, 1)
+        left_layout.addWidget(
+            self._build_bscan_contrast_panel(), 0, 1, len(UI_CHANNELS), 1
+        )
 
         slider_row = QtWidgets.QWidget()
         slider_row.setObjectName("bscan_history_row")
@@ -3673,7 +3715,8 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.bscan_window_label.setMinimumWidth(140)
         slider_layout.addWidget(self.bscan_window_slider, 1)
         slider_layout.addWidget(self.bscan_window_label)
-        left_layout.addWidget(slider_row)
+        left_layout.addWidget(slider_row, len(UI_CHANNELS), 0)
+        left_layout.setRowStretch(len(UI_CHANNELS), 0)
 
         self.gnss_map = GnssMapWidget()
         self.gnss_map.setObjectName("gnss_map")
@@ -3684,6 +3727,58 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([966, 414])  # 约 70:30
         return splitter
+
+    def _build_bscan_contrast_panel(self) -> QtWidgets.QWidget:
+        """B-scan 右侧竖向色阶滑块：调整 colorbar 显示范围（颜色深浅）。"""
+        panel = QtWidgets.QWidget()
+        panel.setObjectName("bscan_contrast_panel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        title = QtWidgets.QLabel("色阶")
+        title.setObjectName("bscan_contrast_title")
+        title.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        self.bscan_contrast_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
+        self.bscan_contrast_slider.setObjectName("bscan_contrast_slider")
+        self.bscan_contrast_slider.setRange(BSCAN_CONTRAST_MIN_PERCENT, BSCAN_CONTRAST_MAX_PERCENT)
+        self.bscan_contrast_slider.setValue(int(self.bscan_contrast_percent))
+        self.bscan_contrast_slider.setSingleStep(1)
+        self.bscan_contrast_slider.setPageStep(10)
+        self.bscan_contrast_slider.setToolTip(
+            "调整 B-scan 色阶显示范围（相对当前窗口最大幅值的百分比）。\n"
+            "调小：范围收窄，弱反射颜色更深、更明显；调大：颜色变浅。"
+        )
+        self.bscan_contrast_slider.valueChanged.connect(self.on_bscan_contrast_changed)
+        self.bscan_contrast_label = QtWidgets.QLabel(f"{int(self.bscan_contrast_percent)}%")
+        self.bscan_contrast_label.setObjectName("bscan_contrast_label")
+        self.bscan_contrast_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        self.bscan_contrast_label.setMinimumWidth(40)
+        # QToolButton（非 QPushButton）：主窗口业务按钮仍只有开始/停止/暂停/继续。
+        self.bscan_contrast_reset_button = QtWidgets.QToolButton()
+        self.bscan_contrast_reset_button.setText("重置")
+        self.bscan_contrast_reset_button.setObjectName("bscan_contrast_reset_button")
+        self.bscan_contrast_reset_button.setToolTip("恢复 100%（自动色阶，与原显示一致）")
+        self.bscan_contrast_reset_button.setMaximumWidth(48)
+        self.bscan_contrast_reset_button.clicked.connect(self.reset_bscan_contrast)
+        layout.addWidget(title)
+        layout.addWidget(self.bscan_contrast_slider, 1, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.bscan_contrast_label)
+        layout.addWidget(self.bscan_contrast_reset_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        return panel
+
+    def on_bscan_contrast_changed(self, value: int) -> None:
+        """色阶滑块变化：只改各通道 ImageItem 的 levels，不重算显示矩阵。"""
+        percent = min(max(int(value), BSCAN_CONTRAST_MIN_PERCENT), BSCAN_CONTRAST_MAX_PERCENT)
+        self.bscan_contrast_percent = percent
+        self.bscan_contrast_label.setText(f"{percent}%")
+        for name, image_item in getattr(self, "bscan_images", {}).items():
+            max_abs = self._bscan_max_abs.get(name)
+            if max_abs is None or image_item.image is None:
+                continue
+            image_item.setLevels(bscan_contrast_levels(max_abs, percent))
+
+    def reset_bscan_contrast(self) -> None:
+        self.bscan_contrast_slider.setValue(BSCAN_CONTRAST_DEFAULT_PERCENT)
 
     def _build_status_bar(self) -> None:
         status = self.statusBar()
@@ -4390,6 +4485,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             else "Flat Filter：无数据"
         )
         self.dewow_status.setText("Dewow：等待数据")
+        self._bscan_max_abs.clear()
         for name, image in self.bscan_images.items():
             image.clear()
             self.bscan_plots[name].setXRange(0.5, BSCAN_WINDOW_TRACES + 0.5, padding=0)
@@ -4524,7 +4620,8 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         - 只构造可见窗口（成本与历史长度无关）；
         - Flat Filter 开启时执行邻域窗口化滤波（结果与全历史滤波一致）；
         - 色阶显式计算：实部关于 0 对称 [-max_abs, +max_abs]；全零/全 NaN
-          时使用安全非零范围；S11/S22 各自独立计算。
+          时使用安全非零范围；S11/S22 各自独立计算；
+        - 再乘以色阶滑块百分比（默认 100% = 原行为），见 bscan_contrast_levels。
         """
         rows_c = getattr(self, "bscan_rows_complex", {}).get(name, [])
         flat_window = self.flat_filter_window()
@@ -4553,7 +4650,8 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             max_abs = 0.0
         if not np.isfinite(max_abs) or max_abs <= 0.0:
             max_abs = 1.0
-        return matrix, (-max_abs, max_abs)
+        self._bscan_max_abs[name] = max_abs
+        return matrix, bscan_contrast_levels(max_abs, self.bscan_contrast_percent)
 
     def _set_bscan_missing_channels(self, missing: tuple[str, ...]) -> None:
         """单通道采集时在没采的那幅 B-scan 标题上注明“本次未采集”。"""

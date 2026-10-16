@@ -395,6 +395,35 @@ class GroundSingleChannelTests(unittest.TestCase):
         self.window.clear_bscan()
         self.assertNotIn("本次未采集", self.window.bscan_plots["S22"].getPlotItem().titleLabel.text)
 
+    def test_single_channel_setting_hides_other_bscan(self) -> None:
+        from dataclasses import replace
+
+        self.window.apply_acquisition_settings(replace(self.window.acq_settings, channels="S22"))
+        self.assertTrue(self.window.bscan_containers["S11"].isHidden())
+        self.assertFalse(self.window.bscan_containers["S22"].isHidden())
+        # 容器仍是 bscan_area 布局的直接成员（冻结约定）
+        layout = self.window.findChild(self.ground.QtWidgets.QWidget, "bscan_area").layout()
+        self.assertGreaterEqual(layout.indexOf(self.window.bscan_containers["S11"]), 0)
+        self.window.apply_acquisition_settings(replace(self.window.acq_settings, channels="dual"))
+        self.assertFalse(self.window.bscan_containers["S11"].isHidden())
+        self.assertFalse(self.window.bscan_containers["S22"].isHidden())
+
+    def test_single_channel_trace_hides_missing_plot_until_clear(self) -> None:
+        f = _freq()
+        cfg = air.SweepConfig(start_mhz=400, stop_mhz=4000, points=9)
+        raw = {"S11": np.full(9, 0.4 - 0.2j)}
+        display, time_ns, traces = air.process_trace_pipeline(f, raw, cfg)
+        payload = air.trace_npz_bytes(1, cfg, f, raw, display, time_ns, traces, air.GgaFix(), channels=("S11",))
+        self.window.on_trace({"channels": ["S11"], "trace_index": 1}, payload, "t1.npz")
+        self.assertTrue(self.window.bscan_containers["S22"].isHidden())
+        self.assertFalse(self.window.bscan_containers["S11"].isHidden())
+        self.window.clear_bscan()
+        self.assertFalse(self.window.bscan_containers["S22"].isHidden())
+
+    def test_contrast_slider_panel_has_min_width(self) -> None:
+        panel = self.window.findChild(self.ground.QtWidgets.QWidget, "bscan_contrast_panel")
+        self.assertGreaterEqual(panel.minimumWidth(), 40)
+
     def test_calibration_dialog_follows_channel_choice(self) -> None:
         from dataclasses import replace
 

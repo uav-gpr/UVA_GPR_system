@@ -60,6 +60,8 @@ from librevna.librevna_protocol import (
     REQUEST_DEVICE_INFO,
     SET_IDLE,
     S11_S22_STAGES_BITMAP,
+    S11_STAGES_BITMAP,
+    S22_STAGES_BITMAP,
     SWEEP_SETTINGS,
     VNA_DATAPOINT,
     LibreVnaDeviceInfo,
@@ -68,7 +70,9 @@ from librevna.librevna_protocol import (
     SweepSettings,
     decode_device_info,
     encode_packet,
+    parse_s11_point,
     parse_s11_s22_point,
+    parse_s22_point,
 )
 from librevna.librevna_transport import LibreVnaTransportProtocol, LibreVnaUsbTransport
 
@@ -1005,7 +1009,7 @@ class PersistentLibreVnaBackend:
                 self._enqueue_pending(packet)
                 return None
             try:
-                parsed = parse_s11_s22_point(packet.payload)
+                parsed = self._parse_point(packet.payload)
             except struct.error as exc:
                 raise LibreVnaProtocolError(
                     f"VNA 数据包损坏/截断（payload {len(packet.payload)} 字节）"
@@ -1028,6 +1032,29 @@ class PersistentLibreVnaBackend:
             return None
         self._stats.ignored_packets += 1
         return None
+
+    def _parse_point(self, payload: bytes) -> tuple[int, float, complex, complex] | None:
+        """按当前扫法解析一个数据点，统一成 (点号, 频率, S11, S22)。
+
+        单端口扫法（0x1240 只采 S11 / 0x1208 只采 S22）里没测的那一路填 0；
+        上层按所选通道只保留测到的那一路，占位值不会进入处理/保存。
+        """
+        bitmap = (
+            self._frozen_settings.stages_bitmap
+            if self._frozen_settings is not None
+            else S11_S22_STAGES_BITMAP
+        )
+        if bitmap == S11_STAGES_BITMAP:
+            single = parse_s11_point(payload)
+            if single is None:
+                return None
+            return single[0], single[1], single[2], 0j
+        if bitmap == S22_STAGES_BITMAP:
+            single = parse_s22_point(payload)
+            if single is None:
+                return None
+            return single[0], single[1], 0j, single[2]
+        return parse_s11_s22_point(payload)
 
     def _enqueue_pending(self, packet: Packet) -> None:
         """把 packet 加入 pending；溢出 fail-closed（抛溢出错误）。"""
@@ -1062,13 +1089,16 @@ class PersistentLibreVnaBackend:
         self, settings: SweepSettings, info: LibreVnaDeviceInfo
     ) -> None:
         """在**任何 USB 写入前**校验设备能力；不支持即抛错（不破坏当前会话）。"""
-        if settings.stages_bitmap != S11_S22_STAGES_BITMAP:
+        if settings.stages_bitmap not in (
+            S11_S22_STAGES_BITMAP,
+            S11_STAGES_BITMAP,
+            S22_STAGES_BITMAP,
+        ):
             raise LibreVnaUnsupportedConfigError(
-                f"PersistentLibreVnaBackend 仅支持双反射 S11/S22（stages_bitmap "
-                f"0x1241）；收到 {settings.stages_bitmap:#x}。单通道/四参数采集请"
-                "继续使用 legacy acquire_s11()/acquire_sparameters()。"
+                f"PersistentLibreVnaBackend 仅支持双反射 0x1241、只采 S11 0x1240、"
+                f"只采 S22 0x1208（实验）；收到 {settings.stages_bitmap:#x}。"
             )
-        if info.num_ports < 2:
+        if settings.stages_bitmap != S11_STAGES_BITMAP and info.num_ports < 2:
             raise LibreVnaUnsupportedConfigError(
                 f"双反射 S11/S22 需要设备 num_ports>=2，实际 {info.num_ports}"
             )

@@ -93,6 +93,7 @@ from calibration_service import (  # noqa: E402
     REPEATS_MIN,
     build_background_plan,
     build_osl_plan,
+    normalize_osl_ports,
     build_reference_background,
     calibration_from_measurements,
     calibration_points_payload,
@@ -135,6 +136,8 @@ from librevna.librevna_continuous import (  # noqa: E402
 from librevna.librevna_errors import LibreVnaSweepError  # noqa: E402
 from librevna.librevna_protocol import (  # noqa: E402
     S11_S22_STAGES_BITMAP,
+    S11_STAGES_BITMAP,
+    S22_STAGES_BITMAP,
     SweepSettings,
 )
 from librevna.simulated_transport import (  # noqa: E402
@@ -729,6 +732,59 @@ def dual_channel_raw(raw: np.ndarray) -> dict[str, np.ndarray]:
 # re-export，``air.CalibrationMeasurement`` 等引用不变）。
 S_PARAMETERS = ("S11", "S21", "S12", "S22")
 UI_CHANNELS = ("S11", "S22")
+#: 采集通道选择（用户可选只采一个通道）。值 → 实际保留的通道。
+CHANNEL_MODES: dict[str, tuple[str, ...]] = {
+    "dual": ("S11", "S22"),
+    "S11": ("S11",),
+    "S22": ("S22",),
+}
+CHANNEL_MODE_LABELS = {"dual": "双通道 HH+VV", "S11": "只采 HH (S11)", "S22": "只采 VV (S22)"}
+
+
+def normalize_channel_mode(value: object) -> str:
+    """把 ``channels`` 参数规范成 ``dual`` / ``S11`` / ``S22``（非法抛 ValueError）。
+
+    接受字符串（dual/both/S11/S22，大小写不敏感）或通道列表。
+    """
+    if isinstance(value, (list, tuple)):
+        names = tuple(str(v).strip().upper() for v in value)
+        for mode, channels in CHANNEL_MODES.items():
+            if names == channels:
+                return mode
+        raise ValueError(f"channels 非法: {list(value)!r}（可选 [S11,S22] / [S11] / [S22]）")
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if lowered in ("dual", "both", "s11+s22", "hh+vv"):
+        return "dual"
+    if lowered in ("s11", "hh"):
+        return "S11"
+    if lowered in ("s22", "vv"):
+        return "S22"
+    raise ValueError(f"channels 非法: {value!r}（可选 dual / S11 / S22）")
+
+
+def stages_bitmap_for_channels(channels: Sequence[str], *, experimental_s22_fast_sweep: bool = False) -> int:
+    """按所选通道选雷达扫法（这才是真正提速的地方）。
+
+    - 双通道 → 0x1241（两个端口轮流发射，真机验证过）；
+    - 只采 HH → 0x1240（只让端口 1 发射，真机验证过，约快一倍）；
+    - 只采 VV → 打开实验开关时 0x1208（只让端口 2 发射，**未经真机验证**），
+      否则仍用 0x1241 扫两路再丢掉 HH（速度不变，但稳妥）。
+    """
+    names = tuple(channels)
+    if names == ("S11",):
+        return S11_STAGES_BITMAP
+    if names == ("S22",) and experimental_s22_fast_sweep:
+        return S22_STAGES_BITMAP
+    return S11_S22_STAGES_BITMAP
+
+
+def select_channels(raw_sparams: dict[str, np.ndarray], channels: Sequence[str]) -> dict[str, np.ndarray]:
+    """只保留选中的通道（单通道采集）。"""
+    missing = [name for name in channels if name not in raw_sparams]
+    if missing:
+        raise ValueError(f"原始数据缺少所选通道: {', '.join(missing)}")
+    return {name: raw_sparams[name] for name in channels}
 CHANNEL_LABELS = {"S11": "HH (S11)", "S22": "VV (S22)"}
 CHANNEL_COLORS = {"S11": "#0077b6", "S22": "#6d597a"}
 
@@ -1378,13 +1434,13 @@ def apply_reflection_and_through_calibration(
     through: CalibrationMeasurement | None,
 ) -> dict[str, np.ndarray]:
     display = {name: values.copy() for name, values in raw_sparams.items()}
-    if calibration_p1:
+    if calibration_p1 and "S11" in raw_sparams:
         f_min = float(calibration_p1.points[0].frequency)
         f_max = float(calibration_p1.points[-1].frequency)
         if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
             raise ValueError(f"S11 校准频率覆盖不足 [{f_min:g}, {f_max:g}] Hz，禁止带外外推")
         display["S11"] = np.array([calibration_p1.correct(f, s) for f, s in zip(frequency_hz, raw_sparams["S11"])], dtype=np.complex128)
-    if calibration_p2:
+    if calibration_p2 and "S22" in raw_sparams:
         f_min = float(calibration_p2.points[0].frequency)
         f_max = float(calibration_p2.points[-1].frequency)
         if frequency_hz[0] < f_min - 1e-6 or frequency_hz[-1] > f_max + 1e-6:
@@ -1471,7 +1527,8 @@ def process_trace_pipeline(
         if not np.array_equal(scan_frequency, background_frequency):
             raise ValueError("background frequency axis does not match the current scan frequency axis")
         background_values = np.asarray(background, dtype=np.complex128)
-        if background_values.shape != scan_frequency.shape:
+        # 背景可以是 (F,)（只有 HH/S11，旧语义）或 (2, F)（第 0 行 S11、第 1 行 S22）。
+        if background_values.shape != scan_frequency.shape and background_values.shape != (2,) + scan_frequency.shape:
             raise ValueError("background trace length does not match the current scan frequency axis")
         if not np.all(np.isfinite(background_values.real)) or not np.all(np.isfinite(background_values.imag)):
             raise ValueError("background trace must contain only finite values")
@@ -1486,7 +1543,14 @@ def process_trace_pipeline(
         through_measurement,
     )
     if background_values is not None:
-        display["S11"] = display["S11"] - background_values
+        if background_values.ndim == 1:
+            background_by_channel = {"S11": background_values}
+        else:
+            background_by_channel = {"S11": background_values[0], "S22": background_values[1]}
+        # 各通道只减自己的背景，绝不把一个通道的背景套到另一个通道（R-C-19）。
+        for name, values in background_by_channel.items():
+            if name in display:
+                display[name] = display[name] - values
 
     # 处理 raw_sparams 中真实存在的通道（legacy 四通道 / continuous 双通道）。
     channels = tuple(name for name in S_PARAMETERS if name in raw_sparams)
@@ -2851,9 +2915,11 @@ class ProcessingConsumer(QtCore.QThread):
         remote_sender: RemoteSender | None = None,
         drain_after_stop_s: float = 2.0,
         run_id: str | None = None,
+        channels: Sequence[str] = ("S11", "S22"),
     ) -> None:
         super().__init__()
         self._queue = queue
+        self.channels = tuple(channels)
         self._gnss_cache = gnss_cache
         self.cfg = cfg
         self.out_dir = out_dir
@@ -2908,8 +2974,9 @@ class ProcessingConsumer(QtCore.QThread):
         if enqueued_at > 0.0:
             _record_stage("processing_started", time.perf_counter() - enqueued_at)
         _processing_t0 = time.perf_counter()
-        # 连续采集为 S11/S22 双通道 schema（决策门 B）：只处理真实存在的通道。
-        channels = ("S11", "S22")
+        # 连续采集为 S11/S22 双通道 schema（决策门 B）：只处理真实存在的通道；
+        # 单通道采集时只保留用户选中的通道（处理/保存/发送都只有这一路）。
+        channels = tuple(getattr(self, "channels", ("S11", "S22")))
         lookup = self._gnss_cache.latest(item.midpoint_monotonic)
         self.last_gnss_age_ms = lookup.age_ms
         # 只有 lookup.valid 时才把缓存 Fix 当作当前有效定位传给保存/UI/遥测；
@@ -2918,6 +2985,8 @@ class ProcessingConsumer(QtCore.QThread):
         acquisition = self._acquisition_metadata(item, lookup)
         flight = self._flight_metadata(lookup, fix)
         raw_sparams = dual_channel_raw(item.raw)
+        if channels != ("S11", "S22"):
+            raw_sparams = select_channels(raw_sparams, channels)
         display, time_ns, trace_by_channel = process_trace_pipeline(
             item.frequency_hz,
             raw_sparams,
@@ -3326,6 +3395,10 @@ class AcquisitionTaskSpec:
     #: 在 cal_activate 之后填充；经 SelectedSweep 透传进每条 trace 的**嵌套**
     #: acquisition metadata（不进 telemetry framing 顶层，R-X-02）。
     calibration_id: str = ""
+    #: 采集通道（单通道采集：只保留选中的通道处理/保存/发送）。
+    channels: tuple[str, ...] = ("S11", "S22")
+    #: 只采 VV 时是否用未验证的单端口快速扫法 0x1208。
+    experimental_s22_fast_sweep: bool = False
 
 
 class AcquisitionService:
@@ -3454,7 +3527,7 @@ class AcquisitionService:
 
     # ---- 会话生命周期（由 worker 线程调用/服务命令入口调用）----
 
-    def _settings_of(self, cfg: SweepConfig) -> SweepSettings:
+    def _settings_of(self, cfg: SweepConfig, stages_bitmap: int = S11_S22_STAGES_BITMAP) -> SweepSettings:
         return SweepSettings(
             start_hz=int(cfg.start_mhz * 1e6),
             stop_hz=int(cfg.stop_mhz * 1e6),
@@ -3462,7 +3535,8 @@ class AcquisitionService:
             ifbw_hz=cfg.ifbw_hz,
             power_dbm=cfg.power_dbm,
             dwell_us=cfg.dwell_us,
-            stages_bitmap=S11_S22_STAGES_BITMAP,
+            stages_bitmap=stages_bitmap,
+            allow_experimental=stages_bitmap == S22_STAGES_BITMAP,
         )
 
     def _ensure_backend(self) -> PersistentLibreVnaBackend:
@@ -3488,7 +3562,7 @@ class AcquisitionService:
         return backend
 
     def open_and_start(
-        self, cfg: SweepConfig
+        self, cfg: SweepConfig, stages_bitmap: int = S11_S22_STAGES_BITMAP
     ) -> tuple[PersistentLibreVnaBackend, str]:
         """worker 线程启动会话入口。
 
@@ -3498,7 +3572,7 @@ class AcquisitionService:
         - 待命 + 配置字节相同：resume（不 reopen、不重 configure）
         - 待命 + 配置字节不同：reconfigure（configure_count+1，open_count 不变）
         """
-        settings = self._settings_of(cfg)
+        settings = self._settings_of(cfg, stages_bitmap)
         with self._lock:
             if self._state in (SERVICE_STATE_SHUTTING_DOWN, SERVICE_STATE_STOPPING):
                 raise RuntimeError(f"服务状态 {self._state} 不允许启动新任务")
@@ -4019,9 +4093,16 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
         statistics_interval_s: float = 0.5,
         service: AcquisitionService | None = None,
         task_spec: AcquisitionTaskSpec | None = None,
+        channels: Sequence[str] = ("S11", "S22"),
+        experimental_s22_fast_sweep: bool = False,
     ) -> None:
         super().__init__()
         self.cfg = cfg
+        self.channels = tuple(channels)
+        #: 实际下发给雷达的扫法（单通道时真正只让一个端口发射）。
+        self.stages_bitmap = stages_bitmap_for_channels(
+            self.channels, experimental_s22_fast_sweep=experimental_s22_fast_sweep
+        )
         self.interval_s = float(interval_s)
         self.out_dir = out_dir
         self.count = count
@@ -4226,7 +4307,9 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
                 # idle_waiting 且配置字节相同→resume（冻结配置，不重新 open）；
                 # 配置字节不同→reconfigure（configure_count+1、open_count 不变）。
                 phase = "启动常驻采集会话"
-                backend, session_path = self._service.open_and_start(self.cfg)
+                backend, session_path = self._service.open_and_start(
+                    self.cfg, getattr(self, "stages_bitmap", S11_S22_STAGES_BITMAP)
+                )
                 self._backend = backend
                 self.status.emit(
                     {
@@ -4520,6 +4603,7 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
             remote_sender=self.remote_sender,
             # 第2轮 §3.7：任务身份由 spec 下发；独立 worker 为 None（连接身份）。
             run_id=self._message_run_id(),
+            channels=self.channels,
         )
 
     def _sweep_settings(self) -> SweepSettings:
@@ -4531,7 +4615,8 @@ class ContinuousAcquisitionWorker(QtCore.QThread):
             ifbw_hz=cfg.ifbw_hz,
             power_dbm=cfg.power_dbm,
             dwell_us=cfg.dwell_us,
-            stages_bitmap=S11_S22_STAGES_BITMAP,
+            stages_bitmap=getattr(self, "stages_bitmap", S11_S22_STAGES_BITMAP),
+            allow_experimental=getattr(self, "stages_bitmap", None) == S22_STAGES_BITMAP,
         )
 
     def _pause_wait_for_wakeup(self, backend: PersistentLibreVnaBackend) -> bool:

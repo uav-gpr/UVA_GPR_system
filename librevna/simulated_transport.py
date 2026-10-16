@@ -249,6 +249,7 @@ class SimulatedLibreVnaTransport:
         self._reply = None
         self._freq_axis = []
         self._pace_point_s = 0.0
+        self._stages_bitmap = 0x1241
 
     def close(self) -> None:
         """断开“连接”（幂等）。"""
@@ -302,7 +303,7 @@ class SimulatedLibreVnaTransport:
         if self._point >= len(self._freq_axis):
             self._point = 0
             self._sweep_count += 1
-        return _vna_point_packet(freq_hz, point, s11, s22)
+        return _vna_point_packet(freq_hz, point, s11, s22, stages_bitmap=getattr(self, "_stages_bitmap", 0x1241))
 
     # ---- 内部 ----
 
@@ -324,8 +325,11 @@ class SimulatedLibreVnaTransport:
         step_hz = max(1, int(round((stop_hz - start_hz) / (points - 1))))
         axis = [start_hz + step_hz * index for index in range(points)]
         self._freq_axis = axis
-        # 逐点节奏 ≈ 双反射 2 阶段 / IFBW + 固件开销。
-        self._pace_point_s = (2.0 / max(int(ifbw_hz), 1)) + (
+        (stages_bitmap,) = struct.unpack_from("<H", payload, 25)
+        self._stages_bitmap = int(stages_bitmap)
+        stages = (self._stages_bitmap & 0x07) + 1
+        # 逐点节奏 ≈ 阶段数 / IFBW + 固件开销（单端口扫法 1 阶段，更快）。
+        self._pace_point_s = (float(stages) / max(int(ifbw_hz), 1)) + (
             FIRMWARE_POINT_OVERHEAD_S if self._pace else 0.0
         )
         self._point = 0
@@ -345,8 +349,27 @@ class SimulatedLibreVnaTransport:
         return value
 
 
-def _vna_point_packet(freq_hz: int, point: int, s11: complex, s22: complex) -> bytes:
-    """构造 protocol v14 双反射 VNADatapoint（六接收机，与真实硬件布局一致）。"""
+def _vna_point_packet(
+    freq_hz: int, point: int, s11: complex, s22: complex, *, stages_bitmap: int = 0x1241
+) -> bytes:
+    """构造 protocol v14 VNADatapoint。
+
+    双反射 0x1241：六接收机（与真实硬件布局一致）；只采 S11 0x1240 / 只采 S22
+    0x1208：只有 stage0 三个接收机，被激励端口的接收机给出反射值。
+    """
+    if stages_bitmap == 0x1240:
+        receivers = [(0x01, s11), (0x02, complex(9.0, 9.0)), (0x13, complex(1.0, 0.0))]
+    elif stages_bitmap == 0x1208:
+        receivers = [(0x01, complex(9.0, 9.0)), (0x02, s22), (0x13, complex(1.0, 0.0))]
+    else:
+        receivers = None
+    if receivers is not None:
+        count = len(receivers)
+        payload = struct.pack("<QhH", int(freq_hz), -1000, int(point))
+        payload += struct.pack("<" + "f" * count, *[v.real for _, v in receivers])
+        payload += struct.pack("<" + "f" * count, *[v.imag for _, v in receivers])
+        payload += bytes(d for d, _ in receivers)
+        return encode_packet(VNA_DATAPOINT, payload)
     receivers = [
         (0x01, s11),  # stage0 Port-1 接收机 → S11 分子
         (0x02, complex(9.0, 9.0)),  # stage0 Port-2（无关接收机，填充恒定值）

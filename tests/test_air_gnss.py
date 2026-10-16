@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import uav_gpr_air_service as service_module
-import uav_gpr_qt as air
+import air_core as air
 from air_gnss import AirGnssMonitor
 from PySide6 import QtWidgets
 

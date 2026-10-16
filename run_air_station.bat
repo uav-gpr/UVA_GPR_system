@@ -19,15 +19,19 @@ pause
 exit /b 1
 
 :python_found
-echo Starting UAV-GPR air station...
-echo Program: %~dp0uav_gpr_qt.py
+REM 2026-10-15: the old air-side GUI (uav_gpr_qt.py MainWindow) was retired.
+REM This launcher now starts the headless black-box service in local mode,
+REM sending to a ground station running on this same PC (127.0.0.1:8765).
+REM Start run_ground_station.bat as well and control everything from there.
+echo Starting UAV-GPR air black-box service (local mode, ground = 127.0.0.1:8765)...
+echo Program: %~dp0uav_gpr_air_service.py
 echo.
 
-"%PYTHON_EXE%" "%~dp0uav_gpr_qt.py"
+"%PYTHON_EXE%" "%~dp0uav_gpr_air_service.py" --server 127.0.0.1:8765 %*
 
 if errorlevel 1 (
     echo.
-    echo [Error] The air-station UI failed to start.
+    echo [Error] The air black-box service failed to start.
     pause
     exit /b 1
 )

@@ -297,7 +297,10 @@ def validate_calibration_content(
             return False, f"步骤 {mtype} 频率轴与其他步骤不一致", {}
 
     has_p1 = {"P1_Open", "P1_Short", "P1_Load"}.issubset(present_types) or {"Open", "Short", "Load"}.issubset(present_types)
-    if not has_p1:
+    has_any_p1 = bool(present_types & {"P1_Open", "P1_Short", "P1_Load", "Open", "Short", "Load"})
+    has_p2 = {"P2_Open", "P2_Short", "P2_Load"}.issubset(present_types)
+    # 单通道采集：允许只有 P2 的文件（只采 VV）；有 P1 痕迹就必须完整。
+    if not has_p1 and (has_any_p1 or not has_p2):
         return False, "缺少完整的一端口 P1 (Open, Short, Load) 标准件", {}
 
     return True, "", data
@@ -715,9 +718,41 @@ class CalibrationPlan:
         raise KeyError(f"计划中不存在步骤 {name!r}")
 
 
-def build_osl_plan(cal_id: str, repeats: int, config_snapshot: dict[str, object]) -> CalibrationPlan:
-    """六步双反射 OSL 计划（P1_Open…P2_Load，固定顺序，参考文档 §4.1）。"""
+OSL_PORT_CHOICES: dict[str, tuple[str, ...]] = {
+    "both": ("P1", "P2"),
+    "P1": ("P1",),
+    "P2": ("P2",),
+}
+
+
+def normalize_osl_ports(value: object) -> tuple[str, ...]:
+    """校准端口选择：both / P1 / P2（或列表），返回 ("P1","P2") 的子集。"""
+    if value is None or value == "":
+        return ("P1", "P2")
+    if isinstance(value, (list, tuple)):
+        ports = tuple(str(v).strip().upper() for v in value)
+        if ports in (("P1", "P2"), ("P1",), ("P2",)):
+            return ports
+        raise ValueError(f"校准端口非法: {list(value)!r}")
+    text = str(value).strip()
+    for key, ports in OSL_PORT_CHOICES.items():
+        if text.lower() == key.lower():
+            return ports
+    raise ValueError(f"校准端口非法: {value!r}（可选 both / P1 / P2）")
+
+
+def build_osl_plan(
+    cal_id: str,
+    repeats: int,
+    config_snapshot: dict[str, object],
+    ports: Sequence[str] = ("P1", "P2"),
+) -> CalibrationPlan:
+    """双反射 OSL 计划（P1_Open…P2_Load，固定顺序，参考文档 §4.1）。
+
+    ``ports`` 只选 P1 或 P2 时只有对应的 3 步（单通道采集用；另一端口不必接标准件）。
+    """
     repeats = validate_repeats(repeats)
+    ports = normalize_osl_ports(ports)
     steps = tuple(
         CalibrationStep(
             name=name,
@@ -727,6 +762,7 @@ def build_osl_plan(cal_id: str, repeats: int, config_snapshot: dict[str, object]
             config_snapshot=dict(config_snapshot),
         )
         for name in OSL_STEP_NAMES
+        if name.split("_", 1)[0] in ports
     )
     return CalibrationPlan(
         cal_id=cal_id,
@@ -1141,45 +1177,61 @@ class CalibrationSession:
         return progress.mean, progress.frequency_hz, list(progress.captures)
 
     def _solve_osl(self) -> dict[str, object]:
-        means = {name: self._mean_of(name) for name in OSL_STEP_NAMES}
-        frequency = means["P1_Open"][1]
+        step_names = [step.name for step in self.plan.steps]
+        means = {name: self._mean_of(name) for name in step_names}
+        first = step_names[0]
+        frequency = means[first][1]
         for name, (_mean, freq, _captures) in means.items():
             if not np.array_equal(freq, frequency):
-                raise ValueError(f"步骤 {name} 频率轴与 P1_Open 不一致，不能解算")
+                raise ValueError(f"步骤 {name} 频率轴与 {first} 不一致，不能解算")
         # 步骤均值是 (2, F) 双通道数组：P1 用 S11 行、P2 用 S22 行（固定通道
-        # 序，参考文档 §4.3——两套 D/T/M 绝不交换共用）。
-        p1 = solve_one_port_osl(
-            frequency,
-            means["P1_Open"][0][0],
-            means["P1_Short"][0][0],
-            means["P1_Load"][0][0],
-            s_parameter="S11",
-        )
-        p2 = solve_one_port_osl(
-            frequency,
-            means["P2_Open"][0][1],
-            means["P2_Short"][0][1],
-            means["P2_Load"][0][1],
-            s_parameter="S22",
-        )
+        # 序，参考文档 §4.3——两套 D/T/M 绝不交换共用）。单端口计划只解对应一套。
+        p1 = None
+        p2 = None
+        if "P1_Open" in means:
+            p1 = solve_one_port_osl(
+                frequency,
+                means["P1_Open"][0][0],
+                means["P1_Short"][0][0],
+                means["P1_Load"][0][0],
+                s_parameter="S11",
+            )
+        if "P2_Open" in means:
+            p2 = solve_one_port_osl(
+                frequency,
+                means["P2_Open"][0][1],
+                means["P2_Short"][0][1],
+                means["P2_Load"][0][1],
+                s_parameter="S22",
+            )
+        primary = p1 if p1 is not None else p2
+        assert primary is not None
         return {
             "mode": self.plan.mode,
             "cal_id": self.plan.cal_id,
             "frequency_hz": frequency,
             "p1_terms": p1,
             "p2_terms": p2,
-            "valid_band_hz": p1.valid_band_hz,
+            "valid_band_hz": primary.valid_band_hz,
             "profile_summary": self._profile_summary(p1, p2, frequency.size),
         }
 
     def _solve_background(self) -> dict[str, object]:
         mean, frequency, _captures = self._mean_of(BACKGROUND_STEP_NAME)
-        s11_mean = np.asarray(mean[0], dtype=np.complex128)
+        mean_array = np.asarray(mean, dtype=np.complex128)
+        s11_mean = np.asarray(mean_array[0], dtype=np.complex128)
+        # VV 背景：空采时 S22 一并采到了，各通道保留自己的背景（绝不互相套用）。
+        s22_mean = (
+            np.asarray(mean_array[1], dtype=np.complex128)
+            if mean_array.ndim == 2 and mean_array.shape[0] >= 2
+            else None
+        )
         return {
             "mode": self.plan.mode,
             "cal_id": self.plan.cal_id,
             "frequency_hz": frequency,
             "background": s11_mean,
+            "background_s22": s22_mean,
             "background_frequency_hz": frequency,
             "valid_band_hz": (float(frequency[0]), float(frequency[-1])),
             "profile_summary": {
@@ -1189,30 +1241,39 @@ class CalibrationSession:
             },
         }
 
-    def _profile_summary(self, p1: OSLTerms, p2: OSLTerms, points: int) -> dict[str, object]:
+    def _profile_summary(self, p1: OSLTerms | None, p2: OSLTerms | None, points: int) -> dict[str, object]:
         """地面展示用的结果摘要（全部 JSON 可序列化，R-C-11/16）。"""
         step_quality: dict[str, object] = {}
         for name in OSL_STEP_NAMES:
+            if name not in self._progress:
+                continue
             progress = self._progress[name]
             step_quality[name] = {
                 "captured": progress.captured,
                 "state": progress.state,
             }
-        return {
+
+        def _terms_summary(terms: OSLTerms | None) -> dict[str, object] | None:
+            if terms is None:
+                return None
+            return {
+                "s_parameter": terms.s_parameter,
+                "capture_counts": list(terms.capture_counts),
+                "quality_metrics": {k: v for k, v in terms.quality_metrics.items()},
+            }
+
+        summary: dict[str, object] = {
             "points": int(points),
             "repeats": self.plan.steps[0].repeats if self.plan.steps else 0,
-            "p1": {
-                "s_parameter": p1.s_parameter,
-                "capture_counts": list(p1.capture_counts),
-                "quality_metrics": {k: v for k, v in p1.quality_metrics.items()},
-            },
-            "p2": {
-                "s_parameter": p2.s_parameter,
-                "capture_counts": list(p2.capture_counts),
-                "quality_metrics": {k: v for k, v in p2.quality_metrics.items()},
-            },
             "steps": step_quality,
         }
+        # 单端口校准时没有的那一端口不写（避免伪造字段）。
+        if p1 is not None:
+            summary["p1"] = _terms_summary(p1)
+        if p2 is not None:
+            summary["p2"] = _terms_summary(p2)
+        summary["ports"] = [port for port, terms in (("P1", p1), ("P2", p2)) if terms is not None]
+        return summary
 
     def activate(self) -> dict[str, object]:
         """激活（终态）：返回接线层所需的生效组件（R-C-16）。
@@ -1237,6 +1298,7 @@ class CalibrationSession:
                 activation["p2_terms"] = result["p2_terms"]
             else:
                 activation["background"] = result["background"]
+                activation["background_s22"] = result.get("background_s22")
                 activation["background_frequency_hz"] = result["background_frequency_hz"]
             self._activation = activation
             self._state = self.STATE_ACTIVATED
@@ -1267,6 +1329,8 @@ class CalibrationSession:
 
 
 __all__ = [
+    "OSL_PORT_CHOICES",
+    "normalize_osl_ports",
     "BACKGROUND_STEP_NAME",
     "CALIBRATION_MODE_BACKGROUND",
     "CALIBRATION_MODE_OSL",

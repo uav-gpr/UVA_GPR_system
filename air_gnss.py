@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, replace
 
 from serial.tools import list_ports
-import uav_gpr_qt as air
+import air_core as air
 
 
 class AirGnssMonitor(air.GnssFixCache):

@@ -24,7 +24,7 @@ from unittest.mock import MagicMock
 import numpy as np
 from PySide6 import QtWidgets
 
-import uav_gpr_qt as air
+import air_core as air
 from uav_gpr_ground_station import GroundStationWindow
 
 _PROTOCOL = "uav-gpr-telemetry-v1"
@@ -52,56 +52,6 @@ def _fake_trace(time_end_ns: float = 40.0, points: int = 32) -> tuple[np.ndarray
     }
     return time_ns, traces
 
-
-class AirStationAutoClearTests(unittest.TestCase):
-    """空中端：开始新采集清空、停止保留。"""
-
-    def setUp(self) -> None:
-        self.app = _app()
-        self.win = air.MainWindow()
-
-    def test_start_acquisition_clears_bscan_history(self) -> None:
-        time_ns, traces = _fake_trace()
-        self.assertTrue(
-            self.win._append_bscan_trace(time_ns, traces),
-            "前置：注入历史道必须成功",
-        )
-        self.assertGreater(len(self.win.bscan["S11"]), 0)
-
-        # 断言 clear_bscan 会被 start_acquisition 调用（spy 不替换行为）。
-        calls: list[bool] = []
-        original_clear = self.win.clear_bscan
-
-        def spy_clear() -> None:
-            calls.append(True)
-            original_clear()
-
-        self.win.clear_bscan = spy_clear  # type: ignore[method-assign]
-
-        # 走 legacy 分支：worker 用哨兵替换（不真开 USB）。
-        self.win.continuous_enabled.setChecked(False)
-        self.win.remote_enable.setChecked(False)
-        sentinel = MagicMock()
-        sentinel.isRunning = MagicMock(return_value=False)
-        sentinel.trace_ready = MagicMock()
-        sentinel.status = MagicMock()
-        sentinel.failed = MagicMock()
-        sentinel.finished_run = MagicMock()
-        with unittest.mock.patch.object(air, "AcquisitionWorker", return_value=sentinel):
-            self.win.start_acquisition(single=True)
-
-        self.assertTrue(calls, "start_acquisition 必须调用 clear_bscan（Q2=A）")
-        self.assertEqual(len(self.win.bscan["S11"]), 0, "开始新采集后画布必须为空")
-        self.assertEqual(self.win.bscan_time_ns, None)
-
-    def test_stop_keeps_bscan_history_for_review(self) -> None:
-        time_ns, traces = _fake_trace()
-        self.win._append_bscan_trace(time_ns, traces)
-        before = len(self.win.bscan["S11"])
-        self.assertGreater(before, 0)
-        # 停止路径（Q2=A 语义：停止后可回看，不清空）。
-        self.win.stop_acquisition()
-        self.assertEqual(len(self.win.bscan["S11"]), before, "停止后历史必须保留")
 
 
 class GroundStationAutoClearTests(unittest.TestCase):

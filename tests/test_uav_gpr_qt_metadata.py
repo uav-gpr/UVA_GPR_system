@@ -36,7 +36,7 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    import uav_gpr_qt as air
+    import air_core as air
 except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - environment dependent
     air = None
     IMPORT_ERROR = exc

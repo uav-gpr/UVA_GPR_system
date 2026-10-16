@@ -44,7 +44,7 @@ else:
     IMPORT_ERROR = None
 
 try:
-    import uav_gpr_qt as air
+    import air_core as air
 except Exception as exc:  # noqa: BLE001
     air = None
     AIR_IMPORT_ERROR = exc

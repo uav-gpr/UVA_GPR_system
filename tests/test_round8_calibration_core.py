@@ -481,7 +481,7 @@ class Round8CalibrationCoreTests(unittest.TestCase):
 
     def test_out_of_band_frequency_rejected(self) -> None:
         """带外频率申请校正时，严禁非法外推，必须抛出 ValueError。"""
-        from uav_gpr_qt import apply_reflection_and_through_calibration
+        from air_core import apply_reflection_and_through_calibration
 
         pts = [
             OSLPoint(1e9, complex(0.1, 0.1), complex(0.9, 0.0), complex(0.05, 0.05)),

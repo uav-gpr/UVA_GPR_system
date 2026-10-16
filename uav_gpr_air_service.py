@@ -3,7 +3,7 @@
 
 设计要点（与计划/契约逐条对应）：
 
-- **复用而非第二套**：采集/发送/补传核心全部直接 import ``uav_gpr_qt.py``
+- **复用而非第二套**：采集/发送/补传核心全部直接 import ``air_core.py``（2026-10-15 前名为 ``uav_gpr_qt.py``）
   既有零件（AcquisitionService、ContinuousAcquisitionWorker、AcquisitionWorker、
   RemoteSender、GnssReader 等），本文件只做无界面接线（QCoreApplication +
   offscreen），绝不复制采集/发送/补传逻辑；
@@ -57,8 +57,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import uav_gpr_qt as air  # noqa: E402  （既有核心零件唯一来源，禁止复制第二套）
+import air_core as air  # noqa: E402  （既有核心零件唯一来源，禁止复制第二套）
 from air_gnss import AirGnssMonitor
+import calibration_guard  # noqa: E402  （校准与扫频参数是否对得上）
 from disk_outbox import (  # noqa: E402
     AIR_TASK_RUN_ID_RE,
     CALIBRATION_RUN_ID_RE,
@@ -112,6 +113,9 @@ class AirConfig:
     log_max_bytes: int = LOG_MAX_BYTES_DEFAULT
     log_backup_count: int = LOG_BACKUP_COUNT_DEFAULT
     calibration_path: str = ""
+    #: 只采 VV 时用单端口快速扫法 0x1208（**未经真机验证**，默认关）。关闭时
+    #: 只采 VV 仍按双通道扫、丢掉 HH（速度不变）。真机验证通过后再默认打开。
+    experimental_s22_fast_sweep: bool = False
 
 
 def _field_names() -> tuple[str, ...]:
@@ -138,7 +142,7 @@ def _validate_field(name: str, value: object) -> tuple[bool, object]:
         return value in DEVICE_SOURCE_CHOICES, value
     if name == "output_dir":
         return isinstance(value, str) and bool(value.strip()), value
-    if name == "autostart_acquisition":
+    if name in ("autostart_acquisition", "experimental_s22_fast_sweep"):
         return isinstance(value, bool), value
     if name in ("disk_min_free_gb", "disk_target_free_gb"):
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0, value
@@ -619,6 +623,16 @@ class _BlackboxCalibrationCapturerProxy:
 # =========================================================================
 
 
+def _sweep_config_from_calibration_file(path: Path) -> dict[str, object] | None:
+    """读校准文件里记下的扫频参数（v2 文件的 ``sweep_config``；没有就返回 None）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    sweep = data.get("sweep_config") if isinstance(data, dict) else None
+    return dict(sweep) if isinstance(sweep, dict) else None
+
+
 class AirBlackboxService:
     """无界面黑匣子：自动连接 + 远程命令 + 采集编排 + 磁盘水位。"""
 
@@ -658,15 +672,23 @@ class AirBlackboxService:
         self._count = 0
         self._autosave = True
         self._save_csv = False  # GUI 默认：关闭 CSV，提高棒子采集流畅度
+        #: 采集通道：dual（HH+VV）/ S11（只 HH）/ S22（只 VV）。
+        self._channel_mode = "dual"
         self._calibration_path = ""
         # 远程校准编排状态（与 MainWindow 同名同语义的无界面等价物）。
         self.active_calibration_id: str | None = None
         self._active_osl_id: str | None = None
         self._active_calibration_path: Path | None = None
+        #: 生效校准"当时"的扫频参数（功率/带宽提醒用；可为 None）。
+        self._calibration_sweep_ref: dict[str, object] | None = None
+        #: 上次记录过的校准匹配状态（只在变化时写日志）。
+        self._last_calibration_fit_level = "ok"
         self._session_calibration = None
         self._session_calibration_p2 = None
         self._active_through = None
         self._background = None
+        #: VV（S22）空采背景（与 _background 同频率轴；没有就是 None）。
+        self._background_s22 = None
         self._background_frequency_hz = None
         self._background_cal_id: str | None = None
         self._recent_requests: dict[str, dict[str, object]] = {}
@@ -694,6 +716,7 @@ class AirBlackboxService:
                     self._active_calibration_path = cal_p
                     self.active_calibration_id = cal_p.stem
                     self._active_osl_id = cal_p.stem
+                    self._calibration_sweep_ref = _sweep_config_from_calibration_file(cal_p)
                     self._log(f"自启动恢复生效校准: {cal_p.name}")
                 except Exception as exc:
                     self._log(f"自启动加载生效校准失败（已回退未校准）: {cal_p}: {exc}")
@@ -835,6 +858,7 @@ class AirBlackboxService:
         payload["count"] = self._count
         payload["autosave"] = self._autosave
         payload["save_csv"] = self._save_csv
+        payload["channels"] = self._channel_mode
         return payload
 
     def _is_acquiring(self) -> bool:
@@ -869,6 +893,7 @@ class AirBlackboxService:
             "config": self._active_config_dict(),
             "active_config": self._active_config_dict(),
             "sweep": asdict(self._sweep),
+            "calibration_fit": self._calibration_fit().to_dict(),
             "service_state": self.acquisition.state,
             "engine": self.config.engine,
             "device_source": air.get_default_device_source(),
@@ -1013,6 +1038,7 @@ class AirBlackboxService:
             "state": self.acquisition.state,
             "run_id": self._active_run_id,
             "reason": None if started else "服务拒绝启动（详见空中端日志）",
+            "calibration_fit": self._calibration_fit().to_dict(),
         }
 
     def _cmd_single(self, params: dict) -> dict[str, object]:
@@ -1033,6 +1059,9 @@ class AirBlackboxService:
     def _cmd_set_params(self, params: dict) -> dict[str, object]:
         if self._is_acquiring():
             return {"ok": False, "error": "采集运行中不可修改配置"}
+        if self._calibration_session_open():
+            # 校准进行中改参数会让后续采集与这次校准对不上：直接拒绝。
+            return {"ok": False, "error": "校准进行中不可修改扫频参数（请先完成或取消校准）"}
         sweep = self._sweep
         try:
             start = float(params.get("start_mhz", sweep.start_mhz))
@@ -1047,6 +1076,11 @@ class AirBlackboxService:
             dewow_window = float(params.get("dewow_window_ns", params.get("dewow_window", sweep.dewow_window_ns)))
             interval = float(params.get("interval_s", self._interval_s))
             count = int(params.get("count", self._count))
+            channel_mode = (
+                air.normalize_channel_mode(params["channels"])
+                if "channels" in params
+                else self._channel_mode
+            )
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": f"参数类型解析错误: {exc}"}
         # 校验范围与 MainWindow._handle_set_params_command 同口径。
@@ -1084,11 +1118,21 @@ class AirBlackboxService:
         )
         self._interval_s = interval
         self._count = count
+        self._channel_mode = channel_mode
         self._log(
             f"远程参数更新成功: {start:g}-{stop:g} MHz, {points} 点, IFBW={ifbw} Hz, "
-            f"功率={power:g} dBm, interval={interval}s, count={count}"
+            f"功率={power:g} dBm, interval={interval}s, count={count}, "
+            f"通道={air.CHANNEL_MODE_LABELS[channel_mode]}"
         )
-        return {"ok": True, "sweep": asdict(self._sweep), "interval_s": interval, "count": count}
+        fit = self._calibration_fit(log_changes=True)
+        return {
+            "ok": True,
+            "sweep": asdict(self._sweep),
+            "interval_s": interval,
+            "count": count,
+            "channels": channel_mode,
+            "calibration_fit": fit.to_dict(),
+        }
 
     # ---- 远程校准编排（cal_*：MainWindow 会话编排的无界面等价实现）----
     #
@@ -1176,6 +1220,93 @@ class AirBlackboxService:
         if isinstance(accepted, dict):
             return accepted
         return {"ok": bool(accepted)}
+
+    # ---- 校准与扫频参数匹配（改参数后提醒/停用校准）----
+
+    def _calibration_session_open(self) -> bool:
+        session = self._calibration_session
+        return session is not None and session.state in (
+            air.CalibrationSession.STATE_PLANNED,
+            air.CalibrationSession.STATE_IN_PROGRESS,
+            air.CalibrationSession.STATE_SOLVED,
+        )
+
+    def _calibration_fit(self, *, log_changes: bool = False) -> calibration_guard.CalibrationFit:
+        """当前扫频参数与生效校准是否对得上（见 calibration_guard）。"""
+        with self._calibration_lock:
+            osl_grids = [
+                calibration_guard.grid_from_osl(self._session_calibration),
+                calibration_guard.grid_from_osl(self._session_calibration_p2),
+                calibration_guard.grid_from_frequencies(
+                    getattr(self._active_through, "frequency_hz", None)
+                    if self._active_through is not None
+                    else None
+                ),
+            ]
+            background_grid = (
+                calibration_guard.grid_from_frequencies(self._background_frequency_hz)
+                if self._background is not None
+                else None
+            )
+            fit = calibration_guard.evaluate_calibration_fit(
+                self._sweep,
+                osl_grids=osl_grids,
+                background_grid=background_grid,
+                reference_sweep=self._calibration_sweep_ref,
+            )
+            # 通道覆盖：已有校准但所选通道没有对应端口的校准/背景 → 提醒。
+            selected = air.CHANNEL_MODES.get(self._channel_mode, ("S11", "S22"))
+            has_osl = self._session_calibration is not None or self._session_calibration_p2 is not None
+            if has_osl and not fit.osl_stale:
+                if "S11" in selected and self._session_calibration is None:
+                    fit.warnings.append("HH（S11）没有 P1 校准，该通道按未校准采集")
+                if "S22" in selected and self._session_calibration_p2 is None:
+                    fit.warnings.append("VV（S22）没有 P2 校准，该通道按未校准采集")
+            if self._background is not None and not fit.background_stale:
+                if "S22" in selected and getattr(self, "_background_s22", None) is None:
+                    fit.warnings.append("VV（S22）没有空采背景，该通道不做背景扣除")
+        if log_changes and fit.level != self._last_calibration_fit_level:
+            if fit.level == "ok":
+                self._log("扫频参数与生效校准重新一致：校准恢复使用")
+            else:
+                self._log(fit.message())
+        self._last_calibration_fit_level = fit.level
+        return fit
+
+    def _effective_calibration_components(self) -> dict[str, object]:
+        """采集任务实际使用的校准组件：失效的部分替换为"未校准"。"""
+        fit = self._calibration_fit(log_changes=True)
+        with self._calibration_lock:
+            components: dict[str, object] = {
+                "calibration_path": self._calibration_path,
+                "session_calibration": self._session_calibration,
+                "session_calibration_p2": self._session_calibration_p2,
+                "through_measurement": self._active_through,
+                "background_frequency_hz": self._background_frequency_hz,
+                "background": self._background,
+                "calibration_id": self.active_calibration_id or "",
+            }
+            if fit.osl_stale:
+                components.update(
+                    calibration_path="",
+                    session_calibration=None,
+                    session_calibration_p2=None,
+                    through_measurement=None,
+                    calibration_id="",
+                )
+            # VV 背景存在时合成 (2, F)：第 0 行 HH、第 1 行 VV（各减各的）。
+            background_s22 = getattr(self, "_background_s22", None)
+            if self._background is not None and background_s22 is not None:
+                components["background"] = np.vstack(
+                    [np.asarray(self._background, dtype=np.complex128), np.asarray(background_s22, dtype=np.complex128)]
+                )
+            if fit.background_stale:
+                components.update(background_frequency_hz=None, background=None)
+                if fit.osl_stale or self._session_calibration is None:
+                    components["calibration_id"] = ""
+        if fit.stale:
+            self._log(f"{fit.message()}。本次采集中失效部分按未校准处理")
+        return components
 
     def _calibration_acquisition_conflict(self, action: str, cal_id: str = "") -> str | None:
         """校准/采集互斥判据（R-C-14：与 MainWindow 同规则无界面版）。"""
@@ -1275,7 +1406,8 @@ class AirBlackboxService:
             try:
                 repeats = air.validate_repeats(params.get("repeats", air.REPEATS_DEFAULT))
                 if mode == air.CALIBRATION_MODE_OSL:
-                    plan = air.build_osl_plan(cal_id, repeats, {})
+                    ports = air.normalize_osl_ports(params.get("ports"))
+                    plan = air.build_osl_plan(cal_id, repeats, {}, ports=ports)
                 elif mode == air.CALIBRATION_MODE_BACKGROUND:
                     plan = air.build_background_plan(cal_id, repeats, {})
                 else:
@@ -1393,9 +1525,12 @@ class AirBlackboxService:
                 cal_id_str = str(parsed_data.get("cal_id") or target_path.stem)
                 self.active_calibration_id = cal_id_str
                 self._active_osl_id = cal_id_str
+                sweep_ref = parsed_data.get("sweep_config") if isinstance(parsed_data, dict) else None
+                self._calibration_sweep_ref = dict(sweep_ref) if isinstance(sweep_ref, dict) else None
 
                 if self._background is not None:
                     self._background = None
+                    self._background_s22 = None
                     self._background_frequency_hz = None
                     self._background_cal_id = None
                     self._log("新 OSL 校准已导入生效：先前的背景校准已显式失效")
@@ -1437,6 +1572,9 @@ class AirBlackboxService:
                     "background_real": [float(v.real) for v in self._background],
                     "background_imag": [float(v.imag) for v in self._background],
                 }
+                if getattr(self, "_background_s22", None) is not None:
+                    payload["background_s22_real"] = [float(v.real) for v in self._background_s22]
+                    payload["background_s22_imag"] = [float(v.imag) for v in self._background_s22]
                 content_str = json.dumps(payload, ensure_ascii=False, indent=2)
                 filename = f"background_{getattr(self, '_background_cal_id', 'active') or 'active'}.json"
                 return {
@@ -1495,25 +1633,31 @@ class AirBlackboxService:
         with self._calibration_lock:
             osl_p1 = self._active_osl_p1()
             osl_p2 = self._active_osl_p2()
-            active_osl_cal_id = self._active_osl_id or (self.active_calibration_id if osl_p1 is not None else None)
+            osl_any = osl_p1 if osl_p1 is not None else osl_p2
+            active_osl_cal_id = self._active_osl_id or (self.active_calibration_id if osl_any is not None else None)
             active_osl: dict[str, object] = {
-                "active": osl_p1 is not None,
+                "active": osl_any is not None,
                 "cal_id": active_osl_cal_id,
                 "path": str(self._active_calibration_path) if self._active_calibration_path else None,
                 "filename": self._active_calibration_path.name if self._active_calibration_path else None,
                 "valid_band_hz": (
-                    [float(osl_p1.points[0].frequency), float(osl_p1.points[-1].frequency)]
-                    if osl_p1
+                    [float(osl_any.points[0].frequency), float(osl_any.points[-1].frequency)]
+                    if osl_any
                     else None
                 ),
-                "points": len(osl_p1.points) if osl_p1 else 0,
-                "ports": (["P1", "P2"] if osl_p2 else ["P1"]) if osl_p1 else [],
+                "points": len(osl_any.points) if osl_any else 0,
+                "ports": [port for port, cal in (("P1", osl_p1), ("P2", osl_p2)) if cal is not None],
                 "has_through": getattr(self, "_active_through", None) is not None,
             }
             active_bg: dict[str, object] = {
                 "active": self._background is not None,
                 "cal_id": getattr(self, "_background_cal_id", None),
                 "points": len(self._background) if self._background is not None else 0,
+                "channels": (
+                    (["S11", "S22"] if getattr(self, "_background_s22", None) is not None else ["S11"])
+                    if self._background is not None
+                    else []
+                ),
                 "frequency_range_mhz": (
                     [
                         float(self._background_frequency_hz[0] / 1e6),
@@ -1584,15 +1728,18 @@ class AirBlackboxService:
                 self._active_calibration_path = None
                 self.active_calibration_id = None
                 self._active_osl_id = None
+                self._calibration_sweep_ref = None
                 with self._config_lock:
                     self.config.calibration_path = ""
                     self.save_config()
                 self._background = None
+                self._background_s22 = None
                 self._background_frequency_hz = None
                 self._background_cal_id = None
                 self._log("已清除生效的 OSL 校准与背景")
             elif target == "background":
                 self._background = None
+                self._background_s22 = None
                 self._background_frequency_hz = None
                 self._background_cal_id = None
                 if self._session_calibration is None:
@@ -1909,10 +2056,12 @@ class AirBlackboxService:
                 note=None if sample_count >= 2 else "样本不足",
             )
             return
-        p1: air.OSLTerms = result["p1_terms"]  # type: ignore[assignment]
-        p2: air.OSLTerms = result["p2_terms"]  # type: ignore[assignment]
+        p1 = result.get("p1_terms")
+        p2 = result.get("p2_terms")
         for step_name in air.OSL_STEP_NAMES:
             port_terms = p1 if step_name.startswith("P1_") else p2
+            if port_terms is None:
+                continue  # 单端口校准：没校的端口没有质量指标
             label = step_name.split("_", 1)[1].lower()
             metrics = port_terms.quality_metrics
             self._send_calibration_message(
@@ -1990,22 +2139,33 @@ class AirBlackboxService:
                             )
                             return False
 
-                p1_terms: air.OSLTerms = activation["p1_terms"]  # type: ignore[assignment]
-                p2_terms: air.OSLTerms = activation["p2_terms"]  # type: ignore[assignment]
-                self._session_calibration = air.terms_to_osl_calibration(p1_terms, cal_path)
-                self._session_calibration_p2 = air.terms_to_osl_calibration(p2_terms, cal_path)
+                p1_terms = activation.get("p1_terms")
+                p2_terms = activation.get("p2_terms")
+                # 单端口校准：没校的端口为 None（该通道数据按未校准处理）。
+                self._session_calibration = (
+                    air.terms_to_osl_calibration(p1_terms, cal_path) if p1_terms is not None else None
+                )
+                self._session_calibration_p2 = (
+                    air.terms_to_osl_calibration(p2_terms, cal_path) if p2_terms is not None else None
+                )
                 self.active_calibration_id = cal_id
                 self._active_osl_id = cal_id
+                self._calibration_sweep_ref = dict(getattr(session, "config_snapshot", {}) or {}) or None
 
                 if self._background is not None:
                     self._background = None
+                    self._background_s22 = None
                     self._background_frequency_hz = None
                     self._background_cal_id = None
                     self._log(f"新 OSL 校准已激活（cal_id={cal_id}）：先前的背景校准已显式失效")
                 else:
+                    ports_text = "/".join(
+                        port for port, terms in (("P1", p1_terms), ("P2", p2_terms)) if terms is not None
+                    )
+                    any_terms = p1_terms if p1_terms is not None else p2_terms
                     self._log(
-                        f"远程校准已激活: cal_id={cal_id}（P1/P2 双反射 OSL，"
-                        f"{len(p1_terms.frequency_hz)} 点）"
+                        f"远程校准已激活: cal_id={cal_id}（{ports_text} OSL，"
+                        f"{len(any_terms.frequency_hz)} 点）"
                     )
             else:
                 frequency = np.asarray(activation["background_frequency_hz"], dtype=np.float64)
@@ -2021,10 +2181,25 @@ class AirBlackboxService:
                 else:
                     background = raw_mean.copy()
                 self._background = background
+                raw_s22 = activation.get("background_s22")
+                if raw_s22 is not None:
+                    raw_s22 = np.asarray(raw_s22, dtype=np.complex128)
+                    calibration_p2 = self._active_osl_p2()
+                    if calibration_p2 is not None:
+                        # VV 背景用 P2 校正（各通道各用自己的校准，绝不交叉）。
+                        self._background_s22 = np.array(
+                            [calibration_p2.correct(float(f), complex(v)) for f, v in zip(frequency, raw_s22)],
+                            dtype=np.complex128,
+                        )
+                    else:
+                        self._background_s22 = raw_s22.copy()
+                else:
+                    self._background_s22 = None
                 self._background_frequency_hz = np.array(frequency, dtype=np.float64, copy=True)
                 self._background_cal_id = cal_id
                 if self._session_calibration is None:
                     self.active_calibration_id = cal_id
+                    self._calibration_sweep_ref = dict(getattr(session, "config_snapshot", {}) or {}) or None
                 self._log(f"远程空采背景已激活: {len(background)} 点（cal_id={cal_id}）")
             summary = json.dumps(
                 (session.solved_result() or {}).get("profile_summary", {}), ensure_ascii=False
@@ -2038,15 +2213,21 @@ class AirBlackboxService:
         }
         if session.plan.mode == air.CALIBRATION_MODE_OSL:
             act_fields["active_osl_id"] = self._active_osl_id or cal_id
-            if self._session_calibration is not None:
-                act_fields["points"] = len(self._session_calibration.points)
-                act_fields["ports"] = ["P1", "P2"] if self._session_calibration_p2 else ["P1"]
-                p_pts = self._session_calibration.points
+            any_cal = self._session_calibration or self._session_calibration_p2
+            if any_cal is not None:
+                act_fields["points"] = len(any_cal.points)
+                act_fields["ports"] = [
+                    port
+                    for port, cal in (("P1", self._session_calibration), ("P2", self._session_calibration_p2))
+                    if cal is not None
+                ]
+                p_pts = any_cal.points
                 act_fields["valid_band_hz"] = f"{p_pts[0].frequency:g}-{p_pts[-1].frequency:g}"
         else:
             act_fields["background_cal_id"] = self._background_cal_id or cal_id
             if self._background is not None:
                 act_fields["points"] = len(self._background)
+                act_fields["channels"] = ["S11", "S22"] if self._background_s22 is not None else ["S11"]
 
         self._send_calibration_message("calibration_result", cal_id, **act_fields)
         return True
@@ -2115,12 +2296,16 @@ class AirBlackboxService:
             # 与 MainWindow 同规则：模拟器只支持连续采集协议线假设备。
             self._log("启动被拒: 模拟器（无硬件演示）只支持 continuous 引擎")
             return False
+        if engine == "legacy" and self._channel_mode != "dual":
+            self._log("启动被拒: legacy 引擎不支持单通道采集，请改用 continuous 引擎或选双通道")
+            return False
         if engine == "legacy":
             return self._start_legacy(cfg, single)
         return self._start_continuous(cfg, single)
 
     def _start_continuous(self, cfg: air.SweepConfig, single: bool) -> bool:
         self._log(f"启动采集: 引擎 continuous，设备来源 {air.get_default_device_source()}")
+        effective = self._effective_calibration_components()
         spec = air.AcquisitionTaskSpec(
             cfg=cfg,
             interval_s=self._interval_s,
@@ -2128,16 +2313,25 @@ class AirBlackboxService:
             count=1 if single else self._count,
             gnss_port=self.config.gnss_port,
             baud=self.config.gnss_baud,
-            calibration_path=self._calibration_path,
-            session_calibration=self._session_calibration,
-            session_calibration_p2=self._session_calibration_p2,
-            through_measurement=self._active_through,
-            background_frequency_hz=self._background_frequency_hz,
-            background=self._background,
+            calibration_path=effective["calibration_path"],
+            session_calibration=effective["session_calibration"],
+            session_calibration_p2=effective["session_calibration_p2"],
+            through_measurement=effective["through_measurement"],
+            background_frequency_hz=effective["background_frequency_hz"],
+            background=effective["background"],
             autosave=self._autosave,
             save_csv=self._save_csv,
             remote_sender=self.sender,
-            calibration_id=self.active_calibration_id or "",
+            calibration_id=effective["calibration_id"],
+            channels=air.CHANNEL_MODES[self._channel_mode],
+            experimental_s22_fast_sweep=bool(self.config.experimental_s22_fast_sweep),
+        )
+        sweep_bitmap = air.stages_bitmap_for_channels(
+            spec.channels, experimental_s22_fast_sweep=spec.experimental_s22_fast_sweep
+        )
+        self._log(
+            f"采集通道: {air.CHANNEL_MODE_LABELS[self._channel_mode]}，雷达扫法 {sweep_bitmap:#06x}"
+            + ("（实验，未经真机验证）" if sweep_bitmap == 0x1208 else "")
         )
 
         def _factory(task_spec: air.AcquisitionTaskSpec) -> air.ContinuousAcquisitionWorker:
@@ -2145,6 +2339,8 @@ class AirBlackboxService:
             self._active_run_id = str(task_spec.run_id or "")
             self._last_run_id = self._active_run_id
             worker = air.ContinuousAcquisitionWorker(
+                channels=task_spec.channels,
+                experimental_s22_fast_sweep=task_spec.experimental_s22_fast_sweep,
                 cfg=task_spec.cfg,
                 interval_s=task_spec.interval_s,
                 out_dir=run_dir,
@@ -2184,6 +2380,7 @@ class AirBlackboxService:
 
     def _start_legacy(self, cfg: air.SweepConfig, single: bool) -> bool:
         self._log("启动采集: 引擎 legacy（逐帧开关 USB，慢；调试退路）")
+        effective = self._effective_calibration_components()
         run_id = self.acquisition.new_run_id(air.RUN_ID_KIND_TASK)
         run_dir = self.output_root / sanitize_run_dir_name(run_id)
         worker = air.AcquisitionWorker(
@@ -2193,12 +2390,12 @@ class AirBlackboxService:
             out_dir=run_dir,
             count=1 if single else self._count,
             interval_s=self._interval_s,
-            calibration_path=self._calibration_path,
-            session_calibration=self._session_calibration,
-            session_calibration_p2=self._session_calibration_p2,
-            through_measurement=self._active_through,
-            background_frequency_hz=self._background_frequency_hz,
-            background=self._background,
+            calibration_path=effective["calibration_path"],
+            session_calibration=effective["session_calibration"],
+            session_calibration_p2=effective["session_calibration_p2"],
+            through_measurement=effective["through_measurement"],
+            background_frequency_hz=effective["background_frequency_hz"],
+            background=effective["background"],
             autosave=self._autosave,
             gnss_cache=self.gnss,
         )

@@ -56,7 +56,7 @@ import numpy as np
 import calibration_service as cal
 import uav_gpr_air_service as svc
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 from librevna.librevna_continuous import PersistentBackendSettings, PersistentLibreVnaBackend
 from librevna.simulated_transport import (
     SimulatedLibreVnaTransport,
@@ -642,9 +642,14 @@ class TestR8_1_FullChain(_E2ECase):
             f"{np.max(np.abs(disp_s11 - expected_s11)):.3e}",
         )
         expected_s22 = np.array([cal_p2.correct(f, v) for f, v in zip(freq, raw_s22)])
+        if expect_background:
+            # 2026-10-15 起 VV 也扣自己的背景（P2 校正域），绝不套用 HH 背景。
+            background_s22 = self.service._background_s22
+            self.assertIsNotNone(background_s22, "VV 背景必须真实生效")
+            expected_s22 = expected_s22 - background_s22
         self.assertTrue(
             np.allclose(disp_s22, expected_s22, atol=1e-7, rtol=1e-7),
-            "S22 display 未按 P2 校准真实生效",
+            "S22 display 未按 P2 校准（+VV 背景扣除）真实生效",
         )
 
         if expect_background:

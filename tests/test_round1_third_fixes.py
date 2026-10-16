@@ -42,7 +42,7 @@ from PySide6 import QtCore, QtWidgets
 import uav_gpr_ground_station as ground
 from ground_trace_pipeline import GroundTraceDecoder, decode_ground_trace_payload
 from pipeline_metrics import PipelineMetrics
-import uav_gpr_qt as air
+import air_core as air
 
 
 PROTOCOL = "uav-gpr-telemetry-v1"

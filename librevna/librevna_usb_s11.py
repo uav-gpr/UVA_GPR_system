@@ -202,7 +202,7 @@ class OSLCalibration:
     def load_components(
         cls,
         filename_or_dict: str | Path | dict,
-    ) -> tuple["OSLCalibration", "OSLCalibration | None", object | None]:
+    ) -> tuple["OSLCalibration | None", "OSLCalibration | None", object | None]:
         if isinstance(filename_or_dict, (str, Path)):
             path = Path(filename_or_dict)
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -212,14 +212,22 @@ class OSLCalibration:
         else:
             raise ValueError(f"不支持的输入类型: {type(filename_or_dict)}")
 
-        p1_cal = cls.from_dict(data, path, port=1)
         p2_cal: OSLCalibration | None = None
         has_any_p2 = False
+        has_any_p1 = True
         if isinstance(data, dict):
-            for m in data.get("measurements", []):
-                if m.get("type") in ("P2_Open", "P2_Short", "P2_Load"):
-                    has_any_p2 = True
-                    break
+            measurement_types = {
+                m.get("type") for m in data.get("measurements", []) if isinstance(m, dict)
+            }
+            has_any_p2 = bool(measurement_types & {"P2_Open", "P2_Short", "P2_Load"})
+            if data.get("measurements"):
+                has_any_p1 = bool(
+                    measurement_types & {"P1_Open", "P1_Short", "P1_Load", "Open", "Short", "Load"}
+                )
+        # 单通道（只采 VV）校准文件只有 P2：此时 P1 为 None。
+        p1_cal: OSLCalibration | None = (
+            cls.from_dict(data, path, port=1) if (has_any_p1 or not has_any_p2) else None
+        )
         if has_any_p2:
             # 数据中包含 P2 标准件，必须完整合法，绝不允许静默降级为单端口
             p2_cal = cls.from_dict(data, path, port=2)

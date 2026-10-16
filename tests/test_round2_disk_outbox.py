@@ -201,7 +201,7 @@ class FrameParityTests(unittest.TestCase):
     """R-B-01/R-B-09：帧字节必须与 send_remote_frame 写到 socket 的字节逐字节一致。"""
 
     def test_frame_bytes_match_real_sendall(self) -> None:
-        import uav_gpr_qt as air  # 测试侧允许依赖 Qt 模块（本模块本身不依赖）
+        import air_core as air  # 测试侧允许依赖 Qt 模块（本模块本身不依赖）
 
         payload = make_payload("wire")
         header = make_header(trace_index=11, payload=payload)
@@ -950,7 +950,7 @@ class WriteCostTests(unittest.TestCase):
     SAMPLES = 40
 
     def _real_payload(self, seed: int) -> bytes:
-        import uav_gpr_qt as air
+        import air_core as air
         import numpy as np
 
         cfg = air.SweepConfig(
@@ -1038,7 +1038,7 @@ class WriteCostTests(unittest.TestCase):
 # =====================================================================
 
 import numpy as np  # noqa: E402
-import uav_gpr_qt as air  # noqa: E402
+import air_core as air  # noqa: E402
 
 TASK_RUN = "20260906_101112_0001"
 IDLE_RUN = "20260906_101112_idle"

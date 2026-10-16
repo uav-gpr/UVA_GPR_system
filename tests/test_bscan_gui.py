@@ -14,7 +14,7 @@ try:
     os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
     from PySide6 import QtCore, QtWidgets
     import uav_gpr_ground_station as ground
-    import uav_gpr_qt as air
+    import air_core as air
     import gpr_processing
 except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - environment dependent
     QtCore = None
@@ -181,30 +181,6 @@ class GroundBScanGuiTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
-    @unittest.skipIf(air is None, f"air GUI dependencies unavailable: {IMPORT_ERROR}")
-    def test_air_rejects_time_axis_change_without_modifying_history(self) -> None:
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = air.MainWindow()
-        try:
-            old_time = np.array([0.0, 2.0, 4.0, 6.0])
-            old_traces = {name: np.arange(4, dtype=float) + index for index, name in enumerate(air.UI_CHANNELS)}
-            self.assertTrue(window._append_bscan_trace(old_time, old_traces))
-            old_history = {name: [row.copy() for row in rows] for name, rows in window.bscan.items()}
-            self.assertFalse(window._append_bscan_trace(np.arange(5, dtype=float), {
-                name: np.arange(5, dtype=float) for name in air.UI_CHANNELS
-            }))
-            np.testing.assert_array_equal(window.bscan_time_ns, old_time)
-            self.assertEqual(len(window.bscan["S11"]), len(window.bscan["S22"]))
-            np.testing.assert_array_equal(window.bscan["S22"][0], old_history["S22"][0])
-            window.clear_bscan()
-            new_time = np.arange(5, dtype=float)
-            self.assertTrue(window._append_bscan_trace(new_time, {
-                name: np.ones(5) for name in air.UI_CHANNELS
-            }))
-            np.testing.assert_array_equal(window.bscan_time_ns, new_time)
-        finally:
-            window.close()
-            app.processEvents()
 
     def test_ground_flat_filter_is_optional_display_only(self) -> None:
         class DummyReceiver(QtCore.QObject):
@@ -314,74 +290,6 @@ class GroundBScanGuiTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
-    @unittest.skipIf(air is None, f"air GUI dependencies unavailable: {IMPORT_ERROR}")
-    def test_air_flat_filter_is_optional_display_only(self) -> None:
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = air.MainWindow()
-        try:
-            self.assertFalse(window.flat_filter_enabled.isChecked())
-            self.assertFalse(window.flat_window_traces.isEnabled())
-            saved_window = window.flat_window_traces.value()
-            window.bscan = {
-                name: [np.full(4, float(index)) for index in range(40)]
-                for name in air.UI_CHANNELS
-            }
-            window.bscan_time_ns = np.arange(4, dtype=float)
-            old_rows = {name: [row.copy() for row in rows] for name, rows in window.bscan.items()}
-            old_time = window.bscan_time_ns.copy()
-            with patch.object(air, "flat_reflection_filter", wraps=air.flat_reflection_filter) as mocked:
-                window.refresh_bscan_views()
-                self.assertEqual(mocked.call_count, 0)
-                self.assertIn("disabled", window.bscan_filter_status.text())
-                window.flat_filter_enabled.setChecked(True)
-                self.assertTrue(window.flat_window_traces.isEnabled())
-                self.assertEqual(mocked.call_count, 2)
-                window.flat_filter_enabled.setChecked(False)
-                self.assertFalse(window.flat_window_traces.isEnabled())
-                self.assertEqual(window.flat_window_traces.value(), saved_window)
-                self.assertEqual(mocked.call_count, 2)
-            np.testing.assert_array_equal(window.bscan_time_ns, old_time)
-            for name in air.UI_CHANNELS:
-                np.testing.assert_array_equal(window.bscan[name][0], old_rows[name][0])
-        finally:
-            window.close()
-            app.processEvents()
-
-    @unittest.skipIf(air is None, f"air GUI dependencies unavailable: {IMPORT_ERROR}")
-    def test_air_rejects_changed_dewow_signature_and_clear_restarts(self) -> None:
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = air.MainWindow()
-        try:
-            time_ns = np.arange(4, dtype=float)
-            traces = {name: np.ones(4) for name in air.UI_CHANNELS}
-            self.assertTrue(window._append_bscan_trace(time_ns, traces, (False, None)))
-            self.assertFalse(window._append_bscan_trace(time_ns, traces, (True, 4.0)))
-            window.refresh_bscan_views()
-            self.assertIn("Dewow setting changed", window.bscan_filter_status.text())
-            self.assertEqual(window.bscan_trace_count(), 1)
-            window.clear_bscan()
-            self.assertTrue(window._append_bscan_trace(time_ns, traces, (True, 4.0)))
-        finally:
-            window.close()
-            app.processEvents()
-
-    @unittest.skipIf(air is None, f"air GUI dependencies unavailable: {IMPORT_ERROR}")
-    def test_air_dewow_switch_defaults_off_and_controls_window(self) -> None:
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = air.MainWindow()
-        try:
-            self.assertFalse(window.dewow_enabled.isChecked())
-            self.assertFalse(window.dewow_window.isEnabled())
-            saved_window = window.dewow_window.value()
-            window.dewow_enabled.setChecked(True)
-            self.assertTrue(window.dewow_window.isEnabled())
-            window.dewow_enabled.setChecked(False)
-            self.assertFalse(window.dewow_window.isEnabled())
-            self.assertEqual(window.dewow_window.value(), saved_window)
-            self.assertFalse(window.config().dewow_enabled)
-        finally:
-            window.close()
-            app.processEvents()
 
     @unittest.skipIf(ground is None, f"ground GUI dependencies unavailable: {IMPORT_ERROR}")
     def test_ground_reads_new_and_legacy_dewow_metadata(self) -> None:
@@ -696,86 +604,6 @@ class GroundBScanGuiTests(unittest.TestCase):
                 app.processEvents()
         finally:
             temp.cleanup()
-
-    @unittest.skipIf(air is None, f"air GUI dependencies unavailable: {IMPORT_ERROR}")
-    def test_air_four_dewow_flat_combinations_use_real_display_entry(self) -> None:
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = air.MainWindow()
-        try:
-            frequency_hz = np.linspace(400e6, 1e9, 8)
-            raw_sparams = {
-                name: np.exp(1j * np.linspace(0.0, 1.0, frequency_hz.size)) * (index + 1)
-                for index, name in enumerate(air.S_PARAMETERS)
-            }
-            for dewow_enabled in (False, True):
-                cfg = air.SweepConfig(
-                    ifft_points=128,
-                    time_window_ns=8.0,
-                    dewow_window_ns=4.0,
-                    dewow_enabled=dewow_enabled,
-                )
-                with patch("gpr_processing.dewow", wraps=gpr_processing.dewow) as mocked_dewow:
-                    _display, time_ns, produced_traces = air.process_trace_pipeline(
-                        frequency_hz,
-                        raw_sparams,
-                        cfg,
-                    )
-                self.assertEqual(mocked_dewow.call_count, len(air.S_PARAMETERS) if dewow_enabled else 0)
-                pipeline_snapshot = {
-                    name: produced_traces[name].copy()
-                    for name in air.UI_CHANNELS
-                }
-                for flat_enabled in (False, True):
-                    with self.subTest(dewow_enabled=dewow_enabled, flat_enabled=flat_enabled):
-                        window.clear_bscan()
-                        traces = {
-                            name: produced_traces[name].copy()
-                            for name in air.UI_CHANNELS
-                        }
-                        original_ascan = {}
-                        if hasattr(window, "ascan_curves"):
-                            for name in air.UI_CHANNELS:
-                                window.ascan_curves[name].setData(time_ns, traces[name])
-                            original_ascan = {
-                                name: tuple(
-                                    None if value is None else np.asarray(value).copy()
-                                    for value in window.ascan_curves[name].getData()
-                                )
-                                for name in air.UI_CHANNELS
-                            }
-                        signature = (dewow_enabled, 4.0) if dewow_enabled else (False, None)
-                        for _ in range(40):
-                            self.assertTrue(window._append_bscan_trace(time_ns, traces, signature))
-                        original_history = {
-                            name: [row.copy() for row in rows]
-                            for name, rows in window.bscan.items()
-                        }
-                        window.flat_filter_enabled.blockSignals(True)
-                        window.flat_filter_enabled.setChecked(flat_enabled)
-                        window.flat_filter_enabled.blockSignals(False)
-                        with patch.object(
-                            air,
-                            "flat_reflection_filter",
-                            wraps=air.flat_reflection_filter,
-                        ) as mocked_filter:
-                            window.refresh_bscan_views()
-                        self.assertEqual(mocked_filter.call_count, 2 if flat_enabled else 0)
-                        for name in air.UI_CHANNELS:
-                            np.testing.assert_array_equal(produced_traces[name], pipeline_snapshot[name])
-                            for actual, expected in zip(window.bscan[name], original_history[name]):
-                                np.testing.assert_array_equal(actual, expected)
-                            if hasattr(window, "ascan_curves"):
-                                for actual, expected in zip(
-                                    window.ascan_curves[name].getData(),
-                                    original_ascan[name],
-                                ):
-                                    if expected is None:
-                                        self.assertIsNone(actual)
-                                    else:
-                                        np.testing.assert_array_equal(actual, expected)
-        finally:
-            window.close()
-            app.processEvents()
 
 
 if __name__ == "__main__":

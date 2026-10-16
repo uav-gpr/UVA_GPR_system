@@ -23,7 +23,7 @@ os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
 from PySide6 import QtWidgets
 
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 
 PROTOCOL = "uav-gpr-telemetry-v1"
 
@@ -209,39 +209,6 @@ class _FakeSenderForClose:
         self.stop_calls.append((timeout_ms, drain))
         return self.stop_result
 
-
-class MainWindowCloseDrainTests(unittest.TestCase):
-    """复审一(4)：closeEvent 排空失败 ignore，成功后第二次关闭 accept。"""
-
-    def setUp(self) -> None:
-        self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        self.temp = tempfile.TemporaryDirectory()
-        self.window = air.MainWindow()
-        self.sender = _FakeSenderForClose(stop_result=False)  # 排空失败。
-        self.window.remote_sender = self.sender
-
-    def tearDown(self) -> None:
-        # 幂等安全收尾：排空成功路径让 closeEvent 真正完成清理。
-        self.sender.stop_result = True
-        try:
-            self.window.close()
-        except Exception:  # noqa: BLE001
-            pass
-        self.temp.cleanup()
-        self.app.processEvents()
-
-    def test_close_ignored_when_drain_fails(self) -> None:
-        from PySide6 import QtGui
-
-        event = QtGui.QCloseEvent()
-        self.window.closeEvent(event)
-        self.assertFalse(event.isAccepted(), "排空失败必须 ignore 关闭")
-        self.assertTrue(self.sender.stop_calls and self.sender.stop_calls[-1][1], "必须先尝试 drain=True")
-        # 排空成功后第二次关闭 accept。
-        self.sender.stop_result = True
-        event2 = QtGui.QCloseEvent()
-        self.window.closeEvent(event2)
-        self.assertTrue(event2.isAccepted(), "排空成功后第二次关闭应 accept")
 
 
 class StopReconcileTests(unittest.TestCase):

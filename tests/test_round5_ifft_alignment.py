@@ -32,7 +32,7 @@ from gpr_processing import (
     flat_reflection_filter,
     frequency_to_time_trace,
 )
-import uav_gpr_qt as air
+import air_core as air
 import uav_gpr_ground_station as gs
 
 
@@ -263,13 +263,13 @@ class TestNoAbsControlsAndRealDisplay(unittest.TestCase):
     def test_no_abs_or_envelope_controls(self) -> None:
         from PySide6 import QtWidgets
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        win = air.MainWindow()
+        # 2026-10-15：空中端旧 GUI 已退役，只检查地面站窗口。
         gs_win = gs.GroundStationWindow("127.0.0.1", 0, Path(tempfile.mkdtemp()), start_receiver=False)
 
         try:
             # 严格禁止添加任何 abs/包络切换控件
             forbidden_tokens = ["envelope", "包络", "amplitude", "振幅"]
-            for target_win, name in [(win, "MainWindow"), (gs_win, "GroundStationWindow")]:
+            for target_win, name in [(gs_win, "GroundStationWindow")]:
                 all_widgets = target_win.findChildren(QtWidgets.QWidget)
                 for w in all_widgets:
                     obj_name = w.objectName().lower()
@@ -292,28 +292,7 @@ class TestNoAbsControlsAndRealDisplay(unittest.TestCase):
                                 f"{name} 文本含违禁词: {text} 含 '{word}'",
                             )
         finally:
-            win.close()
             gs_win.close()
-            app.processEvents()
-
-    def test_bscan_matrix_for_display_is_real(self) -> None:
-        from PySide6 import QtWidgets
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        win = air.MainWindow()
-        try:
-            time_ns = np.linspace(0, 40, 100)
-            rng = np.random.default_rng(99)
-            traces = {
-                "S11": rng.standard_normal(100) + 1j * rng.standard_normal(100),
-                "S22": rng.standard_normal(100) + 1j * rng.standard_normal(100),
-            }
-            win._append_bscan_trace(time_ns, traces)
-            matrix = win._bscan_matrix_for_display("S11")
-            self.assertIsNotNone(matrix)
-            self.assertEqual(matrix.dtype, np.float64)
-            self.assertFalse(np.iscomplexobj(matrix))
-        finally:
-            win.close()
             app.processEvents()
 
 

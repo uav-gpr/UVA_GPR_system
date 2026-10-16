@@ -33,7 +33,7 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 from disk_outbox import DiskOutbox, frame_bytes, parse_frame
 
 PROTOCOL = "uav-gpr-telemetry-v1"
@@ -406,35 +406,6 @@ class BacklogVisibilityTests(unittest.TestCase):
         else:
             cls.app = app
 
-    def test_07_air_station_backlog_visibility(self) -> None:
-        """空中端 MainWindow 具备 backlog_status_label、backlog_counts 与文案格式。"""
-        win = air.MainWindow()
-        try:
-            self.assertTrue(hasattr(win, "backlog_status_label"))
-            self.assertEqual(win.backlog_status_label.objectName(), "backlog_status_label")
-
-            # 初始状态
-            counts = win.backlog_counts()
-            self.assertIn("inflight", counts)
-            self.assertIn("unacknowledged", counts)
-            self.assertEqual(win.backlog_text(), "空闲/已停止")
-
-            # 模拟 sender 状态
-            mock_sender = MagicMock()
-            mock_sender.backlog_counts.return_value = {
-                "inflight": 3,
-                "unacknowledged": 5,
-                "outbox_pending": 0,
-                "stopping_remaining": 0,
-            }
-            mock_sender.backlog_text.side_effect = lambda state="": "在途 3 / 未确认 5" if not state else "排空中 · 还差 5 条"
-            win.remote_sender = mock_sender
-
-            self.assertEqual(win.backlog_counts()["inflight"], 3)
-            self.assertEqual(win.backlog_text(), "在途 3 / 未确认 5")
-            self.assertEqual(win.backlog_text(state="stopping"), "排空中 · 还差 5 条")
-        finally:
-            win.close()
 
     def test_08_ground_station_backlog_visibility_and_status_bar_constraint(self) -> None:
         """地面站 details_window 具备 backlog_label，statusBar 严守仅 3 个业务标签约束。"""

@@ -120,8 +120,20 @@ S11_S22_STAGES_BITMAP = 0x1241
 #: Hardware-validated stages_bitmaps only; extending this set is forbidden.
 ALLOWED_STAGES_BITMAPS: tuple[int, ...] = (S11_STAGES_BITMAP, S11_S22_STAGES_BITMAP)
 
+#: Single-reflection S22 stages_bitmap (EXPERIMENTAL, NOT hardware-validated).
+#: Derived from the same field decode: Stages=0 (1 stage), port 2 excited at
+#: stage 0 (bits8-6 = 0), port 1 assigned to the non-existent stage 1
+#: (bits5-3 = 1, i.e. 1<<3) -> port 1 never excites, mirroring how 0x1240
+#: disables port 2.  Same receiver-enable high bits (1<<9)|(1<<12).
+#: 0x1208 = (1<<3)|(1<<9)|(1<<12).  It is deliberately NOT in
+#: ALLOWED_STAGES_BITMAPS and is only accepted when the caller passes
+#: ``allow_experimental=True`` (air config ``experimental_s22_fast_sweep``),
+#: until confirmed on hardware.
+S22_STAGES_BITMAP = 0x1208
+EXPERIMENTAL_STAGES_BITMAPS: tuple[int, ...] = (S22_STAGES_BITMAP,)
 
-def _validate_stages_bitmap(stages_bitmap: int) -> None:
+
+def _validate_stages_bitmap(stages_bitmap: int, *, allow_experimental: bool = False) -> None:
     """Validate stages_bitmap: int (not bool), uint16 range, and a validated value.
 
     Production code only sends hardware-validated stages_bitmaps (see
@@ -136,6 +148,8 @@ def _validate_stages_bitmap(stages_bitmap: int) -> None:
         raise ValueError(
             f"stages_bitmap must be within 0..0xFFFF, got {stages_bitmap:#x}"
         )
+    if stages_bitmap in EXPERIMENTAL_STAGES_BITMAPS and allow_experimental:
+        return
     if stages_bitmap not in ALLOWED_STAGES_BITMAPS:
         raise ValueError(
             f"stages_bitmap must be one of the hardware-validated values "
@@ -319,6 +333,8 @@ class SweepSettings:
     power_dbm: float = -10.0
     dwell_us: int = 0
     stages_bitmap: int = S11_STAGES_BITMAP
+    #: 允许未经真机验证的实验组合（目前只有只采 S22 的 0x1208）。
+    allow_experimental: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.start_hz, int) or isinstance(self.start_hz, bool):
@@ -339,7 +355,7 @@ class SweepSettings:
             raise ValueError("SweepSettings ifbw_hz must be positive")
         if not math.isfinite(self.power_dbm):
             raise ValueError("SweepSettings power_dbm must be finite")
-        _validate_stages_bitmap(self.stages_bitmap)
+        _validate_stages_bitmap(self.stages_bitmap, allow_experimental=self.allow_experimental)
 
     def encode(self) -> bytes:
         """Encode to a SweepSettings payload (identical to reference bytes)."""
@@ -351,6 +367,7 @@ class SweepSettings:
             self.power_dbm,
             self.dwell_us,
             stages_bitmap=self.stages_bitmap,
+            allow_experimental=self.allow_experimental,
         )
 
 
@@ -363,6 +380,7 @@ def encode_sweep_settings(
     dwell_us: int = 0,
     *,
     stages_bitmap: int = S11_STAGES_BITMAP,
+    allow_experimental: bool = False,
 ) -> bytes:
     """Encode SweepSettings (protocol v14, byte-identical to reference).
 
@@ -377,7 +395,7 @@ def encode_sweep_settings(
     """
     cdbm = int(round(power_dbm * 100))
     config = (1 << 2) | (1 << 3)  # suppress peaks, fixed power
-    _validate_stages_bitmap(stages_bitmap)
+    _validate_stages_bitmap(stages_bitmap, allow_experimental=allow_experimental)
     return struct.pack(
         _SWEEP_SETTINGS_FORMAT,
         int(start_hz),
@@ -479,6 +497,40 @@ def parse_s11_point(
     if not (math.isfinite(s11.real) and math.isfinite(s11.imag)):
         return None
     return point_number, float(frequency), complex(s11)
+
+
+def parse_s22_point(
+    payload: bytes,
+) -> tuple[int, float, complex] | None:
+    """Parse a single-reflection S22 VNADatapoint (stages 0x1208, EXPERIMENTAL).
+
+    Port 2 is excited at stage 0, so S22 = stage-0 Port-2 receiver / stage-0
+    reference.  Same fail-closed rules as :func:`parse_s11_point`: a missing or
+    duplicated slot, a zero/non-finite reference, or a non-finite S22 returns
+    ``None``; broken payloads raise ``struct.error``.
+    """
+    frequency, _cdbm, point_number, values = parse_vna_datapoint(payload)
+    port2: complex | None = None
+    ref: complex | None = None
+    port2_count = 0
+    ref_count = 0
+    for desc, value in values:
+        if desc >> _DESC_STAGE_SHIFT != 0:
+            continue
+        if desc & _DESC_MASK_REFERENCE:
+            ref = value
+            ref_count += 1
+        elif desc & _DESC_MASK_PORT2:
+            port2 = value
+            port2_count += 1
+    if port2_count != 1 or ref_count != 1 or port2 is None or ref is None:
+        return None
+    if not (math.isfinite(ref.real) and math.isfinite(ref.imag)) or abs(ref) == 0:
+        return None
+    s22 = port2 / ref
+    if not (math.isfinite(s22.real) and math.isfinite(s22.imag)):
+        return None
+    return point_number, float(frequency), complex(s22)
 
 
 def parse_s11_s22_point(
@@ -605,6 +657,9 @@ __all__ = [
     "SET_IDLE",
     "S11_S22_STAGES_BITMAP",
     "S11_STAGES_BITMAP",
+    "S22_STAGES_BITMAP",
+    "EXPERIMENTAL_STAGES_BITMAPS",
+    "parse_s22_point",
     "SWEEP_SETTINGS",
     "SweepSettings",
     "VNA_DATAPOINT",

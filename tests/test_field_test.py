@@ -38,7 +38,7 @@ from unittest import mock
 
 import numpy as np
 
-import uav_gpr_qt as U
+import air_core as U
 
 from librevna.librevna_continuous import BackendState, PersistentBackendSettings, PersistentLibreVnaBackend
 from librevna.librevna_errors import LibreVnaDeviceNotFoundError, LibreVnaError

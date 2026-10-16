@@ -29,7 +29,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 try:
-    import uav_gpr_qt as air
+    import air_core as air
 except Exception as exc:  # noqa: BLE001 - 依赖缺失时整体跳过
     air = None
     IMPORT_ERROR = exc
@@ -703,7 +703,7 @@ class TaskIdentityTests(unittest.TestCase):
         """R-A-15：生产代码不得出现第二处 run_id 拼接（散点收编）。"""
         import inspect
 
-        source = inspect.getsource(sys.modules["uav_gpr_qt"])
+        source = inspect.getsource(sys.modules["air_core"])
         occurrences = [
             line.strip()
             for line in source.splitlines()
@@ -962,86 +962,6 @@ class RunIdCollisionRegressionTests(unittest.TestCase):
 # R-A-13 / R-A-07：手动 USB 互斥并集 + 关闭释放
 # ---------------------------------------------------------------------
 
-
-@unittest.skipIf(air is None, f"uav_gpr_qt unavailable: {IMPORT_ERROR}")
-class ManualUsbMutexAndCloseTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="round2-mutex-"))
-        self.window = air.MainWindow()
-        self.window.remote_enable.setChecked(False)
-        self.window.continuous_enabled.setChecked(True)
-
-    def tearDown(self) -> None:
-        worker = self.window.worker
-        if worker is not None and getattr(worker, "isRunning", lambda: False)():
-            worker.stop()
-            worker.wait(5000)
-        if not self.window.acquisition_service.shutdown(5000):
-            self.window.acquisition_service.retry_release()
-        self.window.close()
-        self.window.deleteLater()
-        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
-        self.app.processEvents()
-
-    def _hold_idle_session(self) -> RecordingTransport:
-        transport = RecordingTransport(5)
-        backend = _configured_backend(transport)
-        backend.pause()
-        service = self.window.acquisition_service
-        service._backend = backend  # noqa: SLF001 - 模拟真实任务停止后的待命
-        service._state = "idle_waiting"  # noqa: SLF001
-        return transport
-
-    def test_manual_usb_rejected_while_service_idle_waiting(self) -> None:
-        """R-A-13：任务停止进入待命后，手动 USB 入口仍必须被拒绝。"""
-        transport = self._hold_idle_session()
-        with unittest.mock.patch.object(air, "acquire_sparameters") as mocked:
-            self.window.test_sweep_settings()
-            self.window.capture_background()
-            self.window.capture_calibration_standard("P1_Open")
-            self.assertEqual(mocked.call_count, 0, "待命期不得自开第二条 USB 会话")
-        self.assertTrue(transport.is_open)
-        self.assertIn("禁止手动访问 LibreVNA", self.window.device_log.toPlainText())
-
-    def test_manual_usb_recovers_after_shutdown(self) -> None:
-        """R-A-13：只有 shutdown() 释放后手动入口才恢复（常驻定义性语义）。"""
-        self._hold_idle_session()
-        self.assertTrue(self.window.acquisition_service.shutdown(5000))
-        with unittest.mock.patch.object(air, "acquire_sparameters", return_value=[]) as mocked:
-            self.window.test_sweep_settings()
-            self.assertEqual(mocked.call_count, 1, "释放后手动入口应恢复")
-
-    def test_close_event_releases_usb_and_leaves_no_threads(self) -> None:
-        """R-A-07：closeEvent 经服务真正释放 USB，无残留线程。"""
-        transport = self._hold_idle_session()
-        before = {t.ident for t in threading.enumerate()}
-        event = QtGui.QCloseEvent()
-        self.window.closeEvent(event)
-        self.assertTrue(event.isAccepted(), "服务干净收尾后必须接受关闭")
-        self.assertFalse(transport.is_open, "只有程序关闭才真正释放 USB")
-        self.assertEqual(self.window.acquisition_service.state, "closed")
-        alive = {t.ident for t in threading.enumerate() if t.is_alive()} - before
-        self.assertEqual(alive, set(), f"残留线程: {alive}")
-
-    def test_close_event_ignored_when_release_blocked(self) -> None:
-        """R-A-07：资源未释放 → closeEvent ignore，第二次可成功。"""
-        transport = _CloseFailsTransport(5)
-        backend = _configured_backend(transport)
-        service = self.window.acquisition_service
-        service._backend = backend  # noqa: SLF001
-        service._state = "idle_waiting"  # noqa: SLF001
-        event = QtGui.QCloseEvent()
-        self.window.closeEvent(event)
-        self.assertFalse(event.isAccepted(), "未释放时不得伪装关闭成功")
-        transport.closable = True
-        event2 = QtGui.QCloseEvent()
-        self.window.closeEvent(event2)
-        self.assertTrue(event2.isAccepted())
-        self.assertFalse(transport.is_open)
 
 
 # ---------------------------------------------------------------------

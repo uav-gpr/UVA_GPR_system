@@ -34,9 +34,8 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 from PySide6 import QtCore, QtWidgets
 
 from librevna.librevna_continuous import PersistentLibreVnaBackend
-from tests.test_round2_air_ui_compact import _FlowTransport
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 
 
 class DummyReceiver(QtCore.QObject):
@@ -50,16 +49,6 @@ class DummyReceiver(QtCore.QObject):
 
     def send_command(self, action: str, params: dict | None = None) -> None:
         self.calls.append((action, params))
-
-
-class _CaptureFlowTransport(_FlowTransport):
-    def __init__(self, n_points: int = 5) -> None:
-        super().__init__(n_points=n_points)
-        self.written_packets: list[bytes] = []
-
-    def write(self, data: bytes) -> None:
-        self.written_packets.append(data)
-        super().write(data)
 
 
 class GroundStationSettingsUiTests(unittest.TestCase):
@@ -267,173 +256,6 @@ class GroundStationSettingsUiTests(unittest.TestCase):
         self.window._on_command_status("Remote accepted: set_params")
         self.assertEqual(self.window.acquisition_status_label.text(), "采集状态：参数已下发（以空中应用结果为准）")
 
-
-class AirStationRemoteSettingsTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.app = QtWidgets.QApplication.instance()
-        if cls.app is None:
-            cls.app = QtWidgets.QApplication([])
-
-    def setUp(self) -> None:
-        self.air_window = air.MainWindow()
-
-    def tearDown(self) -> None:
-        self.air_window.close()
-        self.app.processEvents()
-
-    # ---- 4. 空中端 handle_remote_command set_params 分支 ----
-
-    def test_air_set_params_updates_config(self) -> None:
-        initial_cfg = self.air_window.config()
-        self.assertEqual(initial_cfg.start_mhz, 400.0)
-        self.assertEqual(initial_cfg.stop_mhz, 4000.0)
-
-        params = {
-            "start_mhz": 600.0,
-            "stop_mhz": 2400.0,
-            "points": 101,
-            "ifbw_hz": 5000,
-            "power_dbm": -15.0,
-            "dwell_us": 10,
-            "ifft_points": 1024,
-            "time_window_ns": 30.0,
-            "dewow_enabled": True,
-            "dewow_window_ns": 3.5,
-        }
-        self.air_window.handle_remote_command("set_params", params)
-
-        new_cfg = self.air_window.config()
-        self.assertEqual(new_cfg.start_mhz, 600.0)
-        self.assertEqual(new_cfg.stop_mhz, 2400.0)
-        self.assertEqual(new_cfg.points, 101)
-        self.assertEqual(new_cfg.ifbw_hz, 5000)
-        self.assertEqual(new_cfg.power_dbm, -15.0)
-        self.assertEqual(new_cfg.dwell_us, 10)
-        self.assertEqual(new_cfg.ifft_points, 1024)
-        self.assertEqual(new_cfg.time_window_ns, 30.0)
-        self.assertTrue(new_cfg.dewow_enabled)
-        self.assertEqual(new_cfg.dewow_window_ns, 3.5)
-
-    def test_air_set_params_invalid_rejected_cleanly(self) -> None:
-        initial_cfg = self.air_window.config()
-
-        # 非法起止频率 (stop <= start)
-        self.air_window.handle_remote_command("set_params", {"start_mhz": 3000.0, "stop_mhz": 1000.0})
-        self.assertEqual(self.air_window.config(), initial_cfg)
-
-        # 非法频点数 (< 2)
-        self.air_window.handle_remote_command("set_params", {"points": 1})
-        self.assertEqual(self.air_window.config(), initial_cfg)
-
-    def test_air_set_params_rejected_while_acquiring(self) -> None:
-        initial_cfg = self.air_window.config()
-
-        # 模拟采集运行态
-        with patch.object(self.air_window, "_is_acquisition_running", return_value=True):
-            self.air_window.handle_remote_command("set_params", {"start_mhz": 800.0, "stop_mhz": 2000.0})
-            self.assertEqual(self.air_window.config(), initial_cfg)
-            log_text = self.air_window.device_log.toPlainText()
-            self.assertIn("set_params 拒绝: 采集运行中不可修改配置", log_text)
-
-        # 停止状态后允许下发生效
-        self.air_window.handle_remote_command("set_params", {"start_mhz": 800.0, "stop_mhz": 2000.0})
-        self.assertEqual(self.air_window.config().start_mhz, 800.0)
-        self.assertEqual(self.air_window.config().stop_mhz, 2000.0)
-
-    # ---- 5. 空中端 pause / resume 远程命令 ----
-
-    def test_air_remote_pause_and_resume_dispatch(self) -> None:
-        with patch.object(self.air_window, "pause_acquisition") as mock_pause, \
-             patch.object(self.air_window, "resume_acquisition") as mock_resume:
-            self.air_window.handle_remote_command("pause", {})
-            mock_pause.assert_called_once()
-
-            self.air_window.handle_remote_command("resume", {})
-            mock_resume.assert_called_once()
-
-    # ---- 6. 端到端链路集成测试 (Ground UI -> Air MainWindow.config) ----
-
-    def test_end_to_end_ground_ui_to_air_config(self) -> None:
-        ground_receiver = DummyReceiver()
-        ground_win = ground.GroundStationWindow(
-            host="127.0.0.1",
-            port=0,
-            out_dir=Path("./tmp_ground_e2e"),
-            receiver=ground_receiver,
-            start_receiver=False,
-        )
-        try:
-            # 1. 地面端打开设置中心并填写新配置
-            dialog = ground_win.acquisition_dialog
-            dialog.load_from(ground_win.acq_settings)
-            dialog.start_mhz.setValue(750.0)
-            dialog.stop_mhz.setValue(2800.0)
-            dialog.points.setValue(301)
-            dialog.ifbw.setValue(15000)
-            dialog.power.setValue(-12.0)
-            dialog.dewow_enabled.setChecked(True)
-            dialog.dewow_window.setValue(4.5)
-            dialog.time_window.setValue(55.0)
-
-            # 2. 地面端点“应用”，下发 set_params
-            dialog.apply()
-            self.assertEqual(ground_receiver.calls[-1][0], "set_params")
-            payload = ground_receiver.calls[-1][1]
-
-            # 3. 空中端接收到远程命令并处理
-            self.air_window.handle_remote_command("set_params", payload)
-
-            # 4. 验证空中端 config() 实时生效
-            air_cfg = self.air_window.config()
-            self.assertEqual(air_cfg.start_mhz, 750.0)
-            self.assertEqual(air_cfg.stop_mhz, 2800.0)
-            self.assertEqual(air_cfg.points, 301)
-            self.assertEqual(air_cfg.ifbw_hz, 15000)
-            self.assertEqual(air_cfg.power_dbm, -12.0)
-            self.assertTrue(air_cfg.dewow_enabled)
-            self.assertEqual(air_cfg.dewow_window_ns, 4.5)
-            self.assertEqual(air_cfg.time_window_ns, 55.0)
-
-            # 5. 协议级验证（F4）：空中端在 set_params 后启动真实采集，在 transport 侧捕获 SWEEP_SETTINGS 报文
-            transport = _CaptureFlowTransport(n_points=301)
-            service = air.AcquisitionService(
-                backend_factory=lambda: PersistentLibreVnaBackend(transport=transport)
-            )
-            self.air_window.acquisition_service = service
-            self.air_window.remote_enable.setChecked(False)
-            self.air_window.continuous_enabled.setChecked(True)
-            self.air_window.count.setValue(1)
-            self.air_window.start_acquisition()
-            try:
-                sweep_packets: list[bytes] = []
-                for _ in range(50):
-                    time.sleep(0.02)
-                    self.app.processEvents()
-                    sweep_packets = [
-                        pkt for pkt in transport.written_packets
-                        if len(pkt) >= 8 and pkt[3] == 2
-                    ]
-                    if sweep_packets:
-                        break
-
-                self.assertTrue(len(sweep_packets) >= 1, "未在 transport 层捕获到 SWEEP_SETTINGS 报文")
-                payload = sweep_packets[0][4:-4]
-                start_hz, stop_hz, points, ifbw_hz, power_cdbm = struct.unpack("<QQHIh", payload[:24])
-                self.assertEqual(start_hz, 750_000_000)
-                self.assertEqual(stop_hz, 2_800_000_000)
-                self.assertEqual(points, 301)
-                self.assertEqual(ifbw_hz, 15000)
-                self.assertEqual(power_cdbm, -1200)
-            finally:
-                self.air_window.stop_acquisition()
-                worker = self.air_window.worker
-                if worker is not None and getattr(worker, "isRunning", lambda: False)():
-                    worker.stop()
-                    worker.wait(2000)
-        finally:
-            ground_win.close()
-            self.app.processEvents()
 
 
 if __name__ == "__main__":

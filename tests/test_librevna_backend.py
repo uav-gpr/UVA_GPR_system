@@ -1372,10 +1372,8 @@ class BackendConfigValidationTests(unittest.TestCase):
         self.assertEqual(len(self.transport.writes), writes_before)
         self.assertIs(self.backend.state, BackendState.OPEN_IDLE)
 
-    def test_single_channel_0x1240_rejected(self) -> None:
-        self._assert_rejected(
-            _sweep_settings(stages_bitmap=S11_STAGES_BITMAP), "0x1241"
-        )
+    # 2026-10-15：0x1240（只采 S11）现在是连续后端支持的扫法，原“拒绝 0x1240”
+    # 用例移除；单端口扫法的覆盖见 tests/test_single_channel_and_vv_background.py。
 
     def test_frequency_out_of_range_rejected(self) -> None:
         self._assert_rejected(_sweep_settings(stop_hz=7_000_000_000), "频率范围")

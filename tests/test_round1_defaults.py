@@ -9,7 +9,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import uav_gpr_ground_station as ground
-import uav_gpr_qt as air
+import air_core as air
 
 
 class DefaultIntervalTests(unittest.TestCase):
@@ -26,20 +26,6 @@ class DefaultIntervalTests(unittest.TestCase):
         # 直接用 dataclass 语义验证（对话框 UI 映射由其它测试覆盖）。
         settings = ground.AcquisitionUiSettings(interval_s=0.0, count=0)
         self.assertEqual(settings.command_params(single=True)["count"], 1)
-
-    def test_air_interval_spin_default_zero(self) -> None:
-        # SweepConfig 默认值与本测试无关；断言模块级默认常量路径：
-        # ContinuousAcquisitionWorker 未显式传 interval 时按调用方值，
-        # UI 默认在 MainWindow._acquisition_page 中设置为 0.0。
-        from PySide6 import QtWidgets
-
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = air.MainWindow()
-        try:
-            self.assertEqual(window.interval.value(), 0.0, "空中端默认 interval=0（无采集间隔）")
-        finally:
-            window.close()
-            window.deleteLater()
 
 
 class LosslessQueueTests(unittest.TestCase):

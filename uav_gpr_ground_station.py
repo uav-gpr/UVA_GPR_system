@@ -3559,6 +3559,10 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.action_bscan_settings.setObjectName("action_bscan_settings")
         self.action_clear_bscan = self.menu_bscan.addAction("清空 B-scan")
         self.action_clear_bscan.setObjectName("action_clear_bscan")
+        # 2026-10-22：历史采集回看（独立窗口：读历史 run、合并、离线 Dewow/Flat Filter）。
+        self.menu_bscan.addSeparator()
+        self.action_open_history = self.menu_bscan.addAction("历史采集回看……")
+        self.action_open_history.setObjectName("action_open_history")
 
         self.menu_view = menubar.addMenu("视图")
         self.action_show_details = self.menu_view.addAction("详细状态")
@@ -3584,6 +3588,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.action_exit.triggered.connect(self.close)
         self.action_bscan_settings.triggered.connect(self.open_bscan_settings)
         self.action_clear_bscan.triggered.connect(self.clear_bscan)
+        self.action_open_history.triggered.connect(self.show_history_viewer)
         self.action_show_details.triggered.connect(self.show_details_window)
         self.action_show_log.triggered.connect(self.show_log_window)
         self.action_show_pipeline_metrics.triggered.connect(self.show_pipeline_metrics)
@@ -3592,6 +3597,20 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         # 复审修复：关于 action 在 _build_menu_bar 中只连接一次（此前错误地
         # 放在 show_pipeline_metrics 内，每打开一次诊断就多一条重复连接）。
         self.action_about.triggered.connect(self.show_about)
+
+    def show_history_viewer(self) -> None:
+        """打开「历史采集回看」窗口（非模态、只读磁盘，不影响实时采集）。"""
+        from offline_viewer import OfflineRunViewer  # 延迟导入：不用时不加载
+
+        viewer = getattr(self, "history_viewer", None)
+        if viewer is None:
+            default_dir = getattr(self.receiver, "out_dir", None)
+            viewer = OfflineRunViewer(default_dir=Path(default_dir) if default_dir else None, parent=self)
+            viewer.setWindowFlag(QtCore.Qt.Window, True)
+            self.history_viewer = viewer
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
 
     def show_pipeline_metrics(self) -> None:
         """把链路性能统计快照写入运行日志（诊断入口，不影响主界面）。"""

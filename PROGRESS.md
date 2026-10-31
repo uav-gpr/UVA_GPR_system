@@ -6,7 +6,7 @@
 ---
 
 - **当前版本**：v8.0.0-round8
-- **最后更新时间**：2026-10-15
+- **最后更新时间**：2026-10-22
 - **所属仓库**：uav-gpr / UVA_GPR_system (Private)
 
 ---
@@ -87,10 +87,19 @@
   - 色阶滑块面板加最小宽度 44 px、固定宽度策略，防止被 B-scan 挤没。用户反馈“看不到滑块”的主要原因是测的是 PR #4 分支（不含 PR #1），main 上已有滑块。
   - 新增测试 3 项（`test_single_channel_and_vv_background.py` 共 31 项）。
 
+- [x] 2026-10-22 整次采集合并 + 地面站历史采集回看（分支 `feature/run-merge-offline-viewer`）。
+  - 新增 `run_archive.py`（纯 numpy）：把 `remote_runs/<run_id>/trace_*.npz`（地面命名）或 `gpr_runs/<run_id>/trace_NNNNN_<时间戳>.npz`（空中命名）合并成 `<run_id>_merged.npz`（format=`uav_gpr_run_merged_v1`）。按编号排序去重，缺号/重复/损坏/参数不一致逐条记账并跳过；先写 `.tmp` 再原子改名；原始单道文件一律保留。
+  - 离线重处理从 `display_*`（空中端已做完校准+背景扣除的频域数据）重做 BPF→IFFT→(可选)Dewow，再按需 Flat Filter；与 `air_core.make_time_trace` 同函数同参数，测试锁定“同参数重算 = 实时结果”。老格式无 `display_*` 时退回已存时域 trace。
+  - 新增 `offline_viewer.py`：地面站菜单「B-scan → 历史采集回看……」打开的独立非模态窗口（打开文件夹/合并文件、整条测线 B-scan、Dewow/Flat Filter、色阶/色图、合并保存、导出处理结果）。主界面按钮与菜单栏顶层不变。
+  - 新增 `tools/merge_runs.py` + `merge_runs.bat`：双击合并 `remote_runs` 下全部采集，或把采集文件夹拖上去；默认跳过 `_c`/`_idle`/`_` 开头文件夹。
+  - 已知限制：trace 里只有 `calibration_id`，校准系数与空采背景不随数据走，离线暂不能“换背景”；数千道合并约数秒、文件约百 MB 量级。
+  - 测试：`tests/test_run_archive.py`（11 项）。
+
 ---
 
 ## 4. 下一步任务建议
 
+0. 历史采集回看后续：让空中端把当次校准系数和 HH/VV 空采背景随数据发到地面并写进合并文件，离线即可“换背景/重新校准”；可选“停止采集后自动合并”。
 0. 架构技术债第 2 步：拆分 `air_core.py`（按采集/GNSS/校准/发送分文件，注意测试大量 `patch.object(air, ...)`，拆分时要保证被 patch 的名字仍从同一模块查找）；第 3 步：拆分 `uav_gpr_ground_station.py`；补 CI。
 
 1. 保持当前架构稳定性，新增需求先编写测试用例或在对应模块添加独立单元测试。

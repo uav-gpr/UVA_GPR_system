@@ -234,7 +234,7 @@ class AirGnssQuickCheck(unittest.TestCase):
             reader.close()
 
     def test_port_probe_and_baud_rescue_after_two_cycles(self):
-        """两轮物理口轮询（无端口/COM1/COM3）后按手册降速救援，再切回一次。"""
+        """静默物理口轮询（无端口/COM1/COM3）保留同速率探测，停用 115200 改速与 saveconfig。"""
         rig = SerialRig()
         rig.available = True
         readers = []
@@ -249,7 +249,7 @@ class AirGnssQuickCheck(unittest.TestCase):
             reader.log = logs.append
             reader.open()
             now = time.monotonic()
-            # 7 次阶段切换 = 跑满两轮 (0→1→2) + 触发救援后的新一轮起点。
+            # 7 次阶段切换 = 跑满两轮 (0→1→2)，始终保持同一配置波特率（9600）。
             for _ in range(7):
                 reader._last_sentence_at = now - 100.0
                 reader._last_poll_at = now - 2.0
@@ -259,10 +259,11 @@ class AirGnssQuickCheck(unittest.TestCase):
             self.assertIn(b"log com1 gpgga ontime 1\r\n", rig.commands)
             self.assertIn(b"log com3 gpgga ontime 1\r\n", rig.commands)
             self.assertIn(b"log loglista once\r\n", rig.commands)
-            self.assertIn(b"com com1 9600\r\n", rig.commands)
-            self.assertIn(b"com com3 9600\r\n", rig.commands)
-            self.assertIn(9600, [baud for _, baud in readers])   # 救援后按 9600 重开
-            self.assertTrue(any("波特率救援" in line for line in logs), logs)
+            self.assertNotIn(b"com com1 9600\r\n", rig.commands)
+            self.assertNotIn(b"com com3 9600\r\n", rig.commands)
+            self.assertNotIn(b"saveconfig\r\n", rig.commands)
+            self.assertEqual(readers, [("COM7", 9600)])
+            self.assertTrue(any("波特率救援已停用" in line for line in logs), logs)
             reader.close()
 
 

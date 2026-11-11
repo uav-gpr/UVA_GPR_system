@@ -870,14 +870,29 @@ class GnssReader:
     **波特率**：默认按 9600 工作。2026-10-09 现场实测（计算棒 + PL2303GT +
     20 针线束）：115200 下接收机"0"位大量丢失（80% 字节 >=0x80，全是
     ``11111111`` 少一个 0），降到 9600 后坏字节 1%、``$GNGGA`` 正常可读。
-    程序仍带自适应：收不到 NMEA 时会把接收机与主机一起拉到 9600
-    （手册 4.2 ``com com1 9600``）并 ``saveconfig`` 固化，必要时再回退一次。
+    静默超时期间保持配置速率不变，仅做同速率物理口输出探测，不改写接收机波特率或固化配置。
     """
 
     #: NMEA-0183 句子最短结构（"$xxGGA," 需要 7 个字符）。
     NMEA_SENTENCE_MIN_CHARS = 7
     #: 无 NMEA 时的输出激活轮询周期（老师版本每 0.3 s 发一次 ``log gpgga``）。
     POLL_INTERVAL_S = 1.0
+    #: 读取循环最小节拍（秒）。Windows 上串口设备半断开/线束悬空时，
+    #: ``readline`` 会**立即**返回 0 字节或垃圾字节，原来的 ``while`` 循环
+    #: 于是在 timeout 窗口内满速空转、持续抢占 GIL，把同一进程里的雷达采集
+    #: 线程拖慢一个数量级（实测 9.0 -> 0.7 道/秒，CPU 94%）。每轮未产生有效返回时
+    #: 至少让出这么长时间即可恢复；正常 1Hz 报文流与 FIFO 排流零额外延迟。
+    READ_LOOP_MIN_INTERVAL_S = 0.01
+    #: 单块多行 NMEA 有界 FIFO 容量（行）。保留同一数据块后续完整行及跨块半句。
+    LINE_FIFO_CAPACITY = 256
+    #: GGA/RMC 报文审计环容量（条）。
+    SENTENCE_AUDIT_MAX = 256
+    #: 有效 GGA 空闲超过该阈值（秒）后才允许较新的有效 RMC 兜底输出。
+    RMC_FALLBACK_AFTER_GGA_S = 3.0
+    #: 乱序旧 GGA 窗口（秒）：小幅倒退判为旧 GGA 跳过；大幅跳变视为冷启动授时重同步。
+    STALE_GGA_WINDOW_S = 600.0
+    #: 同历元 GGA/RMC 坐标一致性容差（度，约 11 m）。
+    COORD_CONFLICT_TOL_DEG = 1e-4
     #: 判为"输出没在流"的空闲阈值（正常 1 Hz 报文流不会触发轮询）。
     SILENCE_BEFORE_POLL_S = 2.0
     #: 原始字节诊断样本长度。
@@ -897,16 +912,9 @@ class GnssReader:
         (b"log com1 gpgga ontime 1\r\n",),
         (b"log com3 gpgga ontime 1\r\n",),
     )
-    #: 波特率救援：跑满这么多轮物理口轮询仍无 NMEA，就把接收机与主机一起换到
-    #: 已知可用的波特率（M100 用户手册 4.2 常用指令"com com1 9600"）。
-    #:
-    #: 现场实测（2026-10-09，计算棒 + PL2303GT + 20 针线束）：115200 下接收机的
-    #: "0"位大量丢失（80% 字节 >=0x80，全是 11111111 少一个 0），降到 9600 后
-    #: 坏字节降到 1%、`$GNGGA` 正常可读 —— 位宽放大 12 倍把电平/线束余量拉回来了。
-    #: 所以默认按 9600 工作，救援也是把两边都拉到 9600。
+    #: 物理口轮询周期计数阈值（静默改速救援已停用，仅用于记录一轮探测完成）。
     PORT_PROBE_CYCLES_BEFORE_RESCUE = 1
     RESCUE_BAUD = 9600
-    #: 拖波特率时用来"喂命令"的接收机出厂默认速率（接收机在别的速率上时只能用它对话）。
     FACTORY_BAUD = 115200
 
     @staticmethod
@@ -924,6 +932,48 @@ class GnssReader:
         if not talker.isalpha():
             return ""
         return talker.upper()[2:]
+
+    @staticmethod
+    def _parse_utc_seconds(utc: str) -> float | None:
+        """解析 NMEA UTC 字段（hhmmss[.ss]）为当日秒数 [0, 86401)，空或非法返回 None。"""
+        text = (utc or "").strip()
+        if len(text) < 6 or not text[:6].isdigit():
+            return None
+        try:
+            hours = int(text[0:2])
+            minutes = int(text[2:4])
+            seconds = float(text[4:])
+        except ValueError:
+            return None
+        if not (0 <= hours < 24 and 0 <= minutes < 60 and math.isfinite(seconds) and 0.0 <= seconds < 61.0):
+            return None
+        return round(hours * 3600.0 + minutes * 60.0 + seconds, 3)
+
+    @staticmethod
+    def _epoch_delta_seconds(new_epoch: float, ref_epoch: float) -> float:
+        """按 86400s 圆环计算有符号历元差（new - ref），支持跨午夜 23:59:59 -> 00:00:00。"""
+        day_s = 86400.0
+        delta = (new_epoch - ref_epoch) % day_s
+        if delta > day_s / 2.0:
+            delta -= day_s
+        return round(delta, 3)
+
+    @staticmethod
+    def _fixes_conflict(fix_a: GgaFix, fix_b: GgaFix) -> str:
+        """检查同一历元两条报文是否存在有效性或坐标冲突，返回冲突原因（空串=一致）。"""
+        valid_a = is_valid_gnss_fix(fix_a)
+        valid_b = is_valid_gnss_fix(fix_b)
+        if valid_a != valid_b:
+            return "validity_mismatch"
+        if valid_a and valid_b:
+            assert fix_a.latitude is not None and fix_a.longitude is not None
+            assert fix_b.latitude is not None and fix_b.longitude is not None
+            if (
+                abs(fix_a.latitude - fix_b.latitude) > GnssReader.COORD_CONFLICT_TOL_DEG
+                or abs(fix_a.longitude - fix_b.longitude) > GnssReader.COORD_CONFLICT_TOL_DEG
+            ):
+                return "coordinate_mismatch"
+        return ""
 
     @staticmethod
     def _split_nmea_lines(buffer: bytes) -> tuple[list[bytes], bytes]:
@@ -948,15 +998,25 @@ class GnssReader:
             index += 1
         return lines, bytes(buffer[start:])
 
-    def __init__(self, port: str, baud: int = 115200) -> None:
+    def __init__(self, port: str, baud: int = 9600) -> None:
         self.port = port
         self.baud = baud
         self.ser: serial.Serial | None = None
         self._configured_baud = baud
-        self._rescue_state = 0  # 0=未降速 1=已降到 RESCUE_BAUD 2=已切回并放弃
+        self._rescue_state = 0
         self._probe_cycles = 0
         self._partial = b""
+        self._line_fifo: deque[bytes] = deque()
+        self.fifo_overflows = 0
         self._last_gga_at = float("-inf")
+        self._last_valid_gga_at = float("-inf")
+        self._last_gga_epoch: float | None = None
+        self._last_gga_fix: GgaFix | None = None
+        self._last_rmc_epoch: float | None = None
+        self._last_rmc_fix: GgaFix | None = None
+        self._last_selected_epoch: float | None = None
+        self._last_selected_kind = ""
+        self._last_selected_fix: GgaFix | None = None
         self._last_sentence_at = float("-inf")
         self._last_poll_at = float("-inf")
         self._last_response_at = float("-inf")
@@ -966,12 +1026,22 @@ class GnssReader:
         self._probe_sent = False
         #: 诊断日志回调（air_gnss/测试注入；None = 不记录）。
         self.log = None
+        #: 可选结构化 JSONL 诊断记录器（GnssLogWriter，默认 None = 不写盘）。
+        self.diagnostics_logger: object | None = None
         # ---- 诊断计数：air_gnss 据此区分无字节 / 有字节非 NMEA / 无卫星 / 无定位 ----
         self.rx_bytes = 0
         self.rx_lines = 0
         self.non_nmea_bytes = 0
         self.detected_sentences = 0
         self.parse_errors = 0
+        self.gga_count = 0
+        self.rmc_count = 0
+        self.duplicate_epochs_skipped = 0
+        self.stale_rmc_skipped = 0
+        self.stale_gga_skipped = 0
+        self.suppressed_rmc_count = 0
+        self.epoch_conflicts = 0
+        self.sentence_audit: deque[dict[str, object]] = deque(maxlen=self.SENTENCE_AUDIT_MAX)
         self.raw_sample = b""
         self.latest_sample = b""
         self.last_sentence = ""
@@ -992,6 +1062,21 @@ class GnssReader:
         self._probe_phase_started_at = float("-inf")
         self._saveconfig_done = False
 
+    @property
+    def line_fifo_overflows(self) -> int:
+        return self.fifo_overflows
+
+    def _emit_diag(self, method_name: str, *args: object, **kwargs: object) -> None:
+        logger = self.diagnostics_logger
+        if logger is None or not getattr(logger, "enabled", True):
+            return
+        fn = getattr(logger, method_name, None)
+        if callable(fn):
+            try:
+                fn(*args, **kwargs)
+            except Exception:  # noqa: BLE001 - 诊断日志故障绝不影响串口读取
+                pass
+
     def open(self) -> None:
         if self.ser and self.ser.is_open:
             return
@@ -999,7 +1084,7 @@ class GnssReader:
         # 收数时 write() 会无界阻塞，request_stop 永远轮不到检查。1s 写不进去
         # 按打开失败处理：关串口、抛错，交还 GnssReaderThread.run 的退避重试
         # 循环（每轮间隔都检查 _stop，可被及时终止）。
-        # 串口参数显式写全（老师现场验证版本：115200 / 8 / N / 1 / 无流控）。
+        # 串口参数显式写全（8 / N / 1 / 无流控，默认 9600）。
         # 取值与 pyserial 默认值一致，显式声明是为了诊断日志可核对。
         self.ser = serial.Serial(
             self.port,
@@ -1016,6 +1101,14 @@ class GnssReader:
             f"[GNSS] serial parameters port={self.port} baud={self.baud} "
             "bytesize=8 parity=N stopbits=1 flow=none timeout=0.2s"
         )
+        self._emit_diag(
+            "log_connection",
+            "opened",
+            port=self.port,
+            baud=self.baud,
+            configured_port=self.port,
+            configured_baud=self._configured_baud,
+        )
         try:
             self._write(b"log gpgga ontime 1\r\n")
             self._write(b"log gprmc ontime 1\r\n")
@@ -1031,7 +1124,9 @@ class GnssReader:
         ser = self.ser
         self.ser = None
         self._partial = b""
+        self._line_fifo.clear()
         if ser:
+            self._emit_diag("log_connection", "closed", port=self.port, baud=self.baud)
             ser.close()
 
     # ---- 诊断（区分：串口打不开 / 打开无字节 / 有字节非 NMEA / NMEA 被拒） ----
@@ -1047,11 +1142,31 @@ class GnssReader:
 
     def reset_diagnostics(self) -> None:
         """每次打开串口重置计数（只统计本次连接的字节/句子）。"""
+        self._partial = b""
+        self._line_fifo.clear()
+        self.fifo_overflows = 0
         self.rx_bytes = 0
         self.rx_lines = 0
         self.non_nmea_bytes = 0
         self.detected_sentences = 0
         self.parse_errors = 0
+        self.gga_count = 0
+        self.rmc_count = 0
+        self.duplicate_epochs_skipped = 0
+        self.stale_rmc_skipped = 0
+        self.stale_gga_skipped = 0
+        self.suppressed_rmc_count = 0
+        self.epoch_conflicts = 0
+        self.sentence_audit.clear()
+        self._last_gga_at = float("-inf")
+        self._last_valid_gga_at = float("-inf")
+        self._last_gga_epoch = None
+        self._last_gga_fix = None
+        self._last_rmc_epoch = None
+        self._last_rmc_fix = None
+        self._last_selected_epoch = None
+        self._last_selected_kind = ""
+        self._last_selected_fix = None
         self.raw_sample = b""
         self.latest_sample = b""
         self.last_sentence = ""
@@ -1148,6 +1263,7 @@ class GnssReader:
         probe = self._sample_tail + chunk
         self.binary_sync_hits += probe.count(b"\xaa\x44\x12")
         self._sample_tail = probe[-2:]
+        self._emit_diag("log_raw_bytes", chunk, port=self.port, baud=self.baud)
 
     def _note_response(self, line: str, raw_line: bytes) -> None:
         """记录接收机应答与报告。
@@ -1161,10 +1277,12 @@ class GnssReader:
         self.last_response = line
         if line.startswith(("#", "<")):
             self.last_report = line[:80]
+            self._emit_diag("log_response", line, kind="report", port=self.port, baud=self.baud)
             if len(self.receiver_reports) < self.MAX_RECEIVER_REPORTS:
                 self.receiver_reports.append(line[:120])
                 self._note(f"[GNSS] receiver report {line[:120]!r}")
             return
+        self._emit_diag("log_response", line, kind="response", port=self.port, baud=self.baud)
         self._response_count += 1
         now = time.monotonic()
         # 前三条应答必记（现场需要看清 Error!/版本信息），之后按节流记录。
@@ -1177,6 +1295,15 @@ class GnssReader:
         assert self.ser is not None
         self.ser.write(payload)
         self._note(f"[GNSS] TX command {payload!r}")
+        self._emit_diag(
+            "log_command",
+            payload,
+            direction="tx",
+            kind="command",
+            port=self.port,
+            baud=self.baud,
+            phase=self._probe_phase,
+        )
 
     def _poll_output(self, now: float) -> None:
         """老师版本原命令 + 手册清理序列 + 物理口轮询，激活/恢复 ASCII GGA 输出。"""
@@ -1193,7 +1320,7 @@ class GnssReader:
             self._probe_phase_started_at = now
             next_phase = (self._probe_phase + 1) % len(self.PORT_PROBE_COMMANDS)
             if next_phase == 0:
-                # 一轮（无端口 → COM1 → COM3）跑完仍无 NMEA：按手册降速再试一次。
+                # 一轮（无端口 → COM1 → COM3）跑完仍无 NMEA：保持当前波特率，继续同速率探测。
                 self._probe_cycles += 1
                 if self._probe_cycles >= self.PORT_PROBE_CYCLES_BEFORE_RESCUE:
                     self._probe_cycles = 0
@@ -1216,6 +1343,15 @@ class GnssReader:
         避免两条 TX 同时驱动同一条 RX 互相打架。不下发 saveconfig，不写 flash。
         """
         self._probe_phase = phase
+        self._emit_diag(
+            "log_command",
+            f"enter_probe_phase={phase} first={first}",
+            direction="internal",
+            kind="probe",
+            port=self.port,
+            baud=self.baud,
+            phase=phase,
+        )
         self._write(b"unlogall\r\n")
         for command in self.PORT_PROBE_COMMANDS[phase]:
             self._write(command)
@@ -1228,70 +1364,28 @@ class GnssReader:
             self._write(b"log comconfiga\r\n")
 
     def _try_baud_rescue(self) -> bool:
-        """把接收机与主机一起拉到 RESCUE_BAUD（默认 9600），并按需回退一次。
+        """静默波特率救援已停用：保持当前配置速率，绝不切到 115200 或写 saveconfig。
 
-        为什么"拉到 9600"能救：现场实测 115200 下接收机的"0"位在本链路上大量丢失
-        （80% 字节 >=0x80），9600 位宽放大 12 倍后坏字节降到 1%。命令取自 M100
-        用户手册 4.2 常用指令"修改串口波特率：com com1 9600"（com3 同理）。
-
-        时序：接收机可能停在出厂速率 115200（刚上电/恢复出厂），此时只能用 115200
-        跟它说话 → 先把主机切到 115200 发 ``com com1|com3 9600``，再切回 9600 读取；
-        成功后补一条 ``saveconfig``（手册 4.2，把 9600 与 GGA 输出写进接收机，
-        只写一次），这样接收机重启后不会再回到 115200。若 9600 仍收不到 NMEA，
-        再来一次把两边都切回配置波特率（最多来回一次，不会无限切换）。
+        旧救援会在静默超时后重开 115200、下发 ``com com1/com3 9600`` 与 ``saveconfig``
+        写接收机 flash。现统一停用自动改速与写配置，仅记录一次状态并继续同速率物理口探测。
         """
-        if self._rescue_state == 2:
-            return False
-        first = self._rescue_state == 0
-        target = self.RESCUE_BAUD if first else self._configured_baud
-        self._rescue_state = 1 if first else 2
-        if first:
-            # 1) 用出厂速率与接收机对话（接收机此时可能还在 115200）。
-            if self.baud != self.FACTORY_BAUD:
-                try:
-                    self.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self.baud = self.FACTORY_BAUD
-                try:
-                    self.open()
-                except Exception as exc:  # noqa: BLE001 - 重开失败交回上层重连
-                    self._note(f"[GNSS] 波特率救援重开串口失败：{exc}")
-                    return False
-            for receiver_port in ("com1", "com3"):
-                self._write(f"com {receiver_port} {target}\r\n".encode("ascii"))
-            self._note(
-                f"[GNSS] 波特率救援：接收机 com1/com3 -> {target}（手册 4.2）；"
-                f"主机读取波特率 -> {target}"
+        if self._rescue_state == 0:
+            self._rescue_state = 2
+            msg = (
+                f"[GNSS] 波特率救援已停用：保持当前配置波特率 {self.baud}，"
+                "不下发 com 改速或 saveconfig，仅继续同速率输出探测"
             )
-            self._last_poll_at = time.monotonic()  # 让接收机有时间切换
-            time.sleep(0.4)
-        else:
-            # 回退：当前在 RESCUE_BAUD 上，用它把接收机切回配置波特率。
-            for receiver_port in ("com1", "com3"):
-                self._write(f"com {receiver_port} {target}\r\n".encode("ascii"))
-            self._note(f"[GNSS] 波特率救援仍未收到 NMEA：两边切回 {target}")
-            time.sleep(0.3)
-        try:
-            self.close()
-        except Exception:  # noqa: BLE001
-            pass
-        self.baud = target
-        try:
-            self.open()
-        except Exception as exc:  # noqa: BLE001
-            self._note(f"[GNSS] 波特率救援后重开串口失败：{exc}")
-            return False
-        if first and not self._saveconfig_done:
-            # 手册 4.2 "保存设置：saveconfig"：只做一次，避免每次重连都写接收机 flash。
-            self._saveconfig_done = True
-            try:
-                self._write(b"saveconfig\r\n")
-                self._note("[GNSS] 已下发 saveconfig：接收机保持该波特率与 GGA 输出")
-            except Exception as exc:  # noqa: BLE001
-                self._note(f"[GNSS] saveconfig 下发失败（不影响本次运行）：{exc}")
-        self._cleanup_sent = False  # 换波特率后重新走一遍 unlogall + 阶段0
-        return True
+            self._note(msg)
+            self._emit_diag(
+                "log_command",
+                msg,
+                direction="internal",
+                kind="baud_rescue_disabled",
+                port=self.port,
+                baud=self.baud,
+                phase=self._probe_phase,
+            )
+        return False
 
     def _note_diagnostics(self, now: float) -> None:
         if now - self._last_sentence_at < self.SILENCE_BEFORE_POLL_S:
@@ -1301,11 +1395,333 @@ class GnssReader:
         self._last_diagnostic_at = now
         self._note(f"[GNSS] RX bytes {self.rx_bytes} | {self.diagnostics()}")
 
+    def _enqueue_lines(self, lines: list[bytes]) -> None:
+        """将拆出的完整行推入 256 行有界 FIFO；满时丢弃最旧行并记溢出计数。"""
+        for raw_line in lines:
+            if len(self._line_fifo) >= self.LINE_FIFO_CAPACITY:
+                self._line_fifo.popleft()
+                self.fifo_overflows += 1
+            self._line_fifo.append(raw_line)
+
+    def _record_sentence(
+        self,
+        kind: str,
+        line: str,
+        fix: GgaFix | None = None,
+        *,
+        now: float | None = None,
+        error: str = "",
+    ) -> bool:
+        """统一审计 GGA/RMC 及其他 NMEA 句子，执行同历元去重、冲突记录与取舍决策。
+
+        返回 True 表示该报文被选中作为当前定位输出；返回 False 表示已审计但跳过。
+        """
+        ts = time.monotonic() if now is None else now
+        talker = line[1:3].upper() if len(line) >= 6 and line.startswith("$") else ""
+        if error:
+            record: dict[str, object] = {
+                "kind": kind or "UNKNOWN",
+                "talker": talker,
+                "utc": "",
+                "epoch_s": None,
+                "fix_quality": 0,
+                "satellites": 0,
+                "latitude": None,
+                "longitude": None,
+                "altitude_m": None,
+                "valid": False,
+                "selected": False,
+                "reason": "parse_error",
+                "conflict": False,
+                "conflict_detail": "",
+                "error": error,
+                "raw": line,
+                "monotonic": ts,
+            }
+            self.sentence_audit.append(record)
+            self._emit_diag("log_sentence", record, port=self.port, baud=self.baud)
+            self._note(f"[GNSS] parse result rejected {line[:48]!r} ({error})")
+            return False
+
+        if kind not in ("GGA", "RMC") or fix is None or not fix.nmea_received:
+            reason = "unsupported_sentence" if kind not in ("GGA", "RMC") else "incomplete_sentence"
+            record = {
+                "kind": kind or "UNKNOWN",
+                "talker": talker,
+                "utc": fix.utc if fix is not None else "",
+                "epoch_s": None,
+                "fix_quality": fix.fix_quality if fix is not None else 0,
+                "satellites": fix.satellites if fix is not None else 0,
+                "latitude": fix.latitude if fix is not None else None,
+                "longitude": fix.longitude if fix is not None else None,
+                "altitude_m": fix.altitude_m if fix is not None else None,
+                "valid": False,
+                "selected": False,
+                "reason": reason,
+                "conflict": False,
+                "conflict_detail": "",
+                "error": "",
+                "raw": line,
+                "monotonic": ts,
+            }
+            self.sentence_audit.append(record)
+            self._emit_diag("log_sentence", record, port=self.port, baud=self.baud)
+            return False
+
+        self.detected_sentences += 1
+        epoch_s = self._parse_utc_seconds(fix.utc)
+        fix_valid = is_valid_gnss_fix(fix)
+        selected = False
+        reason = ""
+        conflict = False
+        conflict_detail = ""
+
+        if kind == "GGA":
+            self.gga_count += 1
+            self._last_gga_at = ts
+            if fix_valid:
+                self._last_valid_gga_at = ts
+
+            if (
+                epoch_s is not None
+                and self._last_rmc_epoch is not None
+                and self._last_rmc_fix is not None
+                and self._epoch_delta_seconds(epoch_s, self._last_rmc_epoch) == 0.0
+            ):
+                mismatch = self._fixes_conflict(fix, self._last_rmc_fix)
+                if mismatch:
+                    conflict = True
+                    conflict_detail = f"gga_vs_rmc:{mismatch}"
+                    self.epoch_conflicts += 1
+
+            if epoch_s is not None and self._last_gga_epoch is not None:
+                delta_gga = self._epoch_delta_seconds(epoch_s, self._last_gga_epoch)
+                if delta_gga == 0.0 and self._last_gga_fix is not None:
+                    prev = self._last_gga_fix
+                    same_payload = (
+                        fix.fix_quality == prev.fix_quality
+                        and fix.satellites == prev.satellites
+                        and fix.latitude == prev.latitude
+                        and fix.longitude == prev.longitude
+                    )
+                    if same_payload:
+                        selected = False
+                        reason = "duplicate_epoch_gga"
+                        self.duplicate_epochs_skipped += 1
+                    else:
+                        mismatch = self._fixes_conflict(fix, prev) or "quality_changed"
+                        conflict = True
+                        conflict_detail = f"gga_vs_gga:{mismatch}"
+                        self.epoch_conflicts += 1
+                        if fix.fix_quality > prev.fix_quality or (fix_valid and not is_valid_gnss_fix(prev)):
+                            selected = True
+                            reason = "conflict_gga_upgraded"
+                        else:
+                            selected = False
+                            reason = "conflict_keep_prior_gga"
+                            self.duplicate_epochs_skipped += 1
+                elif -self.STALE_GGA_WINDOW_S <= delta_gga < 0.0:
+                    selected = False
+                    reason = "stale_gga"
+                    self.stale_gga_skipped += 1
+                else:
+                    selected = True
+                    reason = "conflict_gga_preferred" if conflict else "gga_primary"
+            else:
+                selected = True
+                reason = "conflict_gga_preferred" if conflict else "gga_primary"
+
+            if selected:
+                self._last_gga_epoch = epoch_s
+                self._last_gga_fix = fix
+                self._last_selected_epoch = epoch_s
+                self._last_selected_kind = "GGA"
+                self._last_selected_fix = fix
+        else:
+            self.rmc_count += 1
+            delta_vs_gga: float | None = None
+            if epoch_s is not None and self._last_gga_epoch is not None:
+                delta_vs_gga = self._epoch_delta_seconds(epoch_s, self._last_gga_epoch)
+
+            if delta_vs_gga is not None and delta_vs_gga == 0.0 and self._last_gga_fix is not None:
+                mismatch = self._fixes_conflict(self._last_gga_fix, fix)
+                if mismatch:
+                    conflict = True
+                    conflict_detail = f"gga_vs_rmc:{mismatch}"
+                    self.epoch_conflicts += 1
+                selected = False
+                reason = "conflict_gga_preferred" if conflict else "same_epoch_gga_preferred"
+                self.duplicate_epochs_skipped += 1
+            elif delta_vs_gga is not None and delta_vs_gga < 0.0:
+                selected = False
+                reason = "stale_rmc"
+                self.stale_rmc_skipped += 1
+            elif epoch_s is None and self._last_gga_epoch is not None:
+                selected = False
+                reason = "stale_rmc_missing_utc"
+                self.stale_rmc_skipped += 1
+            elif (
+                epoch_s is not None
+                and self._last_selected_epoch is not None
+                and self._epoch_delta_seconds(epoch_s, self._last_selected_epoch) == 0.0
+            ):
+                if self._last_selected_fix is not None:
+                    mismatch = self._fixes_conflict(self._last_selected_fix, fix)
+                    if mismatch:
+                        conflict = True
+                        conflict_detail = f"rmc_vs_selected:{mismatch}"
+                        self.epoch_conflicts += 1
+                selected = False
+                reason = "duplicate_epoch_rmc"
+                self.duplicate_epochs_skipped += 1
+            elif (
+                epoch_s is not None
+                and self._last_selected_epoch is not None
+                and self._epoch_delta_seconds(epoch_s, self._last_selected_epoch) < 0.0
+            ):
+                selected = False
+                reason = "stale_rmc"
+                self.stale_rmc_skipped += 1
+            else:
+                valid_gga_recent = (ts - self._last_valid_gga_at) <= self.RMC_FALLBACK_AFTER_GGA_S
+                any_gga_recent = (ts - self._last_gga_at) <= self.RMC_FALLBACK_AFTER_GGA_S
+                if valid_gga_recent:
+                    selected = False
+                    reason = "gga_active_prefer_gga"
+                    self.suppressed_rmc_count += 1
+                elif any_gga_recent and not fix_valid:
+                    selected = False
+                    reason = "invalid_gga_active_skip_invalid_rmc"
+                    self.suppressed_rmc_count += 1
+                else:
+                    selected = True
+                    reason = "rmc_fallback"
+
+            if (
+                epoch_s is None
+                or self._last_rmc_epoch is None
+                or self._epoch_delta_seconds(epoch_s, self._last_rmc_epoch) >= 0.0
+            ):
+                self._last_rmc_epoch = epoch_s
+                self._last_rmc_fix = fix
+            if selected:
+                self._last_selected_epoch = epoch_s
+                self._last_selected_kind = "RMC"
+                self._last_selected_fix = fix
+
+        record = {
+            "kind": kind,
+            "talker": talker,
+            "utc": fix.utc,
+            "epoch_s": epoch_s,
+            "fix_quality": fix.fix_quality,
+            "satellites": fix.satellites,
+            "latitude": fix.latitude,
+            "longitude": fix.longitude,
+            "altitude_m": fix.altitude_m,
+            "valid": fix_valid,
+            "selected": selected,
+            "reason": reason,
+            "conflict": conflict,
+            "conflict_detail": conflict_detail,
+            "error": "",
+            "raw": line,
+            "monotonic": ts,
+        }
+        self.sentence_audit.append(record)
+        self._emit_diag("log_sentence", record, port=self.port, baud=self.baud)
+        if conflict:
+            self._note(f"[GNSS] epoch conflict {line[:6]} utc={fix.utc!r} detail={conflict_detail} decision={reason}")
+        if selected:
+            suffix = " (RMC 兜底)" if kind == "RMC" else ""
+            self._note(
+                f"[GNSS] detected sentence {line[:6]} | parse result ok{suffix} | "
+                f"satellites={fix.satellites} fix={fix.fix_quality} "
+                f"lat={fix.latitude} lon={fix.longitude}"
+            )
+        else:
+            self._note(f"[GNSS] skipped sentence {line[:6]} utc={fix.utc!r} reason={reason}")
+        return selected
+
+    def _consume_next_buffered_fix(self) -> GgaFix | None:
+        """从 256 行 FIFO 中无延迟顺序消费已成行句子，遇到被选中定位即刻返回。"""
+        while self._line_fifo:
+            raw_line = self._line_fifo.popleft()
+            self.rx_lines += 1
+            # 前导乱码/半个报文：重同步到第一颗 '$'（现场出现过 \xff\xfd\xfb 前缀，
+            # 否则后面合法的 GGA 会被前缀带偏而整行丢弃）。
+            marker = raw_line.find(b"$")
+            if marker > 0:
+                self.non_nmea_bytes += marker
+                raw_line = raw_line[marker:]
+            line = raw_line.decode("ascii", errors="replace").strip()
+            if not line:
+                continue
+            if not line.startswith("$"):
+                # M100 指令应答（OK!/Error!/版本信息）或其它非 NMEA 数据。
+                self._note_response(line, raw_line)
+                continue
+            kind = self._nmea_kind(line)
+            if not kind:
+                self.non_nmea_bytes += len(raw_line)
+                self._note(f"[GNSS] detected sentence 不可识别 {line[:48]!r}")
+                self._emit_diag(
+                    "log_sentence",
+                    {
+                        "kind": "UNRECOGNIZED",
+                        "talker": "",
+                        "utc": "",
+                        "valid": False,
+                        "selected": False,
+                        "reason": "unrecognized_nmea",
+                        "conflict": False,
+                        "raw": line,
+                    },
+                    port=self.port,
+                    baud=self.baud,
+                )
+                continue
+            now = time.monotonic()
+            self._last_sentence_at = now
+            self.last_sentence = line
+            if kind == "GGA":
+                try:
+                    fix = parse_gga(line)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    self.parse_errors += 1
+                    self._record_sentence("GGA", line, None, now=now, error=str(exc))
+                    continue
+                if not fix.nmea_received:
+                    self._record_sentence("GGA", line, fix, now=now)
+                    continue
+                if self._record_sentence("GGA", line, fix, now=now):
+                    return fix
+            elif kind == "RMC":
+                try:
+                    fix = parse_rmc(line)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    self.parse_errors += 1
+                    self._record_sentence("RMC", line, None, now=now, error=str(exc))
+                    continue
+                if not fix.nmea_received:
+                    self._record_sentence("RMC", line, fix, now=now)
+                    continue
+                if self._record_sentence("RMC", line, fix, now=now):
+                    return fix
+            else:
+                self.detected_sentences += 1
+                self._record_sentence(kind, line, None, now=now)
+        return None
+
     def read_gga(self, timeout_s: float = 2.0) -> GgaFix:
         self.open()
         assert self.ser is not None
+        buffered = self._consume_next_buffered_fix()
+        if buffered is not None:
+            return buffered
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            _loop_t0 = time.monotonic()
             chunk = self.ser.readline(1024)
             if chunk:
                 self._note_rx(chunk)
@@ -1314,61 +1730,18 @@ class GnssReader:
             lines, self._partial = self._split_nmea_lines(self._partial)
             if len(self._partial) > 2048:
                 self._partial = b""
-            for raw_line in lines:
-                self.rx_lines += 1
-                # 前导乱码/半个报文：重同步到第一颗 '$'（现场出现过 \xff\xfd\xfb 前缀，
-                # 否则后面合法的 GGA 会被前缀带偏而整行丢弃）。
-                marker = raw_line.find(b"$")
-                if marker > 0:
-                    self.non_nmea_bytes += marker
-                    raw_line = raw_line[marker:]
-                line = raw_line.decode("ascii", errors="replace").strip()
-                if not line:
-                    continue
-                if not line.startswith("$"):
-                    # M100 指令应答（OK!/Error!/版本信息）或其它非 NMEA 数据。
-                    self._note_response(line, raw_line)
-                    continue
-                kind = self._nmea_kind(line)
-                if not kind:
-                    self.non_nmea_bytes += len(raw_line)
-                    self._note(f"[GNSS] detected sentence 不可识别 {line[:48]!r}")
-                    continue
-                self._last_sentence_at = time.monotonic()
-                self.last_sentence = line
-                if kind == "GGA":
-                    try:
-                        fix = parse_gga(line)
-                    except (ValueError, TypeError, OverflowError) as exc:
-                        self.parse_errors += 1
-                        self._note(f"[GNSS] parse result rejected {line[:48]!r} ({exc})")
-                        continue
-                    if not fix.nmea_received:
-                        continue
-                    self.detected_sentences += 1
-                    self._last_gga_at = time.monotonic()
-                    self._note(
-                        f"[GNSS] detected sentence {line[:6]} | parse result ok | "
-                        f"satellites={fix.satellites} fix={fix.fix_quality} "
-                        f"lat={fix.latitude} lon={fix.longitude}"
-                    )
-                    return fix
-                if kind == "RMC" and time.monotonic() - self._last_gga_at > 3.0:
-                    try:
-                        fix = parse_rmc(line)
-                    except (ValueError, TypeError, OverflowError) as exc:
-                        self.parse_errors += 1
-                        self._note(f"[GNSS] parse result rejected {line[:48]!r} ({exc})")
-                        continue
-                    if fix.nmea_received:
-                        self.detected_sentences += 1
-                        self._note(
-                            f"[GNSS] detected sentence {line[:6]} | parse result ok (RMC 兜底) | "
-                            f"satellites={fix.satellites} fix={fix.fix_quality} "
-                            f"lat={fix.latitude} lon={fix.longitude}"
-                        )
-                        return fix
-        # 本轮没解析到 NMEA：按老师版本持续轮询恢复输出，并给出一条诊断。
+            if lines:
+                self._enqueue_lines(lines)
+                buffered = self._consume_next_buffered_fix()
+                if buffered is not None:
+                    return buffered
+            # 节拍限制：本轮没有任何可返回进展（立返空读 / 持续垃圾字节 / 被拒或跳过行）时让出 CPU，
+            # 绝不空转抢 GIL。正常报文流或已缓冲 FIFO 排流在上面已直接 return，不会走到这里。
+            _now = time.monotonic()
+            _spent = _now - _loop_t0
+            if _spent < self.READ_LOOP_MIN_INTERVAL_S and _now < deadline:
+                time.sleep(min(self.READ_LOOP_MIN_INTERVAL_S - _spent, deadline - _now))
+        # 本轮没解析到可返回 NMEA：按同速率输出探测恢复输出，并给出一条诊断。
         now = time.monotonic()
         if now - self._last_sentence_at >= self.SILENCE_BEFORE_POLL_S:
             self._poll_output(now)

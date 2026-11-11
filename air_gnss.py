@@ -7,28 +7,50 @@ from dataclasses import asdict, replace
 
 from serial.tools import list_ports
 import air_core as air
+from gnss_diagnostics import (
+    GnssLogWriter,
+    fix_policy as eval_fix_policy,
+    normalize_fix_policy,
+    solution_type,
+)
 
 
 class AirGnssMonitor(air.GnssFixCache):
     #: 无 NMEA 时诊断状态的重复发布间隔（状态变化即刻发布；同状态按此节流）。
     DIAGNOSTIC_REPUBLISH_S = 5.0
 
-    def __init__(self, port="", baud=115200, *, reader_factory=None, port_scanner=None,
-                 log=None, initial_retry_s=1.0, max_retry_s=5.0, data_timeout_s=30.0):
+    def __init__(
+        self,
+        port="",
+        baud=9600,
+        *,
+        reader_factory=None,
+        port_scanner=None,
+        log=None,
+        initial_retry_s=1.0,
+        max_retry_s=5.0,
+        data_timeout_s=30.0,
+        diag_logger: GnssLogWriter | None = None,
+        fix_policy_mode: str | bool | None = None,
+    ):
         super().__init__(max_age_s=data_timeout_s)
         self._settings_lock = threading.Lock()
         self._settings = (port, baud)
+        self._fix_policy_mode = normalize_fix_policy(fix_policy_mode)
         self._generation = 0
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._reader_factory = reader_factory or air.GnssReader
         self._port_scanner = port_scanner or list_ports.comports
         self._log = log or (lambda text: None)
+        self._diag_logger = diag_logger if diag_logger is not None else GnssLogWriter.from_env()
         self._initial_retry_s = initial_retry_s
         self._max_retry_s = max_retry_s
         self._data_timeout_s = data_timeout_s
         self._identity = None
         self._port = ""
+        self._connected_port = ""
+        self._connected_baud: int | None = None
         self._detail = "等待 GNSS 后台启动"
         # 无数据分类（no_bytes / raw_not_nmea / nmea_rejected）发布节流状态。
         self._diag_state = ""
@@ -36,6 +58,21 @@ class AirGnssMonitor(air.GnssFixCache):
         self._diag_published_at = float("-inf")
         self._thread = threading.Thread(target=self._run, name="m100-gnss", daemon=True)
         self._publish(air.GgaFix(serial_open=False, state="waiting"))
+
+    @property
+    def diag_logger(self) -> GnssLogWriter:
+        return self._diag_logger
+
+    @property
+    def fix_policy_mode(self) -> str:
+        with self._settings_lock:
+            return self._fix_policy_mode
+
+    def set_fix_policy(self, policy: str | bool | None) -> str:
+        mode = normalize_fix_policy(policy)
+        with self._settings_lock:
+            self._fix_policy_mode = mode
+        return mode
 
     def start(self):
         if not self._thread.is_alive():
@@ -46,12 +83,18 @@ class AirGnssMonitor(air.GnssFixCache):
         self._wake.set()
         if self._thread.is_alive():
             self._thread.join(2.5)  # A stuck serial driver cannot hold service shutdown forever.
+        self._diag_logger.close()
 
     def configure(self, port, baud):
         with self._settings_lock:
             self._settings = (port, baud)
             self._generation += 1
             self._identity = None
+        self._diag_logger.log_connection(
+            "configured",
+            configured_port=str(port or ""),
+            configured_baud=int(baud),
+        )
         self._wake.set()
 
     @staticmethod
@@ -88,9 +131,15 @@ class AirGnssMonitor(air.GnssFixCache):
             self._fixes.append(air.TimestampedFix(fix, self._clock(), self._utc_now()))
             self._detail = detail
             self.update_count += 1
+            port_for_log = self._connected_port or self._port
         if fix.state != previous:
             try:
-                self._log(f"GNSS: {fix.state} {self._port} {detail}")
+                self._log(f"GNSS: {fix.state} {port_for_log} {detail}")
+            except Exception:
+                pass
+        if self._diag_logger.enabled:
+            try:
+                self._diag_logger.log_publish(self.snapshot(), detail=detail)
             except Exception:
                 pass
 
@@ -111,24 +160,56 @@ class AirGnssMonitor(air.GnssFixCache):
 
     def snapshot(self):
         lookup = self.latest()
-        result = asdict(self.telemetry_fix(lookup))
+        tf = self.telemetry_fix(lookup)
+        result = asdict(tf)
         with self._settings_lock:
-            baud = self._settings[1]
+            configured_port, configured_baud = self._settings
+            policy_mode = self._fix_policy_mode
         with self._lock:
             detail = self._detail
-        result.update(ok=True, fix=lookup.valid, port=self._port, baud=baud, detail=detail,
-                      lat=result["latitude"], lon=result["longitude"])
+            raw_connected_port = self._connected_port
+            raw_connected_baud = self._connected_baud
+            fallback_port = self._port
+        if tf.serial_open is True:
+            connected_port = raw_connected_port or fallback_port
+            connected_baud = raw_connected_baud if raw_connected_baud is not None else configured_baud
+            port_value = connected_port
+            baud_value = connected_baud
+        else:
+            connected_port = ""
+            connected_baud = None
+            port_value = raw_connected_port or fallback_port
+            baud_value = configured_baud
+        policy_meta = eval_fix_policy(tf if lookup.valid else air.GgaFix(), policy_mode)
+        result.update(
+            ok=True,
+            fix=lookup.valid,
+            port=port_value,
+            baud=baud_value,
+            configured_port=configured_port,
+            configured_baud=configured_baud,
+            connected_port=connected_port,
+            connected_baud=connected_baud,
+            detail=detail,
+            lat=result["latitude"],
+            lon=result["longitude"],
+            **policy_meta,
+        )
         return result
 
     def _wait(self, seconds):
         self._wake.wait(seconds)
 
     def _make_reader(self, port, baud):
-        """构造读取器并把 [GNSS] 诊断日志接到服务日志（无 log 的工厂也能用）。"""
+        """构造读取器并注入 [GNSS] 文本日志与可选 JSONL 诊断日志。"""
         reader = self._reader_factory(port, baud)
         try:
             reader.log = self._log
         except Exception:  # noqa: BLE001 - 不支持注入日志的读取器照常工作
+            pass
+        try:
+            reader.diagnostics_logger = self._diag_logger
+        except Exception:  # noqa: BLE001
             pass
         return reader
 
@@ -182,19 +263,37 @@ class AirGnssMonitor(air.GnssFixCache):
             reader = None
             try:
                 if configured.lower() in {"off", "disabled"}:
+                    with self._lock:
+                        self._port = ""
+                        self._connected_port = ""
+                        self._connected_baud = None
                     self._publish(air.GgaFix(serial_open=False, state="disabled"))
                     self._wait(self._max_retry_s)
                     continue
-                self._port = self._find_port(configured) or ""
-                if not self._port:
+                found_port = self._find_port(configured) or ""
+                if not found_port:
+                    with self._lock:
+                        self._port = ""
+                        self._connected_port = ""
+                        self._connected_baud = None
                     self._publish(air.GgaFix(serial_open=False, state="port_not_found"),
                                   "等待 M100；通用 USB 转串口请配置 gnss_port，避免误连其他设备")
                     self._wait(retry_s)
                     retry_s = min(retry_s * 2, self._max_retry_s)
                     continue
+                with self._lock:
+                    self._port = found_port
+                    self._connected_port = ""
+                    self._connected_baud = None
                 self._publish(air.GgaFix(serial_open=False, state="connecting"))
-                reader = self._make_reader(self._port, baud)
+                reader = self._make_reader(found_port, baud)
                 reader.open()
+                actual_port = str(getattr(reader, "port", found_port) or found_port)
+                actual_baud = int(getattr(reader, "baud", baud))
+                with self._lock:
+                    self._port = actual_port
+                    self._connected_port = actual_port
+                    self._connected_baud = actual_baud
                 self._publish(air.GgaFix(serial_open=True, state="connected"))
                 last_data = time.monotonic()
                 self._diag_state = ""
@@ -204,13 +303,22 @@ class AirGnssMonitor(air.GnssFixCache):
                         if generation != self._generation:
                             break
                     fix = reader.read_gga(timeout_s=0.5)
+                    actual_port = str(getattr(reader, "port", actual_port) or actual_port)
+                    actual_baud = int(getattr(reader, "baud", baud))
+                    with self._lock:
+                        self._port = actual_port
+                        self._connected_port = actual_port
+                        self._connected_baud = actual_baud
                     if fix.nmea_received:
                         last_data = time.monotonic()
                         retry_s = self._initial_retry_s
                         self._diag_state = ""
                         self._diag_detail = ""
-                        state = ("spp_fix" if fix.fix_quality == 1 else "fix") if air.is_valid_gnss_fix(fix) else (
-                            "no_fix" if fix.satellites > 0 else "no_satellites")
+                        state = (
+                            solution_type(fix)
+                            if air.is_valid_gnss_fix(fix)
+                            else ("no_fix" if fix.satellites > 0 else "no_satellites")
+                        )
                         self._publish(replace(fix, serial_open=True, state=state),
                                       f"satellites={fix.satellites} fix={fix.fix_quality}")
                     else:
@@ -222,6 +330,17 @@ class AirGnssMonitor(air.GnssFixCache):
                             raise TimeoutError("持续无有效 NMEA，重新打开并恢复输出")
                     self._wake.wait(0.02)  # Also bounds CPU use with nonblocking/mock readers.
             except Exception as exc:
+                with self._lock:
+                    port_at_err = self._connected_port or self._port
+                    self._connected_port = ""
+                    self._connected_baud = None
+                self._diag_logger.log_connection(
+                    "reconnecting",
+                    port=port_at_err,
+                    configured_port=configured,
+                    configured_baud=baud,
+                    detail=str(exc),
+                )
                 self._publish(air.GgaFix(serial_open=False, state="reconnecting"), str(exc))
             finally:
                 if reader is not None:
@@ -229,6 +348,9 @@ class AirGnssMonitor(air.GnssFixCache):
                         reader.close()
                     except Exception:
                         pass
+                with self._lock:
+                    self._connected_port = ""
+                    self._connected_baud = None
             if not self._stopping.is_set():
                 self._wait(retry_s)
                 retry_s = min(retry_s * 2, self._max_retry_s)

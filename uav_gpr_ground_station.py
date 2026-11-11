@@ -15,7 +15,8 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
 
@@ -2179,6 +2180,9 @@ class CalibrationWizard(QtWidgets.QDialog):
         self._watchdog_query_pending: bool = False
         self._watchdog_query_context: tuple[str | None, str | None, str | None] | None = None
         self._legacy_fallback_count: int = 0
+        self._cancelled_cal_ids: deque[str] = deque(maxlen=32)
+        self._pending_cancel_cal_id: str | None = None
+        self._manual_query_pending: bool = False
 
         self._capture_watchdog_timer = QtCore.QTimer(self)
         self._capture_watchdog_timer.setSingleShot(True)
@@ -2472,6 +2476,13 @@ class CalibrationWizard(QtWidgets.QDialog):
                 self._revert_all_pending_steps("空中端断开连接")
             self.status_label.setText("未连接空中端（开始校准已禁用）")
         else:
+            if self._pending_cancel_cal_id:
+                stale_cal_id = self._pending_cancel_cal_id
+                self._pending_cancel_cal_id = None
+                self._send(
+                    "cal_cancel",
+                    {"cal_id": stale_cal_id, "reason": "校准窗口已关闭，重连后自动补发取消"},
+                )
             if self._cal_id is None:
                 self.status_label.setText("已连接空中端：请配置计划后点击\"开始校准\"")
             else:
@@ -2491,7 +2502,7 @@ class CalibrationWizard(QtWidgets.QDialog):
             self._connected and session_active and self._steps_done >= len(self._steps) and not self._solved and not self._capturing
         )
         self.activate_button.setEnabled(self._connected and session_active and self._solved and not self._capturing)
-        self.cancel_button.setEnabled(self._connected and session_active and not self._capturing)
+        self.cancel_button.setEnabled(self._connected and session_active)
 
         self.import_button.setEnabled(self._connected and not self._capturing)
         self.export_button.setEnabled(self._connected and not self._capturing)
@@ -2676,11 +2687,23 @@ class CalibrationWizard(QtWidgets.QDialog):
             band_str = ""
             if isinstance(band, (list, tuple)) and len(band) == 2:
                 band_str = f", {band[0]/1e6:.1f}-{band[1]/1e6:.1f} MHz"
-            elif isinstance(band, str):
-                band_str = f", {band}"
-            cal_id = self._active_calibration.get("cal_id") or ""
+            elif isinstance(band, str) and band:
+                if "-" in band and "MHz" not in band:
+                    try:
+                        lo_s, hi_s = band.split("-", 1)
+                        band_str = f", {float(lo_s)/1e6:.1f}-{float(hi_s)/1e6:.1f} MHz"
+                    except (TypeError, ValueError):
+                        band_str = f", {band}"
+                else:
+                    band_str = f", {band}"
+            cal_id = (
+                self._active_calibration.get("cal_id")
+                or self._active_calibration.get("active_osl_id")
+                or self._active_calibration.get("calibration_id")
+                or ""
+            )
             fn = self._active_calibration.get("filename")
-            fn_str = f" [{fn}]" if fn else ""
+            fn_str = f" [{fn}]" if fn else (f" [{cal_id}]" if cal_id else "")
             osl_info = f"{ports_str}{pts_str}{band_str}{fn_str}"
 
         bg_info = "未启用"
@@ -2698,6 +2721,95 @@ class CalibrationWizard(QtWidgets.QDialog):
 
         if hasattr(self._window, "calibration_status_label"):
             self._window.calibration_status_label.setText(f"校准: OSL[{osl_info}]")
+
+    def _format_active_query_summary(self, result: dict | None = None) -> tuple[str, str]:
+        """生成可读的生效校准状态摘要（用于 status_label 与 result_label）。"""
+        payload = result if isinstance(result, dict) else {}
+        if self._active_calibration:
+            ports = self._active_calibration.get("ports") or []
+            ports_str = "+".join(str(p) for p in ports) if ports else "P1"
+            pts = self._active_calibration.get("points")
+            pts_str = f"{pts}点" if pts else "已加载"
+            band = self._active_calibration.get("valid_band_hz")
+            band_str = ""
+            if isinstance(band, (list, tuple)) and len(band) == 2:
+                band_str = f"{float(band[0])/1e6:.1f}-{float(band[1])/1e6:.1f} MHz"
+            elif isinstance(band, str) and band:
+                if "-" in band and "MHz" not in band:
+                    try:
+                        lo_s, hi_s = band.split("-", 1)
+                        band_str = f"{float(lo_s)/1e6:.1f}-{float(hi_s)/1e6:.1f} MHz"
+                    except (TypeError, ValueError):
+                        band_str = band
+                else:
+                    band_str = band
+            cal_id = str(
+                self._active_calibration.get("cal_id")
+                or self._active_calibration.get("active_osl_id")
+                or self._active_calibration.get("calibration_id")
+                or "-"
+            )
+            fn = str(self._active_calibration.get("filename") or "")
+            has_through = bool(self._active_calibration.get("has_through"))
+            detail_parts = [f"ID={cal_id}"]
+            if fn:
+                detail_parts.append(f"文件={fn}")
+            detail_parts.append(f"端口={ports_str}")
+            detail_parts.append(pts_str)
+            if band_str:
+                detail_parts.append(band_str)
+            if has_through:
+                detail_parts.append("含Through")
+            osl_summary = f"OSL 已生效（{', '.join(detail_parts)}）"
+        else:
+            osl_summary = "OSL 未启用"
+
+        if self._active_background:
+            bg_pts = self._active_background.get("points")
+            bg_pts_str = f"{bg_pts}点" if bg_pts else "已生效"
+            bg_channels = self._active_background.get("channels") or []
+            ch_map = {"S11": "HH", "S22": "VV"}
+            ch_str = "+".join(ch_map.get(str(c), str(c)) for c in bg_channels) if bg_channels else ""
+            bg_freq = self._active_background.get("frequency_range_mhz")
+            freq_str = (
+                f"{float(bg_freq[0]):.1f}-{float(bg_freq[1]):.1f} MHz"
+                if isinstance(bg_freq, (list, tuple)) and len(bg_freq) == 2
+                else ""
+            )
+            bg_parts = [p for p in (bg_pts_str, ch_str, freq_str) if p]
+            bg_summary = f"背景已生效（{', '.join(bg_parts)}）"
+        else:
+            bg_summary = "背景未启用"
+
+        fit = payload.get("calibration_fit")
+        fit_suffix = ""
+        if isinstance(fit, dict):
+            level = str(fit.get("level") or "ok")
+            msg = str(fit.get("message") or "")
+            if level == "stale":
+                fit_suffix = f"｜⚠ {msg or '与当前扫频不匹配（采集中已停用）'}"
+            elif level == "warning":
+                fit_suffix = f"｜提示：{msg}"
+            elif self._active_calibration or self._active_background:
+                fit_suffix = "｜与当前扫频参数一致（采集中生效）"
+
+        in_prog = payload.get("in_progress_session")
+        session_suffix = ""
+        if isinstance(in_prog, dict) and in_prog.get("active"):
+            session_suffix = (
+                f"｜进行中会话: {in_prog.get('cal_id')} "
+                f"({in_prog.get('state')}, {in_prog.get('steps_done', 0)}/{in_prog.get('total_steps', 0)})"
+            )
+
+        if not self._active_calibration and not self._active_background and not session_suffix:
+            return (
+                "查询完成：空中端当前无生效校准（OSL 未启用，背景未启用）",
+                "生效状态详情：OSL 未启用｜背景未启用",
+            )
+        return (
+            f"查询完成：{osl_summary}；{bg_summary}{fit_suffix}{session_suffix}",
+            f"生效状态详情：{osl_summary}｜{bg_summary}{fit_suffix}{session_suffix}",
+        )
 
     # ---- 交互动作实现 ----
 
@@ -2819,20 +2931,41 @@ class CalibrationWizard(QtWidgets.QDialog):
         self._send("cal_activate", {"cal_id": self._cal_id})
         self.status_label.setText(f"已发送 cal_activate（cal_id={self._cal_id}）…")
 
-    def cancel_session(self) -> None:
+    def cancel_session(self, reason: str = "地面操作员取消") -> None:
         if self._cal_id is None:
             return
         cal_id = self._cal_id
-        self._send("cal_cancel", {"cal_id": cal_id, "reason": "地面操作员取消"})
+        self._cancelled_cal_ids.append(cal_id)
+        if self._connected and self._send("cal_cancel", {"cal_id": cal_id, "reason": reason}):
+            self.status_label.setText(f"已发送 cal_cancel（cal_id={cal_id}）…")
+        else:
+            self._pending_cancel_cal_id = cal_id
+            self.status_label.setText(
+                f"校准会话已在本地关闭（cal_id={cal_id}），恢复连接后将自动通知空中端取消"
+            )
         self._stop_capture_watchdog()
         self._cancel_legacy_fallback()
-        self.status_label.setText(f"已发送 cal_cancel（cal_id={cal_id}）…")
         self._cal_id = None
+        self._solved = False
         self._capturing = False
         self._pending_step = None
         self._pending_request_id = None
-        self._revert_all_pending_steps("地面操作员取消")
+        self._pending_is_recapture = False
+        self._revert_all_pending_steps(reason)
         self._set_session_controls()
+
+    def _cancel_unactivated_session_on_close(self) -> None:
+        """关闭窗口（× / Esc / 关闭按钮）时若仍有未激活的校准会话，自动向空中端发起取消。"""
+        if self._cal_id is not None:
+            self.cancel_session(reason="关闭校准窗口自动取消未激活会话")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self._cancel_unactivated_session_on_close()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        self._cancel_unactivated_session_on_close()
+        super().reject()
 
     def _notify_warning(self, title: str, text: str) -> None:
         self.status_label.setText(f"{title}：{text}")
@@ -2874,7 +3007,24 @@ class CalibrationWizard(QtWidgets.QDialog):
             return False
 
         has_v2 = data.get("format") == "uav_gpr_solt_calibration_v2"
-        has_meas = "measurements" in data or any(k in data for k in ("Open", "Short", "Load", "P1_Open", "P1_Short", "P1_Load"))
+        has_meas = (
+            "measurements" in data
+            or "points" in data
+            or any(
+                k in data
+                for k in (
+                    "Open",
+                    "Short",
+                    "Load",
+                    "P1_Open",
+                    "P1_Short",
+                    "P1_Load",
+                    "P2_Open",
+                    "P2_Short",
+                    "P2_Load",
+                )
+            )
+        )
         if not (has_v2 or has_meas):
             self.status_label.setText("无效校准文件: 缺少 SOLT 标准件测量数据")
             self._notify_warning("格式错误", "校准文件缺少必要的 SOLT 标准件数据")
@@ -2892,7 +3042,7 @@ class CalibrationWizard(QtWidgets.QDialog):
             "activate": True,
             "request_id": req_id,
         })
-        self._import_timer.start(10000)
+        self._import_timer.start(30000)
         return True
 
     def export_calibration_file(self, target_path: str | None = None) -> bool:
@@ -2934,7 +3084,9 @@ class CalibrationWizard(QtWidgets.QDialog):
     def query_active_calibration(self) -> None:
         """向空中端查询当前生效的 OSL 与背景校准组件及能力。"""
         if not self._connected:
+            self.status_label.setText("未连接空中端（无法查询校准状态）")
             return
+        self._manual_query_pending = True
         self.status_label.setText("正在查询空中端当前生效状态…")
         self._send("cal_query_active", {})
 
@@ -2958,34 +3110,52 @@ class CalibrationWizard(QtWidgets.QDialog):
                 return
             result = header.get("result")
             if isinstance(result, dict) and result.get("ok"):
-                self._active_calibration = dict(result)
+                if result.get("activated") is not False:
+                    self._active_calibration = dict(result)
                 self._last_osl_json_content = getattr(self, "_pending_import_content", None)
+                if result.get("activated") is not False and isinstance(result.get("sweep"), dict):
+                    sync_fn = getattr(self._window, "_sync_acq_sweep_from_air", None)
+                    if callable(sync_fn):
+                        sync_fn(result["sweep"])
                 # 补遗明确：OSL 变更彻底失效背景
-                if self._active_background:
+                ports = result.get("ports") or []
+                ports_str = "+".join(ports) if ports else "P1"
+                pts = result.get("points") or ""
+                band = result.get("valid_band_hz") or []
+                band_str = (
+                    f"{band[0]/1e6:.1f}-{band[1]/1e6:.1f} MHz"
+                    if isinstance(band, (list, tuple)) and len(band) == 2
+                    else ""
+                )
+                summary = f"{ports_str}, {pts}频点, {band_str}".strip(", ")
+                if self._active_background and result.get("activated") is not False:
                     self._active_background = None
                     self.status_label.setText("校准文件导入并激活成功。注意：先前背景已失效，请重新采集背景。")
                 else:
-                    ports = result.get("ports") or []
-                    ports_str = "+".join(ports) if ports else "P1"
-                    pts = result.get("points") or ""
-                    band = result.get("valid_band_hz") or []
-                    band_str = f"{band[0]/1e6:.1f}-{band[1]/1e6:.1f} MHz" if isinstance(band, (list, tuple)) and len(band) == 2 else ""
-                    summary = f"{ports_str}, {pts}频点, {band_str}"
                     self.status_label.setText(f"校准文件导入并激活成功: {summary}")
+                _, detail_text = self._format_active_query_summary(result)
+                self.result_label.setText(detail_text)
                 self._update_active_calibration_display()
 
                 import_cal_id = getattr(self, "_import_pending_cal_id", None)
-                if self._mode == "osl" and self._cal_id == import_cal_id:
-                    for step_name in self.OSL_STEPS:
-                        self._update_step_row(step_name, "已导入", "从文件加载")
-                    self._completed_steps = set(self.OSL_STEPS)
-                    self._steps_done = len(self._completed_steps)
-                    self._step_index = len(self.OSL_STEPS)
-                    self._refresh_step_highlight()
-                    self.instruction_label.setText("校准文件已导入并生效！可直接进行雷达采集或切换模式新建背景采集。")
-                if self._cal_id == import_cal_id:
+                if import_cal_id is not None and self._cal_id == import_cal_id:
+                    self._cancelled_cal_ids.append(import_cal_id)
+                    if self._mode == "osl":
+                        for step_name in self._steps or list(self.OSL_STEPS):
+                            self._update_step_row(step_name, "已导入", "从文件加载")
+                        self._completed_steps = set(self._steps or self.OSL_STEPS)
+                        self._steps_done = len(self._completed_steps)
+                        self._step_index = len(self._steps)
+                        self._refresh_step_highlight()
                     self._cal_id = None
+                    self._solved = False
+                    self._capturing = False
+                    self._pending_step = None
+                    self._pending_request_id = None
                     self._set_session_controls()
+                self.instruction_label.setText(
+                    "校准文件已导入并生效！可直接进行雷达采集或切换模式新建背景采集。"
+                )
                 self._import_pending_cal_id = None
             else:
                 err = (result.get("error") if isinstance(result, dict) else None) or "未知错误"
@@ -3135,6 +3305,9 @@ class CalibrationWizard(QtWidgets.QDialog):
                     self._capture_watchdog_timer.start(10000)
                 else:
                     self._air_supports_step_done = False
+                    self._manual_query_pending = False
+                    self.status_label.setText("空中端不支持详细状态查询，正在回退基础状态查询…")
+                    self._send("cal_status", {"cal_id": "query"})
                 return
             result = header.get("result")
             if isinstance(result, dict) and result.get("ok"):
@@ -3144,6 +3317,7 @@ class CalibrationWizard(QtWidgets.QDialog):
 
                 in_prog = result.get("in_progress_session") or {}
                 if isinstance(in_prog, dict) and in_prog.get("busy"):
+                    self._manual_query_pending = False
                     self.status_label.setText(f"空中端仍在忙碌执行采集任务（步骤: {in_prog.get('current_step')}），保持等待…")
                     self._capture_watchdog_timer.start(10000)
                     return
@@ -3165,8 +3339,10 @@ class CalibrationWizard(QtWidgets.QDialog):
                     self._step_index = first_uncompleted_idx
                     self._refresh_step_highlight()
 
+                was_watchdog_recovery = False
                 # 仅响应由 watchdog 超时显式触发的查询，陈旧普通查询绝不得强行重置 _capturing！
                 if is_watchdog and self._capturing:
+                    was_watchdog_recovery = True
                     self._stop_capture_watchdog()
                     self._capturing = False
                     if self._pending_step:
@@ -3195,7 +3371,25 @@ class CalibrationWizard(QtWidgets.QDialog):
                 else:
                     self._active_background = None
 
+                if self._cal_id is None and isinstance(result.get("sweep"), dict):
+                    sync_fn = getattr(self._window, "_sync_acq_sweep_from_air", None)
+                    if callable(sync_fn):
+                        sync_fn(result["sweep"])
+
                 self._update_active_calibration_display()
+                if not was_watchdog_recovery and not self._capturing:
+                    self._manual_query_pending = False
+                    status_text, detail_text = self._format_active_query_summary(result)
+                    self.status_label.setText(status_text)
+                    self.result_label.setText(detail_text)
+            elif isinstance(result, dict) and result.get("ok") is False:
+                self._manual_query_pending = False
+                err = str(result.get("error") or "未知错误")
+                self.status_label.setText(f"查询生效状态失败: {err}")
+            elif result is None and not self._capturing and self._manual_query_pending:
+                # 兼容旧 GUI 空中端（command_ack 不带 result 字段）：回退 cal_status
+                self._manual_query_pending = False
+                self._send("cal_status", {"cal_id": "query"})
 
         elif action == "cal_clear_active":
             result = header.get("result")
@@ -3212,7 +3406,17 @@ class CalibrationWizard(QtWidgets.QDialog):
     def on_calibration_message(self, header: dict) -> None:
         msg_type = str(header.get("type") or "")
         cal_id = str(header.get("cal_id") or "")
+        status_peek = str(header.get("status") or "") if msg_type == "calibration_result" else ""
+        if cal_id and cal_id in self._cancelled_cal_ids:
+            if not (msg_type == "calibration_result" and status_peek == "cancelled"):
+                return
         if self._cal_id is not None and cal_id and cal_id != self._cal_id:
+            if status_peek not in ("active", "none"):
+                return
+        if self._cal_id is None and (
+            msg_type in ("calibration_capture", "calibration_quality")
+            or (msg_type == "calibration_result" and status_peek in ("planned", "step_done", "solved"))
+        ):
             return
 
         if msg_type == "calibration_capture":
@@ -3319,13 +3523,39 @@ class CalibrationWizard(QtWidgets.QDialog):
                     self._active_background = dict(header)
                     self.status_label.setText(f"背景参考已激活（cal_id={cal_id}）：后续探地采集将自动扣除背景。")
                 self._cal_id = None
+                if isinstance(header.get("sweep"), dict):
+                    sync_fn = getattr(self._window, "_sync_acq_sweep_from_air", None)
+                    if callable(sync_fn):
+                        sync_fn(header["sweep"])
                 self._update_active_calibration_display()
                 self._set_session_controls()
+
+            elif status in ("active", "none"):
+                if status == "active":
+                    mode = str(header.get("mode") or "osl")
+                    entry = dict(header)
+                    if not entry.get("cal_id") and entry.get("calibration_id"):
+                        entry["cal_id"] = entry["calibration_id"]
+                    if mode == "background":
+                        self._active_background = entry
+                    else:
+                        self._active_calibration = entry
+                    self._update_active_calibration_display()
+                    status_text, detail_text = self._format_active_query_summary(header)
+                    self.status_label.setText(status_text)
+                    self.result_label.setText(detail_text)
+                else:
+                    self._active_calibration = None
+                    self._active_background = None
+                    self._update_active_calibration_display()
+                    self.status_label.setText("查询完成：空中端当前无生效校准（OSL 未启用，背景未启用）")
+                    self.result_label.setText("生效状态详情：OSL 未启用｜背景未启用")
 
             elif status == "cancelled":
                 self._stop_capture_watchdog()
                 self.status_label.setText(f"会话已取消（cal_id={cal_id}）；已收 capture 文件保留")
                 self._cal_id = None
+                self._solved = False
                 self._capturing = False
                 self._pending_step = None
                 self._pending_request_id = None
@@ -3355,7 +3585,7 @@ class CalibrationWizard(QtWidgets.QDialog):
                     self._revert_all_pending_steps(reason)
                 if status == "failed":
                     self._cal_id = None
-                if status == "rejected" and not step:
+                if status == "rejected" and not step and not self._completed_steps:
                     self._cal_id = None
                 self._pending_step = None
                 self._pending_request_id = None
@@ -3365,11 +3595,12 @@ class CalibrationWizard(QtWidgets.QDialog):
                     len(self._steps)
                 )
                 self._step_index = first_uncompleted_idx
-                if self._step_index >= len(self._steps):
-                    self.instruction_label.setText("所有步骤已采集完毕！请点击“解算并生成”完成校准解算。")
-                else:
-                    next_step = self._steps[self._step_index]
-                    self.instruction_label.setText(self._get_step_instruction(next_step))
+                if self._steps:
+                    if self._step_index >= len(self._steps):
+                        self.instruction_label.setText("所有步骤已采集完毕！请点击“解算并生成”完成校准解算。")
+                    else:
+                        next_step = self._steps[self._step_index]
+                        self.instruction_label.setText(self._get_step_instruction(next_step))
                 self._refresh_step_highlight()
                 self._set_session_controls()
 
@@ -3929,9 +4160,50 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         """打开校准向导（open_calibration_dialog 的别名）。"""
         self.open_calibration_dialog()
 
+    def _sync_acq_sweep_from_air(self, sweep: object) -> None:
+        """空中端导入/激活校准或查询状态回报 sweep 时，同步地面站本地射频扫频设置。"""
+        if not isinstance(sweep, dict):
+            return
+        cur = getattr(self, "acq_settings", None)
+        if cur is None:
+            return
+        try:
+            start_mhz = float(sweep.get("start_mhz", cur.start_mhz))
+            stop_mhz = float(sweep.get("stop_mhz", cur.stop_mhz))
+            points = int(sweep.get("points", cur.points))
+            ifbw_hz = int(sweep.get("ifbw_hz", cur.ifbw_hz))
+            power_dbm = float(sweep.get("power_dbm", cur.power_dbm))
+            dwell_us = int(sweep.get("dwell_us", cur.dwell_us))
+        except (TypeError, ValueError):
+            return
+        if not (stop_mhz > start_mhz > 0.0 and 2 <= points <= 4501):
+            return
+        self.acq_settings = dataclass_replace(
+            cur,
+            start_mhz=start_mhz,
+            stop_mhz=stop_mhz,
+            points=points,
+            ifbw_hz=ifbw_hz,
+            power_dbm=power_dbm,
+            dwell_us=dwell_us,
+        )
+        dialog = getattr(self, "calibration_dialog", None)
+        if dialog is not None and getattr(dialog, "_cal_id", None) is None:
+            try:
+                dialog.cal_start.setValue(start_mhz)
+                dialog.cal_stop.setValue(stop_mhz)
+                dialog.cal_points.setValue(points)
+                dialog.cal_ifbw.setValue(ifbw_hz)
+                dialog.cal_power.setValue(power_dbm)
+                dialog.cal_dwell.setValue(dwell_us)
+            except (AttributeError, TypeError, ValueError):
+                pass
+
     def _on_calibration_message(self, header: dict) -> None:
         """校准回程分派（R-C-17：不进 trace 路径，只到展示层）。"""
         msg_type = str(header.get("type") or "")
+        if isinstance(header.get("calibration_fit"), dict):
+            self.apply_calibration_fit(header["calibration_fit"])
         self.calibration_dialog.on_calibration_message(header)
         if msg_type == "calibration_result":
             status = str(header.get("status") or "")
@@ -4143,8 +4415,22 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         if panel is not None:
             panel.on_command_result(dict(header))
         dialog = getattr(self, "calibration_dialog", None)
-        if dialog is not None and hasattr(dialog, "on_command_result"):
-            dialog.on_command_result(dict(header))
+        if dialog is not None:
+            if header.get("action") == "get_status" and isinstance(result_for_fit, dict):
+                has_osl_key = isinstance(result_for_fit.get("active_osl"), dict)
+                has_bg_key = isinstance(result_for_fit.get("active_background"), dict)
+                if has_osl_key or has_bg_key:
+                    osl_d = result_for_fit.get("active_osl")
+                    bg_d = result_for_fit.get("active_background")
+                    dialog._active_calibration = (
+                        dict(osl_d) if isinstance(osl_d, dict) and osl_d.get("active") else None
+                    )
+                    dialog._active_background = (
+                        dict(bg_d) if isinstance(bg_d, dict) and bg_d.get("active") else None
+                    )
+                    dialog._update_active_calibration_display()
+            if hasattr(dialog, "on_command_result"):
+                dialog.on_command_result(dict(header))
 
     def _on_command_status(self, text: str) -> None:
         self.log(text)

@@ -41,6 +41,8 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
+import re
 import shutil
 import signal
 import sys
@@ -585,9 +587,14 @@ class _BlackboxCalibrationCapturerProxy:
         self._service = service
         self._cal_id = cal_id
         self._step_capturers: dict[str, air.ServiceStepCapturer] = {}
+        self._lock = threading.Lock()
+        self._cancelled = False
 
     def _capturer_for(self, step: air.CalibrationStep) -> air.ServiceStepCapturer:
-        capturer = self._step_capturers.get(step.name)
+        with self._lock:
+            if self._cancelled:
+                raise RuntimeError("校准会话已取消")
+            capturer = self._step_capturers.get(step.name)
         if capturer is None:
             session = self._service._calibration_session
             snapshot = dict(getattr(session, "config_snapshot", {}) or {})
@@ -606,16 +613,39 @@ class _BlackboxCalibrationCapturerProxy:
                 step=step,
                 out_dir=out_dir,
             )
-            self._step_capturers[step.name] = capturer
+            with self._lock:
+                if self._cancelled:
+                    raise RuntimeError("校准会话已取消")
+                self._step_capturers[step.name] = capturer
         return capturer
 
     def capture_one(self, step: air.CalibrationStep, index: int) -> tuple[np.ndarray, np.ndarray]:
+        if self._cancelled:
+            raise RuntimeError("校准会话已取消")
         return self._capturer_for(step).capture_one(step, index)
 
     def close_current(self, step_name: str) -> None:
-        capturer = self._step_capturers.pop(step_name, None)
+        with self._lock:
+            capturer = self._step_capturers.pop(step_name, None)
         if capturer is not None:
             capturer.close()
+
+    def cancel_all(self, reason: str = "校准会话已取消") -> None:
+        """立即唤醒并终止正在等待硬件 sweep 的步骤采集器。"""
+        with self._lock:
+            self._cancelled = True
+            capturers = list(self._step_capturers.values())
+        try:
+            self._service.acquisition.request_stop(f"校准取消: {reason}")
+        except Exception:  # noqa: BLE001
+            pass
+        for capturer in capturers:
+            q = getattr(capturer, "_queue", None)
+            if isinstance(q, queue.Queue):
+                try:
+                    q.put_nowait(None)  # type: ignore[arg-type]
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 # =========================================================================
@@ -717,6 +747,10 @@ class AirBlackboxService:
                     self.active_calibration_id = cal_p.stem
                     self._active_osl_id = cal_p.stem
                     self._calibration_sweep_ref = _sweep_config_from_calibration_file(cal_p)
+                    self._align_sweep_to_calibration(
+                        p1_cal if p1_cal is not None else p2_cal,
+                        self._calibration_sweep_ref,
+                    )
                     self._log(f"自启动恢复生效校准: {cal_p.name}")
                 except Exception as exc:
                     self._log(f"自启动加载生效校准失败（已回退未校准）: {cal_p}: {exc}")
@@ -859,6 +893,7 @@ class AirBlackboxService:
         payload["autosave"] = self._autosave
         payload["save_csv"] = self._save_csv
         payload["channels"] = self._channel_mode
+        payload["calibration_id"] = self.active_calibration_id or ""
         return payload
 
     def _is_acquiring(self) -> bool:
@@ -873,6 +908,7 @@ class AirBlackboxService:
         run_id = self._active_run_id or self._last_run_id
         acquiring = self._is_acquiring()
         disk_state = self.disk.state_dict()
+        cal_snapshot = self._handle_cal_query_active({})
         payload: dict[str, object] = {
             "ok": True,
             "online": self.connected,
@@ -894,6 +930,8 @@ class AirBlackboxService:
             "active_config": self._active_config_dict(),
             "sweep": asdict(self._sweep),
             "calibration_fit": self._calibration_fit().to_dict(),
+            "active_osl": cal_snapshot.get("active_osl"),
+            "active_background": cal_snapshot.get("active_background"),
             "service_state": self.acquisition.state,
             "engine": self.config.engine,
             "device_source": air.get_default_device_source(),
@@ -1184,10 +1222,22 @@ class AirBlackboxService:
         conflict = self._calibration_acquisition_conflict(action, cal_id=cal_id)
         if conflict:
             self._log(conflict)
+            rej_step = str(params_dict.get("step") or "") or None
+            rej_req_id = str(params_dict.get("request_id") or "") or None
             self._send_calibration_message(
-                "calibration_result", cal_id, status="rejected", reason=conflict
+                "calibration_result",
+                cal_id,
+                status="rejected",
+                reason=conflict,
+                step=rej_step,
+                request_id=rej_req_id,
             )
-            return {"ok": False, "error": conflict}
+            rej_ack: dict[str, object] = {"ok": False, "error": conflict}
+            if rej_step:
+                rej_ack["step"] = rej_step
+            if rej_req_id:
+                rej_ack["request_id"] = rej_req_id
+            return rej_ack
         if action == "cal_import_file":
             return self._handle_cal_import_file(params_dict)
         if action == "cal_export_file":
@@ -1216,12 +1266,147 @@ class AirBlackboxService:
                 cal_id, str(params_dict.get("reason") or "地面请求取消")
             )
         elif action == "cal_status":
-            self._command_calibration_status(cal_id)
+            accepted = self._command_calibration_status(cal_id)
         if isinstance(accepted, dict):
             return accepted
         return {"ok": bool(accepted)}
 
     # ---- 校准与扫频参数匹配（改参数后提醒/停用校准）----
+
+    @staticmethod
+    def _sanitize_import_filename(filename: str) -> str | None:
+        """净化地面上传文件名：剥离目录分量、替换危险字符、拒绝空名与遍历名。"""
+        raw = str(filename or "").strip()
+        if not raw:
+            return None
+        base = re.split(r"[\\/]+", raw)[-1].strip()
+        if not base or base in (".", ".."):
+            return None
+        cleaned = "".join(
+            ch if (ch.isalnum() or ch in "._- ()[]+") else "_"
+            for ch in base
+        ).strip(" .")
+        if not cleaned or cleaned in (".", ".."):
+            return None
+        stem_upper = Path(cleaned).stem.upper()
+        if stem_upper in {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }:
+            cleaned = f"_{cleaned}"
+        return cleaned
+
+    def _align_sweep_to_calibration(
+        self, osl_cal: object | None, sweep_ref: dict[str, object] | None
+    ) -> bool:
+        """将当前射频扫频网格对齐到新激活/导入/恢复的校准，保证校准立即真正生效。
+
+        仅同步射频扫频参数（start_mhz / stop_mhz / points，以及合法范围内的
+        ifbw_hz / power_dbm / dwell_us），保持时域信号处理参数（ifft_points /
+        time_window_ns / dewow_* / bpf_rule）不变，避免意外翻转地面 B-scan 的
+        Dewow 签名。后续若用户再经 set_params 改动频率或频点，calibration_guard
+        照常判定 stale 并停用校准。
+        """
+        base = self._sweep
+        start_mhz = float(base.start_mhz)
+        stop_mhz = float(base.stop_mhz)
+        points = int(base.points)
+        ifbw_hz = int(base.ifbw_hz)
+        power_dbm = float(base.power_dbm)
+        dwell_us = int(base.dwell_us)
+
+        ref = sweep_ref if isinstance(sweep_ref, dict) else {}
+
+        def _opt_float(*keys: str) -> float | None:
+            for k in keys:
+                val = ref.get(k)
+                if val is not None and not isinstance(val, bool):
+                    try:
+                        out = float(val)  # type: ignore[arg-type]
+                        if np.isfinite(out):
+                            return out
+                    except (TypeError, ValueError):
+                        pass
+            return None
+
+        cal_pts = getattr(osl_cal, "points", None) if osl_cal is not None else None
+        if cal_pts is not None and len(cal_pts) >= 2:
+            ref_start = _opt_float("start_mhz")
+            ref_stop = _opt_float("stop_mhz")
+            ref_pts = _opt_float("points")
+            used_ref_grid = False
+            if (
+                ref_start is not None
+                and ref_stop is not None
+                and ref_pts is not None
+                and ref_stop > ref_start > 0.0
+                and int(round(ref_pts)) == len(cal_pts)
+            ):
+                probe = air.SweepConfig(
+                    start_mhz=ref_start,
+                    stop_mhz=ref_stop,
+                    points=int(round(ref_pts)),
+                    ifbw_hz=ifbw_hz,
+                    power_dbm=power_dbm,
+                    dwell_us=dwell_us,
+                )
+                probe_fit = calibration_guard.evaluate_calibration_fit(
+                    probe,
+                    osl_grids=[calibration_guard.grid_from_osl(osl_cal)],
+                )
+                if not probe_fit.osl_stale:
+                    start_mhz = ref_start
+                    stop_mhz = ref_stop
+                    points = int(round(ref_pts))
+                    used_ref_grid = True
+            if not used_ref_grid:
+                start_mhz = float(cal_pts[0].frequency) / 1e6
+                stop_mhz = float(cal_pts[-1].frequency) / 1e6
+                points = int(len(cal_pts))
+        else:
+            ref_start = _opt_float("start_mhz")
+            ref_stop = _opt_float("stop_mhz")
+            ref_pts = _opt_float("points")
+            if ref_start is not None and ref_stop is not None and ref_pts is not None:
+                start_mhz = ref_start
+                stop_mhz = ref_stop
+                points = int(round(ref_pts))
+
+        ref_ifbw = _opt_float("ifbw_hz", "ifbw")
+        if ref_ifbw is not None and 6 <= int(round(ref_ifbw)) <= 50000:
+            ifbw_hz = int(round(ref_ifbw))
+        ref_power = _opt_float("power_dbm", "power")
+        if ref_power is not None and -40.0 <= ref_power <= 0.0:
+            power_dbm = float(ref_power)
+        ref_dwell = _opt_float("dwell_us", "dwell")
+        if ref_dwell is not None and 0 <= int(round(ref_dwell)) <= 10239:
+            dwell_us = int(round(ref_dwell))
+
+        if not (0.0 < start_mhz < stop_mhz <= 6500.0 and 2 <= points <= 4501):
+            return False
+
+        updated = air.SweepConfig(
+            start_mhz=start_mhz,
+            stop_mhz=stop_mhz,
+            points=points,
+            ifbw_hz=ifbw_hz,
+            power_dbm=power_dbm,
+            dwell_us=dwell_us,
+            ifft_points=base.ifft_points,
+            time_window_ns=base.time_window_ns,
+            dewow_window_ns=base.dewow_window_ns,
+            dewow_enabled=base.dewow_enabled,
+            bpf_rule=base.bpf_rule,
+        )
+        changed = updated != base
+        self._sweep = updated
+        if changed:
+            self._log(
+                f"扫频参数已自动对齐生效校准: {start_mhz:g}-{stop_mhz:g} MHz, "
+                f"{points} 点, IFBW={ifbw_hz} Hz, 功率={power_dbm:g} dBm"
+            )
+        return changed
 
     def _calibration_session_open(self) -> bool:
         session = self._calibration_session
@@ -1302,7 +1487,9 @@ class AirBlackboxService:
                 )
             if fit.background_stale:
                 components.update(background_frequency_hz=None, background=None)
-                if fit.osl_stale or self._session_calibration is None:
+                if fit.osl_stale or (
+                    self._session_calibration is None and self._session_calibration_p2 is None
+                ):
                     components["calibration_id"] = ""
         if fit.stale:
             self._log(f"{fit.message()}。本次采集中失效部分按未校准处理")
@@ -1315,12 +1502,6 @@ class AirBlackboxService:
         state = self.acquisition.state
         worker = self._legacy_worker
         worker_running = worker is not None and worker.isRunning()
-        if worker_running or state in (
-            air.SERVICE_STATE_ACQUIRING,
-            air.SERVICE_STATE_STOPPING,
-            air.SERVICE_STATE_SHUTTING_DOWN,
-        ):
-            return f"{action} 被拒绝: 采集任务运行中或服务正在收尾（state={state}）"
         session = self._calibration_session
         session_open = (
             session is not None
@@ -1331,6 +1512,32 @@ class AirBlackboxService:
                 air.CalibrationSession.STATE_SOLVED,
             )
         )
+        cal_thread_alive = bool(
+            self._calibration_thread is not None and self._calibration_thread.is_alive()
+        )
+        # 区分“真正的雷达采集任务运行中”与“当前校准会话自身的 ServiceStepCapturer 采集中”：
+        # 校准自身采集中时，同会话的 cal_cancel 必须允许进入以立即中止在途步骤，
+        # 同会话的 cal_capture 交由 _command_calibration_capture 做幂等/在途精确拒绝。
+        own_cal_capture_running = (
+            session_open
+            and cal_thread_alive
+            and not worker_running
+            and not self._active_run_id
+        )
+        if worker_running or state in (
+            air.SERVICE_STATE_ACQUIRING,
+            air.SERVICE_STATE_STOPPING,
+            air.SERVICE_STATE_SHUTTING_DOWN,
+        ):
+            if own_cal_capture_running and action in ("cal_cancel", "cal_capture") and (
+                not cal_id or session.cal_id == cal_id
+            ):
+                return None
+            return f"{action} 被拒绝: 采集任务运行中或服务正在收尾（state={state}）"
+        if action == "cal_import_file":
+            if cal_thread_alive:
+                return "cal_import_file 被拒绝: 校准步骤采集仍在进行"
+            return None
         if not session_open:
             return None
         if cal_id and session.cal_id == cal_id:
@@ -1453,8 +1660,8 @@ class AirBlackboxService:
         activate = bool(params.get("activate", True))
         request_id = str(params.get("request_id") or "").strip()
 
-        safe_filename = Path(filename).name.strip()
-        if not safe_filename or safe_filename in (".", "..") or not all(c.isalnum() or c in "._-" for c in safe_filename):
+        safe_filename = self._sanitize_import_filename(filename)
+        if not safe_filename:
             return {"ok": False, "error": f"非法文件名: {filename!r}"}
         if not content:
             return {"ok": False, "error": "cal_import_file 缺少 content"}
@@ -1470,10 +1677,16 @@ class AirBlackboxService:
         except Exception as exc:
             return {"ok": False, "error": f"校准解析解算失败: {exc}"}
 
+        any_cal = p1_cal if p1_cal is not None else p2_cal
+        if any_cal is None or not getattr(any_cal, "points", None):
+            return {"ok": False, "error": "校准解析解算失败: 未包含有效端口校准点"}
+
         imports_dir = self.output_root / "_calibration" / "imports"
         try:
             imports_dir.mkdir(parents=True, exist_ok=True)
             target_path = imports_dir / safe_filename
+            if target_path.resolve().parent != imports_dir.resolve():
+                return {"ok": False, "error": f"非法文件名路径越界: {filename!r}"}
             tmp_path = imports_dir / f".{safe_filename}.tmp"
             content_str = (
                 json.dumps(parsed_data, ensure_ascii=False, indent=2)
@@ -1501,6 +1714,9 @@ class AirBlackboxService:
                 tmp_path.unlink(missing_ok=True)
             return {"ok": False, "error": f"校准文件写入替换失败: {exc}"}
 
+        cal_id_str = str(parsed_data.get("cal_id") or target_path.stem)
+        ports = [port for port, cal in (("P1", p1_cal), ("P2", p2_cal)) if cal is not None]
+
         if activate:
             old_config_path = self.config.calibration_path
             with self._config_lock:
@@ -1518,15 +1734,29 @@ class AirBlackboxService:
                     return {"ok": False, "error": "配置持久化保存失败，已回滚恢复原文件与配置"}
 
             with self._calibration_lock:
+                open_session = self._calibration_session
+                if open_session is not None and open_session.state in (
+                    air.CalibrationSession.STATE_PLANNED,
+                    air.CalibrationSession.STATE_IN_PROGRESS,
+                    air.CalibrationSession.STATE_SOLVED,
+                ):
+                    try:
+                        open_session.cancel("导入校准文件并生效，自动关闭未激活会话")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._calibration_session = None
+                    self._log(
+                        f"导入校准文件生效：已自动结束未激活的校准会话 cal_id={open_session.cal_id}"
+                    )
                 self._session_calibration = p1_cal
                 self._session_calibration_p2 = p2_cal
                 self._active_through = through_meas
                 self._active_calibration_path = target_path
-                cal_id_str = str(parsed_data.get("cal_id") or target_path.stem)
                 self.active_calibration_id = cal_id_str
                 self._active_osl_id = cal_id_str
                 sweep_ref = parsed_data.get("sweep_config") if isinstance(parsed_data, dict) else None
                 self._calibration_sweep_ref = dict(sweep_ref) if isinstance(sweep_ref, dict) else None
+                self._align_sweep_to_calibration(any_cal, self._calibration_sweep_ref)
 
                 if self._background is not None:
                     self._background = None
@@ -1536,20 +1766,23 @@ class AirBlackboxService:
                     self._log("新 OSL 校准已导入生效：先前的背景校准已显式失效")
 
             self._log(
-                f"校准文件导入并生效成功: {safe_filename}（P1: {len(p1_cal.points)} 点，"
+                f"校准文件导入并生效成功: {safe_filename}（P1: {len(p1_cal.points) if p1_cal else 0} 点，"
                 f"P2: {len(p2_cal.points) if p2_cal else 0} 点）"
             )
 
+        fit = self._calibration_fit(log_changes=activate)
         return {
             "ok": True,
             "filename": safe_filename,
             "activated": activate,
-            "cal_id": str(parsed_data.get("cal_id") or safe_filename),
-            "ports": ["P1", "P2"] if p2_cal else ["P1"],
-            "points": len(p1_cal.points),
-            "valid_band_hz": [float(p1_cal.points[0].frequency), float(p1_cal.points[-1].frequency)],
+            "cal_id": cal_id_str,
+            "ports": ports,
+            "points": len(any_cal.points),
+            "valid_band_hz": [float(any_cal.points[0].frequency), float(any_cal.points[-1].frequency)],
             "format": str(parsed_data.get("format") or "uav_gpr_solt_calibration_v2"),
             "has_through": through_meas is not None,
+            "sweep": asdict(self._sweep),
+            "calibration_fit": fit.to_dict(),
             "request_id": request_id,
         }
 
@@ -1602,7 +1835,8 @@ class AirBlackboxService:
                         }
                     except Exception as exc:
                         return {"ok": False, "error": f"读取生效校准文件失败: {exc}"}
-                elif self._session_calibration is not None:
+                elif self._session_calibration is not None or self._session_calibration_p2 is not None:
+                    any_osl = self._session_calibration or self._session_calibration_p2
                     pts = [
                         {
                             "frequency": float(p.frequency),
@@ -1610,7 +1844,7 @@ class AirBlackboxService:
                             "reflection_tracking": str(p.reflection_tracking),
                             "source_match": str(p.source_match),
                         }
-                        for p in self._session_calibration.points
+                        for p in any_osl.points
                     ]
                     payload = {
                         "format": "uav_gpr_solt_calibration_v2",
@@ -1630,6 +1864,7 @@ class AirBlackboxService:
                     return {"ok": False, "error": "当前无生效的 OSL 校准可导出"}
 
     def _handle_cal_query_active(self, params: dict[str, object]) -> dict[str, object]:
+        request_id = str(params.get("request_id") or "").strip() if isinstance(params, dict) else ""
         with self._calibration_lock:
             osl_p1 = self._active_osl_p1()
             osl_p2 = self._active_osl_p2()
@@ -1648,6 +1883,11 @@ class AirBlackboxService:
                 "points": len(osl_any.points) if osl_any else 0,
                 "ports": [port for port, cal in (("P1", osl_p1), ("P2", osl_p2)) if cal is not None],
                 "has_through": getattr(self, "_active_through", None) is not None,
+                "sweep_config": (
+                    dict(self._calibration_sweep_ref)
+                    if isinstance(self._calibration_sweep_ref, dict)
+                    else None
+                ),
             }
             active_bg: dict[str, object] = {
                 "active": self._background is not None,
@@ -1710,13 +1950,19 @@ class AirBlackboxService:
                 "cal_export_file": True,
                 "recapture": True,
             }
-            return {
+            fit = self._calibration_fit()
+            out: dict[str, object] = {
                 "ok": True,
                 "active_osl": active_osl,
                 "active_background": active_bg,
                 "in_progress_session": in_prog,
                 "capabilities": capabilities,
+                "sweep": asdict(self._sweep),
+                "calibration_fit": fit.to_dict(),
             }
+            if request_id:
+                out["request_id"] = request_id
+            return out
 
     def _handle_cal_clear_active(self, params: dict[str, object]) -> dict[str, object]:
         target = str(params.get("target") or "all").lower()
@@ -1742,12 +1988,18 @@ class AirBlackboxService:
                 self._background_s22 = None
                 self._background_frequency_hz = None
                 self._background_cal_id = None
-                if self._session_calibration is None:
+                if self._session_calibration is None and self._session_calibration_p2 is None:
                     self.active_calibration_id = None
                 self._log("已清除生效的背景校准（OSL 校准保持有效）")
             else:
                 return {"ok": False, "error": f"未知清除目标: {target!r}（可选 all|osl|background）"}
-        return {"ok": True, "cleared": target, "target": target}
+        fit = self._calibration_fit(log_changes=True)
+        return {
+            "ok": True,
+            "cleared": target,
+            "target": target,
+            "calibration_fit": fit.to_dict(),
+        }
 
     def _command_calibration_capture(
         self, cal_id: str, step_name: str, recapture: bool = False, request_id: str = ""
@@ -1910,19 +2162,27 @@ class AirBlackboxService:
                     request_id=request_id,
                 )
 
-            session.capture(step_name, recapture=recapture, on_capture=_on_capture)
-            self._log(f"校准步骤采集完成: cal_id={session.cal_id} step={step_name}")
-            success = True
-        except Exception as exc:  # noqa: BLE001 - 步骤失败：会话已判 failed
-            self._log(f"校准步骤采集失败: cal_id={session.cal_id} step={step_name}: {exc}")
-            self._send_calibration_message(
-                "calibration_result",
-                session.cal_id,
-                status="failed",
-                step=step_name,
-                request_id=request_id,
-                reason=str(exc),
-            )
+            cap_result = session.capture(step_name, recapture=recapture, on_capture=_on_capture)
+            if (
+                isinstance(cap_result, dict) and cap_result.get("cancelled")
+            ) or session.state == air.CalibrationSession.STATE_CANCELLED:
+                self._log(f"校准步骤采集中止（会话已取消）: cal_id={session.cal_id} step={step_name}")
+            else:
+                self._log(f"校准步骤采集完成: cal_id={session.cal_id} step={step_name}")
+                success = True
+        except Exception as exc:  # noqa: BLE001 - 步骤失败：会话已判 failed（取消除外）
+            if session.state == air.CalibrationSession.STATE_CANCELLED:
+                self._log(f"校准步骤采集中止（会话已取消）: cal_id={session.cal_id} step={step_name}: {exc}")
+            else:
+                self._log(f"校准步骤采集失败: cal_id={session.cal_id} step={step_name}: {exc}")
+                self._send_calibration_message(
+                    "calibration_result",
+                    session.cal_id,
+                    status="failed",
+                    step=step_name,
+                    request_id=request_id,
+                    reason=str(exc),
+                )
         close_ok = True
         try:
             proxy = session.capturer
@@ -1935,10 +2195,13 @@ class AirBlackboxService:
                     self._log(f"步骤 {step_name} 释放底层采集器异常: {close_exc}")
         finally:
             with self._calibration_lock:
-                self._calibration_thread = None
-                self._current_capture_step = None
-                self._current_capture_request_id = None
+                if self._calibration_thread is threading.current_thread():
+                    self._calibration_thread = None
+                    self._current_capture_step = None
+                    self._current_capture_request_id = None
 
+        if session.state == air.CalibrationSession.STATE_CANCELLED:
+            return
         if success and close_ok:
             steps_done = sum(1 for p in session._progress.values() if p.state == "done")
             next_step = session.next_pending_step().name if session.next_pending_step() else None
@@ -2151,6 +2414,10 @@ class AirBlackboxService:
                 self.active_calibration_id = cal_id
                 self._active_osl_id = cal_id
                 self._calibration_sweep_ref = dict(getattr(session, "config_snapshot", {}) or {}) or None
+                self._align_sweep_to_calibration(
+                    self._session_calibration or self._session_calibration_p2,
+                    self._calibration_sweep_ref,
+                )
 
                 if self._background is not None:
                     self._background = None
@@ -2197,19 +2464,23 @@ class AirBlackboxService:
                     self._background_s22 = None
                 self._background_frequency_hz = np.array(frequency, dtype=np.float64, copy=True)
                 self._background_cal_id = cal_id
-                if self._session_calibration is None:
+                if self._session_calibration is None and self._session_calibration_p2 is None:
                     self.active_calibration_id = cal_id
                     self._calibration_sweep_ref = dict(getattr(session, "config_snapshot", {}) or {}) or None
+                    self._align_sweep_to_calibration(None, self._calibration_sweep_ref)
                 self._log(f"远程空采背景已激活: {len(background)} 点（cal_id={cal_id}）")
             summary = json.dumps(
                 (session.solved_result() or {}).get("profile_summary", {}), ensure_ascii=False
             )
         self._log(f"校准已激活: cal_id={cal_id}")
+        fit = self._calibration_fit(log_changes=True)
         act_fields: dict[str, object] = {
             "status": "activated",
             "mode": session.plan.mode,
             "profile_summary": summary,
             "calibration_id": cal_id,
+            "sweep": asdict(self._sweep),
+            "calibration_fit": fit.to_dict(),
         }
         if session.plan.mode == air.CALIBRATION_MODE_OSL:
             act_fields["active_osl_id"] = self._active_osl_id or cal_id
@@ -2230,9 +2501,15 @@ class AirBlackboxService:
                 act_fields["channels"] = ["S11", "S22"] if self._background_s22 is not None else ["S11"]
 
         self._send_calibration_message("calibration_result", cal_id, **act_fields)
-        return True
+        return {
+            "ok": True,
+            "sweep": asdict(self._sweep),
+            "calibration_fit": fit.to_dict(),
+        }
 
     def _command_calibration_cancel(self, cal_id: str, reason: str) -> bool:
+        thread: threading.Thread | None = None
+        proxy: object | None = None
         with self._calibration_lock:
             session = self._calibration_session
             if session is None or (cal_id and session.cal_id != cal_id):
@@ -2243,31 +2520,89 @@ class AirBlackboxService:
                     reason="无匹配的校准会话",
                 )
                 return False
+            thread = self._calibration_thread
+            proxy = getattr(session, "capturer", None)
             try:
                 session.cancel(reason)
             except Exception as exc:  # noqa: BLE001
                 self._log(f"校准取消失败: {exc}")
                 return False
             self._calibration_session = None
+
+        if thread is not None and thread.is_alive():
+            cancel_fn = getattr(proxy, "cancel_all", None)
+            if callable(cancel_fn):
+                try:
+                    cancel_fn(reason)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"取消校准采集器异常: {exc}")
+            else:
+                try:
+                    self.acquisition.request_stop(f"校准取消: {reason}")
+                except Exception:  # noqa: BLE001
+                    pass
+            thread.join(timeout=15.0)
+            with self._calibration_lock:
+                if self._calibration_thread is thread and not thread.is_alive():
+                    self._calibration_thread = None
+                    self._current_capture_step = None
+                    self._current_capture_request_id = None
+
         self._log(f"校准会话已取消: cal_id={session.cal_id}（{reason}）；已收 capture 文件保留")
         self._send_calibration_message(
             "calibration_result", session.cal_id, status="cancelled", reason=reason
         )
         return True
 
-    def _command_calibration_status(self, cal_id: str) -> None:
-        """R-C-16：地面查询当前生效校准摘要。"""
+    def _command_calibration_status(self, cal_id: str) -> dict[str, object]:
+        """R-C-16：地面查询当前生效校准摘要（兼顾导入/自启动恢复与会话激活）。"""
         with self._calibration_lock:
             session = self._calibration_session
-            active = session.active() if session is not None else None
+            session_active = session.active() if session is not None else None
+            osl_p1 = self._active_osl_p1()
+            osl_p2 = self._active_osl_p2()
+            osl_any = osl_p1 if osl_p1 is not None else osl_p2
+            has_bg = self._background is not None
+            bg_freq = self._background_frequency_hz
+            active_id = (
+                self._active_osl_id
+                or self.active_calibration_id
+                or (getattr(self, "_background_cal_id", None) if has_bg else None)
+                or ""
+            )
+            filename = self._active_calibration_path.name if self._active_calibration_path else None
+            ports = [port for port, cal in (("P1", osl_p1), ("P2", osl_p2)) if cal is not None]
+            has_through = getattr(self, "_active_through", None) is not None
+
+        fit = self._calibration_fit()
+        is_active = bool(osl_any is not None or has_bg or session_active)
         payload_fields: dict[str, object] = {
-            "status": "active" if active else "none",
-            "calibration_id": self.active_calibration_id or "",
+            "status": "active" if is_active else "none",
+            "calibration_id": active_id if is_active else "",
+            "calibration_fit": fit.to_dict(),
         }
-        if active:
-            payload_fields["valid_band_hz"] = "{:g}-{:g}".format(*active["valid_band_hz"])
-            payload_fields["mode"] = str(active.get("mode", ""))
+        if osl_any is not None:
+            payload_fields["mode"] = air.CALIBRATION_MODE_OSL
+            payload_fields["valid_band_hz"] = (
+                f"{osl_any.points[0].frequency:g}-{osl_any.points[-1].frequency:g}"
+            )
+            payload_fields["ports"] = ports
+            payload_fields["points"] = len(osl_any.points)
+            if filename:
+                payload_fields["filename"] = filename
+            payload_fields["has_through"] = has_through
+            payload_fields["has_background"] = has_bg
+        elif has_bg:
+            payload_fields["mode"] = air.CALIBRATION_MODE_BACKGROUND
+            if bg_freq is not None and len(bg_freq) >= 2:
+                payload_fields["valid_band_hz"] = f"{float(bg_freq[0]):g}-{float(bg_freq[-1]):g}"
+            payload_fields["points"] = len(self._background) if self._background is not None else 0
+            payload_fields["has_background"] = True
+        elif session_active:
+            payload_fields["valid_band_hz"] = "{:g}-{:g}".format(*session_active["valid_band_hz"])
+            payload_fields["mode"] = str(session_active.get("mode", ""))
         self._send_calibration_message("calibration_result", cal_id or "query", **payload_fields)
+        return {"ok": True, **payload_fields}
 
     # ---- 采集编排（复用既有 worker / service，绝不复制核心逻辑）----
 

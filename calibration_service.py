@@ -1108,7 +1108,27 @@ class CalibrationSession:
         try:
             frequency_axis: np.ndarray | None = None
             for index in range(1, progress.repeats + 1):
+                with self._lock:
+                    if self._state == self.STATE_CANCELLED:
+                        progress.state = "cancelled"
+                        return {
+                            "step": step_name,
+                            "captured": progress.captured,
+                            "cancelled": True,
+                            "mean": None,
+                            "frequency_hz": frequency_axis,
+                        }
                 frequency, raw = self.capturer.capture_one(progress, index)  # type: ignore[attr-defined]
+                with self._lock:
+                    if self._state == self.STATE_CANCELLED:
+                        progress.state = "cancelled"
+                        return {
+                            "step": step_name,
+                            "captured": progress.captured,
+                            "cancelled": True,
+                            "mean": None,
+                            "frequency_hz": frequency_axis,
+                        }
                 raw = np.asarray(raw, dtype=np.complex128)
                 frequency = np.asarray(frequency, dtype=np.float64)
                 if raw.ndim != 2 or raw.shape[0] != 2:
@@ -1137,6 +1157,15 @@ class CalibrationSession:
                     progress.frequency_hz = frequency
             mean = average_complex_captures(list(progress.captures))
             with self._lock:
+                if self._state == self.STATE_CANCELLED:
+                    progress.state = "cancelled"
+                    return {
+                        "step": step_name,
+                        "captured": progress.captured,
+                        "cancelled": True,
+                        "mean": None,
+                        "frequency_hz": frequency_axis,
+                    }
                 progress.mean = mean
                 progress.state = "done"
             return {
@@ -1147,6 +1176,16 @@ class CalibrationSession:
             }
         except Exception as exc:
             with self._lock:
+                if self._state == self.STATE_CANCELLED:
+                    progress.state = "cancelled"
+                    progress.error = f"会话已取消: {exc}"
+                    return {
+                        "step": step_name,
+                        "captured": progress.captured,
+                        "cancelled": True,
+                        "mean": None,
+                        "frequency_hz": frequency_axis,
+                    }
                 progress.state = "failed"
                 progress.error = f"{type(exc).__name__}: {exc}"
                 self._fail(f"步骤 {step_name} 采集失败: {exc}")

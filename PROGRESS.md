@@ -6,7 +6,7 @@
 ---
 
 - **当前版本**：v8.0.0-round8
-- **最后更新时间**：2026-10-22
+- **最后更新时间**：2026-11-12
 - **所属仓库**：uav-gpr / UVA_GPR_system (Private)
 
 ---
@@ -18,7 +18,7 @@
   - `air_core.py`：空中端核心零件（采集 worker、AcquisitionService、GNSS、校准接线、处理流水线、RemoteSender 等），**无界面**，只依赖 `PySide6.QtCore`。黑匣子服务 `import air_core as air`。
   - `uav_gpr_qt.py`：**仅兼容别名**（`sys.modules` 指向 `air_core`，同一个模块对象），给旧脚本用；新代码一律 `import air_core`。空中端旧 GUI（MainWindow 等）已于 2026-10-15 退役删除。
   - `run_air_station.bat`：改为以本机模式启动黑匣子服务（`--server 127.0.0.1:8765`），配合本机地面站做桌面联调。
-  - `air_gnss.py`：空中端 GNSS 驱动与串口解析。
+  - `air_gnss.py`、`gnss_diagnostics.py`：空中端常驻 GNSS 驱动、串口解析、固定解分类/筛选策略与可选滚动 JSONL 诊断日志。
 - **地面端（Ground Station）**：
   - `uav_gpr_ground_station.py`：PySide6 / Qt 界面，提供 B-scan 实时成像、设备控制、校准向导等。
   - `ground_gnss.py`、`calibration_service.py`：地面差分定位与 OSL/SOLT 标定校准核心逻辑。
@@ -39,7 +39,7 @@
 - **核心测试避坑指南（必须遵守）**：
   1. **严禁**使用单进程 `python -m unittest discover` 跑全量：Qt 6.11.2 下 WebEngine 在单进程连续运行第 72 个用例左右会抛出 `CalledOnValidBrowserThread` 崩溃，这是 Qt 引擎机制，必须走 `run_tests_batched.py` 的独立子进程分批执行。
   2. **判绿依据**：测试通过与否以子进程输出的 `^OK` 为准。部分 Qt 进程在 teardown 时可能以 0xC0000005 退出，但只要测试输出全 OK 即代表通过，切勿仅凭进程退出码误报回归。
-  3. **测试规模基线**：重构前 42 模块 1191 项；2026-10-15 退役空中端旧 GUI 后删除约 84 项纯旧窗口用例、新增 `tests/test_air_core_headless.py` 7 项守卫，再加校准失效、单通道、色阶滑块等新测试，以 Windows 实跑为准；另有 30 项独立黑匣子端到端 E2E 测试。
+  3. **测试规模基线**：重构前 42 模块 1191 项；2026-10-15 退役空中端旧 GUI 后删除约 84 项纯旧窗口用例、新增 `tests/test_air_core_headless.py` 7 项守卫，再加校准失效、单通道、色阶滑块、整次采集合并、GNSS 专项与校准交互修复等新测试，当前 Windows 分批全量回归基线为 **47 模块 1206 项**（含 30 项黑匣子端到端 E2E 测试）。
 
 ---
 
@@ -94,6 +94,20 @@
   - 新增 `tools/merge_runs.py` + `merge_runs.bat`：双击合并 `remote_runs` 下全部采集，或把采集文件夹拖上去；默认跳过 `_c`/`_idle`/`_` 开头文件夹。
   - 已知限制：trace 里只有 `calibration_id`，校准系数与空采背景不随数据走，离线暂不能“换背景”；数千道合并约数秒、文件约百 MB 量级。
   - 测试：`tests/test_run_archive.py`（11 项）。
+
+- [x] 2026-11-12 空中端 GNSS 断流抢 GIL、多行 FIFO、GGA/RMC 审计与静默安全探测修复（分支 `my-modifications`）。
+  - **`read_gga` 空转抢 GIL 修复**（`air_core.py`）：串口半断开立返 `b""`、持续噪声/非 NMEA 字节或校验被拒行时施加 `READ_LOOP_MIN_INTERVAL_S = 0.01` 让出 CPU，消除单核忙转拖慢连续雷达采集（实测约 0.7 → ~9 Hz 恢复）；消费已入队完整行时零额外延迟。
+  - **256 行有界 FIFO**（`air_core.py`）：`LINE_FIFO_CAPACITY = 256` + `fifo_overflows` 溢出计数，同块多条 NMEA 与跨块半句严格按到达顺序（含 `quality` 0→1→4→5）逐条返回不丢行；关闭/重置时同步清空残留。
+  - **GGA/RMC 双报文审计与历元去重**（`air_core.py`）：两类报文统一解析记入 `sentence_audit`，同历元去重并记录有效性/坐标冲突（`epoch_conflicts`）；保持 GGA 优先、禁止旧 RMC 覆盖较新 GGA，支持 `23:59:59 ↔ 00:00:00` 跨午夜与冷启动授时跳变，持续 `quality=0` GGA 不压制后续较新有效 RMC 兜底。
+  - **停用静默改速写配置**（`air_core.py`、`tests/test_air_gnss.py`）：默认波特率统一为 `9600`；静默超时期间停用切 `115200` 及下发 `com com1/com3 9600` + `saveconfig` 写 flash，仅保留同速率物理口输出探测。
+  - **诊断日志与解类型分类**（新增 `gnss_diagnostics.py`、`air_gnss.py`）：新增默认关闭的可选滚动 JSONL `GnssLogWriter`（记录原始字节、报文审计、指令/应答、连接与发布快照，容忍重连、轮转与写盘异常，黑匣子入口零改动）；新增 `solution_type`（仅有效 GGA `fix_quality==4` 判 `rtk_fixed`、`5` 判 `rtk_float`）与默认 `off` 的 `fix_policy`（仅影响 `fix_eligible` 元数据，既有 `snapshot()`、NPZ 10 字段 `GgaFix` 与地面显示 100% 兼容）；`snapshot()` 区分 `configured_port/baud` 与实连 `connected_port/baud`。
+  - 测试：新增 `tests/test_gnss_specialist.py`（20 项，含连续雷达防饿死实测与 `20261106_151256_0009` 125 历元历史回放）。
+
+- [x] 2026-11-12 标定校准三项现场问题端到端修复（分支 `my-modifications`）。
+  - **问题 1（导入校准文件后未真正应用到采集数据）**：`uav_gpr_air_service.py` 新增 `_align_sweep_to_calibration`，在 `cal_import_file(activate=True)`、自启动恢复与 `cal_activate` 时将空中端射频扫频网格（`start_mhz`/`stop_mhz`/`points` 及合法 `ifbw_hz`/`power_dbm`/`dwell_us`）自动对齐生效校准（保持 Dewow/IFFT 处理参数不变），并通过回执 `sweep` + `calibration_fit` 同步地面 `acq_settings` 与向导输入框，消除此前因扫频网格不一致被 `calibration_guard` 静默判 `stale` 停用校准的问题（导入后若用户再手动 `set_params` 改频率/点数仍照常判 `stale`）；导入同时自动取消未激活的空闲会话、支持仅含 P2 的 VV 单端口文件及含空格/括号的 Windows 副本文件名。
+  - **问题 2（校准中途点窗口 `×` / `Esc` 关闭未点“取消会话”导致空中端卡死拒采）**：`CalibrationWizard` 补齐 `closeEvent` 与 `reject` 自动发送 `cal_cancel`（含 `_cancelled_cal_ids` 防在途 `cal_begin` 迟到 `planned` 复活、断线待发补偿、幂等防重发，已激活校准绝不误取消）；空中端允许校准自身 `ServiceStepCapturer` 在途时接收同会话 `cal_cancel`，经 `_BlackboxCalibrationCapturerProxy.cancel_all` + `CalibrationSession.capture` 取消守卫立即唤醒中止在途采样且不伪发 `step_done`/`failed`，关闭窗口后可立即 `start`/`single`/`set_params`。
+  - **问题 3（导入校准文件后点击“查询生效状态”卡在查询中/查不到状态）**：地面端 `on_command_result("cal_query_active")` 与 `cal_status` 回程新增 `_format_active_query_summary` 刷新 `status_label`、`result_label` 与 `active_cal_label`（含 ID、文件名、端口、频点数、频段、Through/背景及 `calibration_fit` 状态，不再停留在“正在查询…”）；空中端统一导入 `cal_id` 口径，并修复 `_command_calibration_status` 在无活动 `_calibration_session` 时漏报已导入/自启动恢复校准的问题。无新增消息 `type`，主窗口 4 个业务按钮与状态栏 3 个标签冻结契约保持不变。
+  - 测试：新增 `tests/test_calibration_ux_fixes.py`（12 项真实 TCP 双端 E2E + 回归用例，含 `1016dual.json` 与 `solt_2port_20260807_202342.json` 数值级校正核对）；全量 `docs\run_tests_batched.py` 47 模块 1206 项通过。
 
 ---
 

@@ -7,7 +7,7 @@
 
 - **当前版本**：v8.0.0-round8
 - **最后更新时间**：2026-11-12
-- **所属仓库**：uav-gpr / UVA_GPR_system (Private)
+- **所属仓库**：uav-gpr / UVA_GPR_system (Public)
 
 ---
 
@@ -108,6 +108,14 @@
   - **问题 2（校准中途点窗口 `×` / `Esc` 关闭未点“取消会话”导致空中端卡死拒采）**：`CalibrationWizard` 补齐 `closeEvent` 与 `reject` 自动发送 `cal_cancel`（含 `_cancelled_cal_ids` 防在途 `cal_begin` 迟到 `planned` 复活、断线待发补偿、幂等防重发，已激活校准绝不误取消）；空中端允许校准自身 `ServiceStepCapturer` 在途时接收同会话 `cal_cancel`，经 `_BlackboxCalibrationCapturerProxy.cancel_all` + `CalibrationSession.capture` 取消守卫立即唤醒中止在途采样且不伪发 `step_done`/`failed`，关闭窗口后可立即 `start`/`single`/`set_params`。
   - **问题 3（导入校准文件后点击“查询生效状态”卡在查询中/查不到状态）**：地面端 `on_command_result("cal_query_active")` 与 `cal_status` 回程新增 `_format_active_query_summary` 刷新 `status_label`、`result_label` 与 `active_cal_label`（含 ID、文件名、端口、频点数、频段、Through/背景及 `calibration_fit` 状态，不再停留在“正在查询…”）；空中端统一导入 `cal_id` 口径，并修复 `_command_calibration_status` 在无活动 `_calibration_session` 时漏报已导入/自启动恢复校准的问题。无新增消息 `type`，主窗口 4 个业务按钮与状态栏 3 个标签冻结契约保持不变。
   - 测试：新增 `tests/test_calibration_ux_fixes.py`（12 项真实 TCP 双端 E2E + 回归用例，含 `1016dual.json` 与 `solt_2port_20260807_202342.json` 数值级校正核对）；全量 `docs\run_tests_batched.py` 47 模块 1206 项通过。
+
+- [x] 2026-11-12 重打发布包 `20261112`（含上述 GNSS 与校准修复，空中端 + 地面站）。
+  - **打包清单缺模块缺陷（上机即崩）**：`air_gnss.py` 顶部为裸 `from gnss_diagnostics import (...)`，`uav_gpr_air_service.py` 又直接 `from air_gnss import AirGnssMonitor`，而 `build_release_98f8530.py` 的 `AIR_PY_FILES`/`GROUND_PY_FILES` 均未包含新增的 `gnss_diagnostics.py`。已在隔离副本实测：缺该文件时 `import uav_gpr_air_service` 抛 `ModuleNotFoundError`，包一启动即退出。地面站包同样受影响（`run_air_station.bat` 本机联调会拉起黑匣子服务）。
+  - **修复方式**：新增 `dist/build_tools/build_release_20261112.py`（`dist/` 属 `.gitignore`，与历史构建脚本同处不入库），复用 `build_release_98f8530.py` 组装函数与 `601a2ad` 的清单/自检/冒烟逻辑，仅把 `gnss_diagnostics.py` 补进两个包清单（空中 15→16 项、地面 21→22 项），**未修改任何历史构建脚本**，`98f8530`/`601a2ad` 两个旧包仍可原样复现。
+  - **产物**：`dist/发布包_20261112/` 下三个包——`空中端黑匣子便携包_20261112.zip`（278.6 MB，6627 文件）、`空中端黑匣子便携包_20261112_slim.zip`（27.8 MB，654 文件）、`地面站便携包_20261112.zip`（278.8 MB，6633 文件）。旧包 `dist/发布包_601a2ad/` 未被触碰。
+  - **验证**（全部为实跑，非推断）：① 包内 runtime 自检 `AIR_SELFTEST_OK`/`GND_SELFTEST_OK` 通过；② 追加自检 `AIR_GNSS_OK`/`GND_AIR_IMPORT_OK`，黑匣子服务在包内可导入且 `gnss_diagnostics` 在位；③ 地面站真启动冒烟（offscreen 8s）窗口存活、无导入/语法错误；④ 三个包的 `RELEASE_MANIFEST.txt` 共 104 条 SHA-256 条目与磁盘文件逐一比对全通过（空中 33/瘦身 32/地面 39），清单头部幂等重建无重复；⑤ 三包 `air_core.py`/`air_gnss.py`/`gnss_diagnostics.py`/`uav_gpr_air_service.py` 等与源码逐字节一致；⑥ 三个 zip 解压 CRC 全部完好，关键修复标记在位；⑦ 瘦身版解压到干净目录后用**包内自带 python** 端到端验证：`READ_LOOP_MIN_INTERVAL_S=0.01`、`LINE_FIFO_CAPACITY=256`、默认波特率 9600、`fix_policy=off`、生产配置 `192.168.144.20/usb/9600/calibration_path=""`、`load_air_config` 无 issue。
+  - **配置红线**：工作区 `air_config.json` 为开发调试值（`127.0.0.1` + `simulated`，未提交），三个包内配置一律由构建脚本重新生成为现场值，已在构建中加断言拦截。
+  - **未验证项（需现场联调）**：三包均未带真雷达 + 真 GNSS 接收机验证；`_align_sweep_to_calibration` 路径上未见"采集中禁止导入校准"的运行态拦截，建议上机前试一次"采集进行中导入校准"。
 
 ---
 
